@@ -1,0 +1,121 @@
+# fi-nautical-charts
+
+Tooling to build [Signal K](https://signalk.org/) / Freeboard-SK MBTiles chart
+sets from Finnish open nautical charts.
+
+## Sources
+
+- **Traficom raster WMTS** — official Finnish nautical charts, open data under
+  CC BY 4.0. Endpoint `https://julkinen.traficom.fi/rasteripalvelu/wmts`. The
+  `WGS84_Pseudo-Mercator` tile matrix is standard web-mercator XYZ (z0–15 for
+  the marine layers). This is the authoritative, license-clean source.
+
+The rendered raster charts are **only** available through the WMTS view service;
+Traficom's bulk download service offers vector shapefiles (WFS) and depth GeoTIFFs
+(WCS), not the chart images. So tile-by-tile WMTS fetching is the route to raster
+MBTiles — legitimate here because the WMTS is the CC BY 4.0 distribution.
+
+Attribution required: *"Source: Traficom. Not for navigation use. Does not meet
+official nautical chart requirements."*
+
+## Layers (Traficom WMTS)
+
+Base layers each pair with an `erikoiskartat` (special/large-scale) companion:
+
+| Base | Special | Notes |
+|------|---------|-------|
+| `Rannikkokartat public` | `Rannikkokarttojen erikoiskartat` | Coastal charts; covers Helsinki |
+| `Veneilykartat public` | `Veneilykarttojen erikoiskartat` | Boating charts; partial coverage |
+| `Satamakartat` | `Satamakarttojen erikoiskartat` | Harbour charts |
+| `Yleiskartat 100k` / `250k` | — | Small-scale overview |
+
+The `public` suffix marks the openly-licensed subset of each product.
+
+## Usage
+
+```bash
+./run help                 # list commands
+./run ab                   # A/B render (default: Helsinki front, Rannikkokartat vs Merikarttasarjat)
+./run ab --sources "traficom:Satamakartat,traficom:Veneilykartat public" --bbox 26.7,60.3,27.0,60.45
+
+# Download a layer to MBTiles. Descent (default) prunes empty subtrees; sparse
+# overlays seed with --full-until so no isolated feature is pruned.
+./run dl --layer "Merikarttasarjat public" --out mbtiles/merikarttasarjat.mbtiles
+./run dl --layer "Satamakartat" --full-until 11 --out mbtiles/satamakartat.mbtiles
+./run dl --layer "Veneilykartat public" --full-until 10 --out mbtiles/veneilykartat.mbtiles
+
+# Retry tiles that failed on an earlier run (e.g. transient network errors).
+./run dl --layer "Rannikkokartat public" --out mbtiles/rannikkokartat.mbtiles --repair
+```
+
+Failed tiles are recorded in an `_errors` table and retried automatically —
+after each zoom during a download, and at the start of any resumed run. If a
+run finished before error tracking existed, `--repair` re-derives the expected
+tiles and re-fetches whatever is missing from the archive.
+
+## Currency and refresh
+
+Traficom reseeds its tile cache region by region, so a set spans a range of
+edition dates, readable from each tile's `Last-Modified` header. `currency.py`
+samples these, stamps `source_updated` (newest) / `source_updated_oldest` /
+`downloaded` into the MBTiles metadata, and renames the file:
+
+```bash
+./run currency mbtiles/rannikkokartat.mbtiles --rename   # -> fi-rannikkokartat-2026-06-29.mbtiles
+```
+
+On-demand tiles (ones our own download forced GeoWebCache to generate) carry
+today's date, so they're excluded from `source_updated` — it reflects real
+editions, not our footprint.
+
+Keep a set current without re-downloading it:
+
+```bash
+./run refresh mbtiles/fi-rannikkokartat-2026-06-29.mbtiles
+```
+
+`refresh` walks the existing coverage with `If-Modified-Since` = the day after
+the last download: unchanged tiles return 304 (cheap), only reseded tiles
+transfer data. New chart *areas* (coverage that didn't exist before) need a
+fresh `dl` run.
+
+Files are named `<country>-<layer>-<newest-edition-date>.mbtiles`.
+
+**Pick the right layer first.** `Merikarttasarjat public` (the combined official
+chart series) is the complete coastal base — it charts the whole coast including
+the archipelago. `Rannikkokartat public` looks identical around cities but has
+real **coverage holes** over the inner archipelago (it serves transparent
+placeholder tiles there), so it is not a safe base on its own.
+
+**Mode: fill (default).** `fill` is the complete, no-full-grid method: it
+full-fetches the solid low zoom (`--solid-zoom`, default 11) for the chart
+footprint, then flood-fills each deeper zoom outward from seeds, bounded to that
+footprint. Verified tile-for-tile against `full` on Vänö, Helsinki, inland and
+open sea (0 content missed, up to 90% fewer requests). It reaches content behind
+the placeholder band and in transparent quadrants of content tiles, while never
+touching off-sheet land/sea. Caveat: `--solid-zoom` must be the layer's last
+dense zoom before the placeholder band; verify a new layer against `full` on a
+few small boxes before trusting it. `full` is retained only as that test oracle
+and for special cases.
+
+**(legacy) Mode: full vs descent.** Traficom serves transparent
+placeholder tiles at mid zooms where a chart has no data at that scale, but then
+serves **real content again at a deeper zoom** (e.g. Rannikkokartat near Vänö:
+z8–11 content, z12–14 placeholder, z15 content). `descent` only follows children
+of content tiles, so it prunes at the placeholder and **misses the deep content
+behind it** — in the Vänö box it lost 100% of the z15 tiles. So `full` (fetch
+every zoom's full `TileMatrixSetLimits` rectangle) is the safe default. `descent`
+is a ~5× cheaper optimization that is only correct for a layer with no
+placeholder gaps (verified dense, e.g. `Merikarttasarjat public`, which matches
+full enumeration). A re-run reuses already-stored tiles, so `--mode full` over an
+existing descent archive tops it up to complete coverage without re-fetching what
+it already has.
+
+`--mode mask` is a fast footprint-guided variant (tunnels through placeholders,
+prunes off-sheet land/sea via each tile's alpha). It's much cheaper on inland
+areas but **not complete** — content that appears only at the deepest zoom in a
+spot the coarser tile leaves transparent gets pruned (verified: 29 z15 tiles
+missed at Helsinki). Fast previews only; `full` for authoritative charts.
+
+Python tools run via [uv](https://docs.astral.sh/uv/) with PEP 723 inline
+dependencies — no manual environment setup.

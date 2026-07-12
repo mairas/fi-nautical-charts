@@ -1,0 +1,7 @@
+out/
+*.mbtiles
+*.mbtiles-wal
+*.mbtiles-shm
+__pycache__/
+.venv/
+_local/
