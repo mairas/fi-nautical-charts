@@ -50,6 +50,21 @@ function currency {
 }
 
 ################################################################################
+# Process
+
+function downscale {
+  #@ Rebuild lower zoom levels by anti-aliased downscaling from the deepest level
+  #@ Category: Process
+  uv run downscale.py "$@"
+}
+
+function native-zoom {
+  #@ Report each layer's genuine native max zoom (upscale vs real detail)
+  #@ Category: Process
+  uv run native_zoom.py "$@"
+}
+
+################################################################################
 # Utility Commands
 
 function deps {

@@ -53,6 +53,38 @@ after each zoom during a download, and at the start of any resumed run. If a
 run finished before error tracking existed, `--repair` re-derives the expected
 tiles and re-fetches whatever is missing from the archive.
 
+## Downscaling the pyramid
+
+Traficom serves each layer's lower zoom levels as crude rescales of the deepest
+native level, often close to nearest-neighbour, so lines look jagged. `./run
+downscale` rebuilds every level below the deepest one by proper anti-aliased
+reduction:
+
+```bash
+./run downscale mbtiles/fi-satamakartat-2026-06-29.mbtiles \
+    --out mbtiles/fi-satamakartat-2026-06-29.downscaled.mbtiles
+```
+
+- Cascades one octave at a time (z15→z14→…), each level from the level above —
+  a standard mip pyramid.
+- Each output pixel is the box average of the 2×2 block beneath it. For an exact
+  2× step that block lies entirely inside the tile's own children, so the result
+  is **provably seam-free** with no gutter; box also avoids the ringing haloes a
+  Lanczos kernel adds around hard chart edges. Alpha is premultiplied so
+  transparent off-sheet pixels don't bleed dark haloes into coastlines.
+- Sparse-aware (a parent is built only where a child exists) and non-destructive:
+  the source opens read-only, the deepest level is copied verbatim, and only
+  lower levels are regenerated. Idempotent input→output — drop it into a CI step.
+- Never loses coverage: where a mid-zoom tile has content the source level lacks
+  (Traficom sometimes renders a feature at a lower zoom only), the original tile
+  is kept. Per-tile image work is fanned out across all cores.
+
+`--source-zoom` overrides the level to downscale from (default: deepest present);
+`--min-zoom` limits how far down to regenerate (default: the file's lowest zoom).
+
+`./run native-zoom <file>` reports whether each level is genuine detail or an
+upscale, confirming the deepest level is worth downscaling from.
+
 ## Currency and refresh
 
 Traficom reseeds its tile cache region by region, so a set spans a range of
