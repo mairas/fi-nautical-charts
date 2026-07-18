@@ -81,11 +81,11 @@ def main():
         raise SystemExit("no Last-Modified sampled; is the layer name correct?")
 
     sl = slug(layer)
-    label, fin = HUMAN.get(sl, ("Nautical charts", layer))
+    label, fin = HUMAN.get(sl, ("Nautical charts", layer.replace(" public", "")))
     today = datetime.date.today().isoformat()
     stamp = {
         "wmts_layer": layer,
-        "name": f"{args.country.upper()} {label} ({fin}) {newest}",
+        "name": f"{fin} {newest}",
         "source_updated": newest.isoformat(),
         "source_updated_oldest": oldest.isoformat(),
         "downloaded": today,
