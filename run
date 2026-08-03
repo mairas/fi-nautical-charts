@@ -28,7 +28,7 @@ function ab {
 # Download
 
 function dl {
-  #@ Download a Traficom WMTS layer to MBTiles (descent by default)
+  #@ Download a Traficom chart layer to MBTiles (WMTS source, fill mode by default)
   #@ Category: Download
   uv run traficom_dl.py "$@"
 }
