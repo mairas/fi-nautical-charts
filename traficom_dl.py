@@ -756,12 +756,15 @@ def coverage_descent(con, args, src, limits, bbox, zooms):
     totals = {"ok": 0, "empty": 0, "err": 0}
     for z in zooms[start:]:
         cmin, cmax, rmin, rmax = clamped_bounds(limits[z], bbox, z)
-        if cmin > cmax or rmin > rmax:
-            sys.exit(f"z{z} has an empty tile rectangle -- check --bbox ordering "
-                     f"(minlon,minlat,maxlon,maxlat). Nothing was marked complete.")
-        cands = [(x, y) for y in range(rmin, rmax + 1) for x in range(cmin, cmax + 1)
-                 if eligible(z, x, y)]
-        rect = (cmax - cmin + 1) * (rmax - rmin + 1)
+        # A bbox overlapping the extent edge can quantise to nothing at one zoom
+        # and to a row at the next, so an empty rectangle here is a zoom to skip,
+        # not an error; run() skips it too. A bbox empty at *every* zoom is the
+        # real fault, and is caught before any mode starts.
+        empty = cmin > cmax or rmin > rmax
+        cands = [] if empty else [
+            (x, y) for y in range(rmin, rmax + 1) for x in range(cmin, cmax + 1)
+            if eligible(z, x, y)]
+        rect = 0 if empty else (cmax - cmin + 1) * (rmax - rmin + 1)
         already = fetched_at(con, z) | data_tiles_at(con, z)
         todo = [c for c in cands if c not in already]
         zst = {"ok": 0, "empty": 0, "err": 0}
@@ -832,6 +835,15 @@ def run(args):
     if not zooms:
         sys.exit("no zoom levels in range")
     bbox = tuple(float(v) for v in args.bbox.split(",")) if args.bbox else None
+    # A reversed bbox selects nothing at every zoom, and used to leave an empty
+    # archive marked complete. So does a correctly-ordered bbox outside the
+    # source's coverage -- different mistake, same silent result, so both are
+    # refused here rather than per zoom, where quantisation decides which.
+    if bbox and not any(cmin <= cmax and rmin <= rmax for cmin, cmax, rmin, rmax
+                        in (clamped_bounds(limits[z], bbox, z) for z in zooms)):
+        sys.exit(f"--bbox {args.bbox} selects no tiles at any zoom in "
+                 f"z{zooms[0]}-{zooms[-1]}. Give it as minlon,minlat,maxlon,maxlat, "
+                 f"within the area {src['kind']} covers.")
 
     # mask and descent both prune on an out-of-band "no tile here" signal. A WMS
     # answers out-of-coverage with a transparent 200, indistinguishable from the
