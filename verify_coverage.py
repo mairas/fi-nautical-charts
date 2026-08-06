@@ -5,13 +5,14 @@
 # ///
 """Check `--mode coverage` against the `full` oracle, and the footprint against itself.
 
-Two jobs, because coverage mode can be wrong in two unrelated ways.
+Coverage mode can be wrong in two unrelated ways, and its price is a third
+question, so there are three subcommands. The first two assert and can fail; the
+last only measures, so its exit code says nothing about correctness.
 
   oracle  Download the same area twice, once with `full` (brute-force enumeration
           of the zoom's rectangle) and once with `coverage`, and diff the content
           tiles. A tile `full` stored and `coverage` did not is a hole in the
-          footprint. This is the discipline that caught `descent` losing every
-          z15 tile at Vanoe and `mask` losing 29 at Helsinki.
+          footprint.
 
   mask    Two properties the oracle cannot see. Chunking: a footprint assembled
           from several column chunks must equal one assembled from a single
@@ -21,10 +22,14 @@ Two jobs, because coverage mode can be wrong in two unrelated ways.
           shipped one, or the rasterisation is dropping cells the dilation cannot
           restore.
 
+  cost    What a full run would fetch and store, sampled over the footprint.
+
 Boxes are named so a result stays re-runnable. Their value depends on where they
 sit relative to the footprint: a box wholly inside tests that coverage keeps what
 full finds, a straddling box tests that pruning does not cut real chart area, and
-a box wholly outside tests that pruning happens at all.
+a box wholly outside tests that pruning happens at all. A box can therefore pass
+while testing nothing, so each is tagged with the relation it is meant to have
+and the run fails if it does not hold.
 """
 
 from __future__ import annotations
@@ -46,37 +51,36 @@ import traficom_dl as T
 
 HERE = Path(__file__).resolve().parent
 
+# taken from the downloader so the harness cannot drift into verifying a mask,
+# or a zoom range, that the downloader no longer produces
+_DL_DEFAULTS = {a.dest: a.default for a in T.build_parser()._actions}
+CZOOM, COVER = _DL_DEFAULTS["coverage_zoom"], _DL_DEFAULTS["coverage_oversample"]
+DLZOOM = _DL_DEFAULTS["maxzoom"]
+
 # bbox strings, minlon,minlat,maxlon,maxlat. The tags record each box's measured
 # relation to the footprint at the default z11/16x parameters -- `mask` reports it,
 # so a source change that moves a box between classes shows up rather than quietly
 # weakening the check.
 BOXES = {
-    # inside: coverage must keep everything full finds
-    "helsinki":  ("24.90,60.09,25.06,60.17",   "inside",    "dense urban water; the box mask mode failed"),
-    "vano":      ("21.85,59.78,22.10,59.92",   "inside",    "archipelago; the box descent failed on raster"),
+    # inside: no pruning happens, so these test that coverage keeps what full
+    # finds -- containment, not the mask boundary
+    "helsinki":  ("24.90,60.09,25.06,60.17",   "inside",    "dense urban water"),
+    "vano":      ("21.85,59.78,22.10,59.92",   "inside",    "archipelago, content resumes below a placeholder band"),
     "saimaa":    ("28.10,61.00,28.45,61.20",   "inside",    "inland waterway, Coastal band with no General above"),
     "bogskar":   ("20.20,59.42,20.50,59.58",   "inside",    "isolated outer skerry"),
-    # straddling: pruning must not cut real chart area
-    "diagonal":  ("22.6758,64.6991,23.3789,64.9979", "straddle", "Bothnian Bay, boundary crosses cells diagonally"),
-    "diagonal2": ("29.5312,66.0894,30.2344,66.3728", "straddle", "eastern border, boundary crosses cells diagonally"),
-    # 2x2 z11 windows that straddle the *dilated* mask, half in and half out, so
-    # deep zooms are actually pruned rather than merely enumerated. Picked off
-    # the mask itself: a window drawn around the raw footprint's edge looks like
-    # a boundary but dilation swallows it whole, and then it tests nothing.
-    # One per edge, since each is a different neighbour (Sweden, Norway, Russia,
-    # open sea) and the coverage may end differently against each.
-    "edge-north": ("23.3789,66.5133,23.7305,66.6530", "straddle", "head of the Bothnian Bay"),
-    "edge-west":  ("18.6328,60.1524,18.9844,60.3269", "straddle", "western limit, toward Sweden"),
-    "edge-south": ("20.5664,58.6312,20.9180,58.8137", "straddle", "southern limit, open Baltic"),
-    "edge-east":  ("30.4102,62.4311,30.7617,62.5933", "straddle", "eastern limit, toward Russia"),
-    # The boxes above prune, but their kept cells are all dilation ring, which is
-    # empty by construction -- so they show only that pruning loses nothing where
-    # there is nothing. These are wider, spanning charted cells through the ring
-    # to cells outside the mask, so full finds content on one side while coverage
-    # prunes the other. That is the pairing that can actually expose a bad prune.
-    "span-kemi":   ("23.5547,65.8028,24.2578,65.9465", "straddle", "Bothnian Bay coast through the mask edge"),
-    "span-border": ("29.8828,65.8028,30.5859,65.9465", "straddle", "eastern border through the mask edge"),
-    "span-coast":  ("21.7969,64.3209,22.5000,64.4728", "straddle", "Ostrobothnian coast through the mask edge"),
+    # straddling: these reach from charted cells, through the dilation ring, to
+    # cells outside the mask, so full finds content on one side while coverage
+    # prunes the other. That pairing is the only one that can expose a bad prune.
+    # A narrower window sitting on the boundary also prunes, but everything it
+    # keeps is dilation ring, which is empty by construction -- it shows only
+    # that pruning loses nothing where there was nothing to lose. One per edge,
+    # since each borders a different neighbour and the coverage may end
+    # differently against each.
+    "span-kemi":   ("23.5547,65.8028,24.2578,65.9465", "straddle", "Bothnian Bay coast, north edge"),
+    "span-border": ("29.8828,65.8028,30.5859,65.9465", "straddle", "eastern border, toward Russia"),
+    "span-coast":  ("21.7969,64.3209,22.5000,64.4728", "straddle", "Ostrobothnian coast, west edge"),
+    "span-aland":  ("18.6328,60.5870,19.3359,60.7592", "straddle", "outer Aland, toward Sweden"),
+    "span-south":  ("27.0703,59.9770,27.4219,60.3269", "straddle", "Gulf of Finland, south edge"),
     # outside: pruning must reduce these to zero requests
     "lapland":   ("25.50,67.50,25.80,67.65",   "outside",   "inland, no navigable water"),
     "baltic":    ("20.00,58.30,20.40,58.60",   "outside",   "open sea inside the extent, south of the footprint"),
@@ -90,30 +94,42 @@ def tiles_at(con, z):
                 "SELECT tile_column, tile_row FROM tiles WHERE zoom_level=?", (z,))}
 
 
-def run_dl(mode, out, bbox, minzoom, maxzoom):
+def run_dl(mode, out, bbox, args):
     cmd = ["uv", "run", str(HERE / "traficom_dl.py"), "--source", "wms",
            "--mode", mode, "--out", str(out),
-           "--minzoom", str(minzoom), "--maxzoom", str(maxzoom)]
+           "--minzoom", str(args.minzoom), "--maxzoom", str(args.maxzoom),
+           # forwarded so the oracle can grade a mask other than the default one;
+           # otherwise the only check with ground truth is stuck at 11/16x while
+           # the CLI advertises 6..14
+           "--coverage-zoom", str(args.coverage_zoom),
+           "--coverage-oversample", str(args.coverage_oversample)]
     if bbox:
         cmd += ["--bbox", bbox]
     t0 = time.monotonic()
-    # streamed rather than captured: an oracle run over a deep box is tens of
-    # thousands of requests, and the child's progress line is the only sign it
-    # is alive. It rewrites one line with \r, so read chunks, not lines.
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True)
-    out = []
-    while chunk := proc.stdout.read(256):
-        out.append(chunk)
-        sys.stdout.write(chunk)
+    # read1 returns whatever has arrived rather than blocking for a full buffer,
+    # so the child's progress line surfaces as it is written. It rewrites one
+    # line with \r, so read chunks, not lines.
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    chunks = []
+    while raw := proc.stdout.read1(4096):
+        text = raw.decode("utf-8", "replace")
+        chunks.append(text)
+        sys.stdout.write(text)
         sys.stdout.flush()
     if proc.wait() != 0:
         sys.exit(f"\n{mode} run failed ({proc.returncode})")
-    text = "".join(out)
-    num = lambda pat: (int(m.group(1).replace(",", ""))
-                       if (m := re.search(pat, text)) else 0)
-    # a run that gave up on tiles has holes, and a hole in the oracle reads as
-    # agreement -- the comparison is only meaningful if both sides are complete
+    text = "".join(chunks)
+
+    def num(pat):
+        # no default: a missing counter would read as zero, and zero is the
+        # passing value for both the completeness gate and the outside-box
+        # assertion, so an unreadable summary would grade itself clean
+        m = re.search(pat, text)
+        if not m:
+            sys.exit(f"\ncould not read '{pat}' from the {mode} run's summary; "
+                     f"refusing to grade output that cannot be parsed")
+        return int(m.group(1).replace(",", ""))
+
     return {"requested": num(r"requested ([\d,]+)"),
             "errors": num(r"unrecovered errors ([\d,]+)"),
             "secs": time.monotonic() - t0}
@@ -145,9 +161,9 @@ def oracle(args):
     with tempfile.TemporaryDirectory() as td:
         full_db, cov_db = Path(td) / "full.mbtiles", Path(td) / "cov.mbtiles"
         print("  running full (oracle) ...")
-        fstat = run_dl("full", full_db, bbox, args.minzoom, args.maxzoom)
+        fstat = run_dl("full", full_db, bbox, args)
         print("  running coverage ...")
-        cstat = run_dl("coverage", cov_db, bbox, args.minzoom, args.maxzoom)
+        cstat = run_dl("coverage", cov_db, bbox, args)
         fz, fbytes = db_stats(full_db)
         cz, cbytes = db_stats(cov_db)
 
@@ -178,7 +194,22 @@ def oracle(args):
               f"coverage {cstat['errors']:,}); both sides must be complete for "
               f"the diff to mean anything")
         return 1
-    if klass == "outside" and cstat["requested"] != 0:
+    # Agreeing on nothing is not agreement. A service rendering transparent
+    # everywhere -- wrong style id, renamed layer, outage -- makes both sides
+    # store zero tiles and every difference vanish.
+    content = sum(len(s) for s in fz.values())
+    if klass != "outside" and content == 0:
+        print(f"\n  FAIL: the oracle found no content anywhere, so there was "
+              f"nothing for coverage to miss; check the source is rendering")
+        return 1
+    # The class assertions describe the footprint at the coverage zoom. Below it
+    # eligibility comes from the projected ancestors, which at the coarsest zooms
+    # span the whole extent -- an outside box cannot prune to zero there, and a
+    # straddling one cannot prune at all.
+    if args.minzoom < args.coverage_zoom:
+        print(f"\n  note: class assertions skipped, they hold only from "
+              f"z{args.coverage_zoom} down (--minzoom is {args.minzoom})")
+    elif klass == "outside" and cstat["requested"] != 0:
         print(f"\n  FAIL: an outside box must prune to zero requests, "
               f"got {cstat['requested']:,}")
         return 1
@@ -186,10 +217,14 @@ def oracle(args):
     # enumerated the same tiles full did, so the diff proves only that they agree
     # where nothing was at stake. Dilation absorbs a window drawn around the raw
     # footprint edge, which is exactly how such a box gets mistagged.
-    if klass == "straddle" and cstat["requested"] >= fstat["requested"]:
+    elif klass == "straddle" and cstat["requested"] >= fstat["requested"]:
         print(f"\n  FAIL: {args.box} is tagged straddle but pruned nothing "
               f"({cstat['requested']:,} of full's {fstat['requested']:,}); it lies "
               f"inside the dilated mask, so this run tested no pruning")
+        return 1
+    elif klass == "inside" and cstat["requested"] != fstat["requested"]:
+        print(f"\n  FAIL: {args.box} is tagged inside but pruned "
+              f"{fstat['requested'] - cstat['requested']:,} tiles")
         return 1
     if extra_total:
         print(f"\n  FAIL: coverage stored {extra_total:,} tiles full did not; "
@@ -202,42 +237,24 @@ def oracle(args):
     return 0
 
 
-def raw_grid(zoom, over, max_px):
-    """The footprint before dilation, as a (rows, cols) bool array over the extent
-    rectangle. Rendered here rather than taken from build_coverage so the chunk
-    geometry can be varied independently of the shipped constant."""
-    cmin, cmax, rmin, rmax = T.extent_rect(T.WMS_EXTENT, zoom)
-    cols, rows = cmax - cmin + 1, rmax - rmin + 1
-    grid = np.zeros((rows, cols), bool)
-    step = max(1, max_px // over)
-    chunks = [(c0, r0) for r0 in range(0, rows, step) for c0 in range(0, cols, step)]
-    for i, (c0, r0) in enumerate(chunks, 1):
-        nc, nr = min(step, cols - c0), min(step, rows - r0)
-        url = T.wms_url(T.WMS_COVERAGE_LAYER,
-                        T.tile_bbox(zoom, cmin + c0, rmin + r0, nc, nr),
-                        nc * over, nr * over)
-        grid[r0:r0 + nr, c0:c0 + nc] = T.coverage_chunk(url, nc, nr, over)
-        print(f"\r    chunk {i}/{len(chunks)}", end="", flush=True)
-    print(f"   ({len(chunks)} chunks, {grid.sum():,} cells)")
-    return grid, (cmin, rmin)
-
-
 def mask(args):
     fails = 0
     z, over = args.coverage_zoom, args.coverage_oversample
 
+    # build_coverage is called rather than reimplemented: a local copy of its
+    # chunk loop would compare itself against itself, and the transposed index
+    # this is here to catch is exactly what survives a copy.
     print(f"chunking: same parameters (z{z}, {over}x), different chunk geometry")
-    cols = T.extent_rect(T.WMS_EXTENT, z)[1] - T.extent_rect(T.WMS_EXTENT, z)[0] + 1
+    cmin, cmax, _, _ = T.extent_rect(T.WMS_EXTENT, z)
     wide, narrow = T.WMS_MAX_PX, 512
-    print(f"  extent is {cols} columns; step {wide // over} spans it in one chunk, "
-          f"step {narrow // over} needs several")
-    a, _ = raw_grid(z, over, wide)
-    b, _ = raw_grid(z, over, narrow)
-    if np.array_equal(a, b):
-        print(f"  PASS: identical, {a.sum():,} cells either way")
+    print(f"  extent is {cmax - cmin + 1} columns; step {wide // over} spans it in "
+          f"one chunk, step {narrow // over} needs several")
+    a = T.build_coverage(T.WMS_EXTENT, z, over, max_px=wide)
+    b = T.build_coverage(T.WMS_EXTENT, z, over, max_px=narrow)
+    if a == b:
+        print(f"  PASS: identical, {len(a):,} cells either way")
     else:
-        d = int((a ^ b).sum())
-        print(f"  FAIL: {d:,} cells differ between chunk geometries")
+        print(f"  FAIL: {len(a ^ b):,} cells differ between chunk geometries")
         fails += 1
 
     print(f"\ncontainment: footprint at z{args.fine_zoom} projected up into the "
@@ -258,6 +275,18 @@ def mask(args):
         fails += 1
     else:
         print(f"  PASS: every projected cell is inside the shipped mask")
+    # Containment alone is nearly free: the fine build is smaller than the mask it
+    # is checked against, so a build that collapsed would pass by projecting
+    # nothing. The gap is the dilation margin, and it is only meaningful while it
+    # stays near what the dilation is documented to cost.
+    slack = len(shipped - projected) / len(shipped)
+    verdict = "FAIL" if slack > 0.25 else "ok"
+    print(f"  margin: {len(shipped - projected):,} shipped cells the fine build "
+          f"does not reach ({100 * slack:.1f}%)  {verdict}")
+    if verdict == "FAIL":
+        print(f"    a fine build that recovers this much less is evidence about "
+              f"the service, not a passing containment check")
+        fails += 1
 
     print("\nboxes, against the shipped mask:")
     for name, (bbox, klass, _) in BOXES.items():
@@ -283,6 +312,7 @@ def cost(args):
     every tile the footprint implies at a zoom gives an estimate that is
     actually about the run being priced."""
     rng = random.Random(args.seed)
+    fails = 0
     src = T.parse_source("wms", None)
     fp = sorted(T.build_coverage(T.WMS_EXTENT, args.coverage_zoom,
                                  args.coverage_oversample))
@@ -304,19 +334,33 @@ def cost(args):
         secs = time.monotonic() - t0
         sizes = [len(d) for (_, _, st, d) in res if st == "ok"]
         errs = sum(1 for r in res if r[2] == "err")
-        rate = len(sizes) / len(res)
-        kb = (sum(sizes) / len(sizes) / 1024) if sizes else 0.0
+        ok = len(res) - errs
+        if not ok or errs / len(res) > 0.05:
+            # an errored sample is not an empty tile, and counting it as one
+            # deflates the very estimate this exists to produce
+            print(f"  {z:>4} {total:>11,}   {errs} of {len(res)} samples failed "
+                  f"-- no usable estimate")
+            fails += 1
+            continue
+        rate = len(sizes) / ok
+        mean = sum(sizes) / len(sizes) if sizes else 0.0
+        # bytes per tile is heavy-tailed, so the error of its mean is cv/sqrt(n),
+        # not the 1/sqrt(n) that would apply to the content rate
+        sd = (sum((v - mean) ** 2 for v in sizes) / (len(sizes) - 1)) ** 0.5 \
+            if len(sizes) > 1 else 0.0
+        se = (sd / mean / len(sizes) ** 0.5 * 100) if mean else 0.0
+        kb = mean / 1024
         gb = total * rate * kb * 1024 / 1e9
-        hours = total / (len(res) / secs) / 3600
+        hours = total / (ok / secs) / 3600
         tot_gb += gb
         tot_h += hours
         print(f"  {z:>4} {total:>11,} {rate:>7.1%} {kb:>8.1f} {gb:>7.1f} {hours:>7.1f}"
-              + (f"   ({errs} errors)" if errs else ""))
-    print(f"\n  cumulative: {tot_gb:.1f} GB, {tot_h:.1f} h at "
+              f" {se:>6.0f}%")
+    print(f"\n  cumulative: {tot_gb:.1f} GB, {tot_h:.0f} h at "
           f"concurrency {args.concurrency}")
-    print(f"  (sampling error on KB/tile is ~1/sqrt({args.samples}) "
-          f"= {100 / args.samples ** 0.5:.0f}% per zoom)")
-    return 0
+    print(f"  kB/tile error is cv/sqrt(n) at n={args.samples}; hours come from one "
+          f"burst on one network, so treat them as an order of magnitude")
+    return 1 if fails else 0
 
 
 def main():
@@ -330,13 +374,17 @@ def main():
     g.add_argument("--whole-extent", action="store_true",
                    help="every tile in WMS_EXTENT -- only sane at a shallow zoom")
     o.add_argument("--minzoom", type=int, default=0)
-    o.add_argument("--maxzoom", type=int, default=16)
+    o.add_argument("--maxzoom", type=int, default=None,
+                   help="default: the downloader's own maxzoom, or 10 for "
+                        "--whole-extent, where a deep run is millions of requests")
+    o.add_argument("--coverage-zoom", type=int, default=CZOOM)
+    o.add_argument("--coverage-oversample", type=int, default=COVER)
     o.add_argument("--show", type=int, default=10,
                    help="list up to this many missed tiles per zoom")
 
     m = sub.add_parser("mask", help="footprint self-checks")
-    m.add_argument("--coverage-zoom", type=int, default=11)
-    m.add_argument("--coverage-oversample", type=int, default=16)
+    m.add_argument("--coverage-zoom", type=int, default=CZOOM)
+    m.add_argument("--coverage-oversample", type=int, default=COVER)
     m.add_argument("--fine-zoom", type=int, default=13,
                    help="zoom for the independent, finer-geometry build")
 
@@ -346,14 +394,26 @@ def main():
                    type=lambda v: [int(t) for t in v.split(",")])
     c.add_argument("--seed", type=int, default=1)
     c.add_argument("--concurrency", type=int, default=8)
-    c.add_argument("--coverage-zoom", type=int, default=11)
-    c.add_argument("--coverage-oversample", type=int, default=16)
+    c.add_argument("--coverage-zoom", type=int, default=CZOOM)
+    c.add_argument("--coverage-oversample", type=int, default=COVER)
 
     args = p.parse_args()
     if args.cmd == "oracle":
-        if getattr(args, "whole_extent", False):
+        if args.whole_extent:
             args.bbox, args.box = None, None
+        if args.maxzoom is None:
+            args.maxzoom = 10 if args.whole_extent else DLZOOM
+        if args.maxzoom > args.coverage_zoom + 5:
+            p.error(f"--maxzoom {args.maxzoom} enumerates "
+                    f"4^{args.maxzoom - args.coverage_zoom} tiles per footprint "
+                    f"cell on the full side; raise --coverage-zoom or lower it")
         sys.exit(oracle(args))
+    if args.cmd == "mask" and args.fine_zoom <= args.coverage_zoom:
+        p.error("--fine-zoom must be deeper than --coverage-zoom; it exists to "
+                "sample the same footprint more finely")
+    if args.cmd == "cost" and min(args.zooms) < args.coverage_zoom:
+        p.error(f"--zooms below --coverage-zoom ({args.coverage_zoom}) have no "
+                f"footprint cells to sample from")
     if args.cmd == "cost":
         sys.exit(cost(args))
     sys.exit(mask(args))
