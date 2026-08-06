@@ -68,8 +68,14 @@ def box_downscale_2x(block: np.ndarray) -> np.ndarray:
     rgb, a = block[..., :3], block[..., 3:4] / 255.0
     pm = (rgb * a).reshape(TILE, 2, TILE, 2, 3).mean(axis=(1, 3))
     oa = a.reshape(TILE, 2, TILE, 2, 1).mean(axis=(1, 3))
+    # Colour under a fully transparent pixel is undefined by alpha but not
+    # unused: a renderer scaling the tile interpolates across the edge and pulls
+    # it in, so substituting a constant paints a fringe along every chart border
+    # in that colour. Carry the source's own colour through instead -- Traficom
+    # writes white off-sheet, which is what the border should look like.
+    plain = rgb.reshape(TILE, 2, TILE, 2, 3).mean(axis=(1, 3))
     with np.errstate(divide="ignore", invalid="ignore"):
-        orgb = np.where(oa > 1e-6, pm / oa, 0.0)
+        orgb = np.where(oa > 1e-6, pm / oa, plain)
     out = np.concatenate([np.clip(orgb, 0, 255), np.clip(oa * 255.0, 0, 255)], axis=2)
     return out.astype(np.uint8)
 
@@ -91,6 +97,10 @@ def _compute(task):
     """Worker side: decode children, box-downscale, encode. Pure CPU, no DB."""
     z, px, prow, children = task
     block = np.zeros((512, 512, 4), dtype=np.float64)
+    # A quadrant with no child tile is off-sheet, which these charts render
+    # white. Leaving it black would be invisible under alpha until the renderer
+    # interpolates across the edge, and then it is a dark fringe.
+    block[..., :3] = 255.0
     for dx, dy, blob in children:
         block[dy * TILE:dy * TILE + TILE, dx * TILE:dx * TILE + TILE] = decode(blob)
     out = box_downscale_2x(block)
