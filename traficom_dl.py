@@ -63,7 +63,17 @@ TILE_PX = 256                            # tile edge; alpha_mask reshapes on thi
 WMS = "https://julkinen.traficom.fi/s57/wms"
 WMS_LAYER = "cells"                      # "S-57 ENC Layer"
 WMS_STYLE = "style-id-202"               # "Full": soundings, contours, land detail
-WMS_EXTENT = (18.5, 59.0, 32.0, 70.2)    # Finnish waters, incl. Saimaa and the Bothnian Bay
+# Wider than the declared coverage on every side -- rendering the coverage layer
+# over a deliberately oversized box puts it at lon 19.05..30.37, lat 58.84..66.50.
+# build_coverage asserts the footprint does not touch the edge, so a service that
+# grows past this fails loudly instead of being silently cropped.
+WMS_EXTENT = (18.0, 58.0, 32.0, 70.2)
+# The service publishes its own footprint as the S-57 usage bands. The parent
+# layer renders exactly the union of coverage.1..coverage.9 (verified pixel-for-
+# pixel), so one request replaces nine. Overview alone is NOT enough: Traficom's
+# bands are not nested -- Saimaa has Coastal cover with no General above it.
+WMS_COVERAGE_LAYER = "coverage"
+WMS_MAX_PX = 2048                        # per-request GetMap dimension ceiling
 MERC_R = 20037508.342789244              # web-mercator half-circumference, metres
 ATTRIBUTION = ("© Traficom. Not for navigation use. "
                "Does not meet official nautical chart requirements.")
@@ -103,15 +113,24 @@ def parse_source(kind, layer):
 def url_for(src, z, x, y):
     if src["kind"] == "wmts":
         return WMTS_TILE.format(layer=requests.utils.quote(src["layer"]), z=z, x=x, y=y)
+    return wms_url(src["layer"], tile_bbox(z, x, y, 1, 1), TILE_PX, TILE_PX, WMS_STYLE)
+
+
+def tile_bbox(z, x, y, nx, ny):
+    """EPSG:3857 bounds of an nx x ny block of tiles with (x, y) at its top-left.
+    XYZ rows run south, so the block's top edge comes from y and its bottom from
+    y + ny."""
     span = 2 * MERC_R / (1 << z)
-    bbox = (-MERC_R + x * span, MERC_R - (y + 1) * span,
-            -MERC_R + (x + 1) * span, MERC_R - y * span)
+    return (-MERC_R + x * span, MERC_R - (y + ny) * span,
+            -MERC_R + (x + nx) * span, MERC_R - y * span)
+
+
+def wms_url(layers, bbox, w, h, style=""):
     return WMS + "?" + urlencode({
         "SERVICE": "WMS", "REQUEST": "GetMap", "VERSION": "1.1.1",
-        "LAYERS": src["layer"], "STYLES": WMS_STYLE, "SRS": "EPSG:3857",
+        "LAYERS": layers, "STYLES": style, "SRS": "EPSG:3857",
         "BBOX": ",".join(f"{v:.6f}" for v in bbox),
-        "WIDTH": TILE_PX, "HEIGHT": TILE_PX, "FORMAT": "image/png",
-        "TRANSPARENT": "true",
+        "WIDTH": w, "HEIGHT": h, "FORMAT": "image/png", "TRANSPARENT": "true",
         # without this a server configured for INIMAGE renders the error as an
         # opaque PNG, which would classify as chart data and seed the fill
         "EXCEPTIONS": "application/vnd.ogc.se_xml"})
@@ -122,15 +141,126 @@ def bbox_limits(extent, minzoom, maxzoom):
     for TileMatrixSetLimits on a service that declares none. Every zoom in range
     gets a key: run() takes its zoom list from these keys, so a missing one is a
     silently skipped zoom."""
+    return {z: extent_rect(extent, z) for z in range(minzoom, maxzoom + 1)}
+
+
+def extent_rect(extent, z):
+    """Tile rectangle (cmin, cmax, rmin, rmax) covering a geographic extent."""
     minlon, minlat, maxlon, maxlat = extent
-    limits = {}
-    for z in range(minzoom, maxzoom + 1):
-        last = (1 << z) - 1
-        limits[z] = (max(0, min(last, lon2x(minlon, z))),
-                     max(0, min(last, lon2x(maxlon, z))),
-                     max(0, min(last, lat2y(maxlat, z))),
-                     max(0, min(last, lat2y(minlat, z))))
-    return limits
+    last = (1 << z) - 1
+    clamp = lambda v: max(0, min(last, v))
+    return (clamp(lon2x(minlon, z)), clamp(lon2x(maxlon, z)),
+            clamp(lat2y(maxlat, z)), clamp(lat2y(minlat, z)))
+
+
+def coverage_chunk(url, nc, nr, over):
+    """One coverage render, as an nr x nc boolean block. A hole here would prune
+    real chart area with no other symptom, so every failure is fatal rather than
+    retried into an error table."""
+    for attempt in range(3):
+        try:
+            r = session().get(url, timeout=180)
+            if not r.headers.get("content-type", "").startswith("image"):
+                raise ValueError(f"HTTP {r.status_code}: {r.content[:200]!r}")
+            img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+            if img.size != (nc * over, nr * over):
+                raise ValueError(f"server returned {img.size}, requested "
+                                 f"{(nc * over, nr * over)}; lower --coverage-oversample")
+            a = np.asarray(img.getchannel("A")) > 0
+            return a.reshape(nr, over, nc, over).max(axis=(1, 3))
+        except (requests.RequestException, OSError, ValueError) as e:
+            if attempt == 2:
+                sys.exit(f"coverage layer request failed after 3 attempts: {e}")
+
+
+def build_coverage(extent, zoom, over):
+    """The service's declared footprint, as the set of `zoom` tiles it touches.
+
+    Each cell is rendered `over` pixels across and max-pooled, then the grid is
+    dilated by one cell: coarse rasterisation over-includes at polygon boundaries
+    but drops the occasional small cell, so the dilation is what makes the result
+    independent of the sampling resolution. Costs ~8% more cells."""
+    cmin, cmax, rmin, rmax = extent_rect(extent, zoom)
+    cols, rows = cmax - cmin + 1, rmax - rmin + 1
+    grid = np.zeros((rows, cols), bool)
+    step = max(1, WMS_MAX_PX // over)
+    chunks = [(c0, r0) for r0 in range(0, rows, step) for c0 in range(0, cols, step)]
+    for i, (c0, r0) in enumerate(chunks, 1):
+        nc, nr = min(step, cols - c0), min(step, rows - r0)
+        url = wms_url(WMS_COVERAGE_LAYER,
+                      tile_bbox(zoom, cmin + c0, rmin + r0, nc, nr), nc * over, nr * over)
+        grid[r0:r0 + nr, c0:c0 + nc] = coverage_chunk(url, nc, nr, over)
+        print(f"\r  coverage: chunk {i}/{len(chunks)}", end="", flush=True)
+    print()
+
+    frac = grid.sum() / grid.size
+    if not 0.02 < frac < 0.95:
+        sys.exit(f"coverage layer rendered {100 * frac:.1f}% of the extent, which is not a "
+                 f"plausible footprint. A blank render would prune everything and an opaque "
+                 f"one would defeat the pruning, and neither reports an HTTP error.")
+    if grid[0].any() or grid[-1].any() or grid[:, 0].any() or grid[:, -1].any():
+        sys.exit(f"declared coverage reaches the edge of WMS_EXTENT {extent}, so the extent "
+                 f"is cropping it. Widen the constant and re-run; a mask built from a cropped "
+                 f"render silently loses whatever lies beyond.")
+
+    dil = np.zeros_like(grid)
+    pad = np.pad(grid, 1)
+    for dy in (0, 1, 2):
+        for dx in (0, 1, 2):
+            dil |= pad[dy:dy + rows, dx:dx + cols]
+    return {(cmin + int(c), rmin + int(r)) for r, c in zip(*np.nonzero(dil))}
+
+
+def coverage_ancestors(footprint, zoom, minzoom):
+    """Footprint cells projected up to each zoom above `zoom`, so eligibility at a
+    coarse zoom is a set lookup rather than a walk over every descendant cell."""
+    return {z: {(x >> (zoom - z), y >> (zoom - z)) for (x, y) in footprint}
+            for z in range(minzoom, zoom)}
+
+
+def coverage_key(args, src):
+    """Everything that determines the footprint's content. A cache hit on anything
+    less silently reuses a mask built for a different question."""
+    return "|".join(str(v) for v in (args.coverage_zoom, args.coverage_oversample,
+                                     WMS_COVERAGE_LAYER, src["extent"]))
+
+
+def load_coverage(con, key):
+    if get_meta(con, "coverage_key") != key:
+        return None
+    return {(x, y) for x, y in con.execute("SELECT x, y FROM _coverage")} or None
+
+
+def store_coverage(con, footprint, key, args):
+    con.execute("DELETE FROM _coverage")
+    con.executemany("INSERT INTO _coverage (x, y) VALUES (?,?)", sorted(footprint))
+    set_meta(con, "coverage_key", key)
+    set_meta(con, "coverage_zoom", args.coverage_zoom)
+    set_meta(con, "coverage_oversample", args.coverage_oversample)
+    set_meta(con, "coverage_layer", WMS_COVERAGE_LAYER)
+    con.commit()
+
+
+def run_shape(args):
+    """What `completed_zoom` was measured against. The marker is a bare zoom
+    number, so resuming under a different mode, bbox, zoom range or footprint
+    would otherwise skip work the earlier run never did."""
+    return "|".join(str(v) for v in (args.mode, args.bbox, args.minzoom, args.maxzoom,
+                                     args.coverage_zoom, args.coverage_oversample))
+
+
+def resume_point(con, args, zooms):
+    """Index into `zooms` to restart from, honouring completed_zoom only when the
+    run is shaped the same way as the one that wrote it."""
+    completed = get_meta(con, "completed_zoom")
+    if completed is None:
+        return 0
+    if get_meta(con, "run_shape") != run_shape(args):
+        print("  run differs from the one that wrote completed_zoom "
+              "(mode, bbox, zoom range or footprint); re-walking every zoom")
+        return 0
+    completed = int(completed)
+    return zooms.index(completed) + 1 if completed in zooms else 0
 
 
 def parse_limits(layer):
@@ -226,6 +356,8 @@ def init_db(con, src, mode):
                 "(z INTEGER, x INTEGER, y INTEGER, PRIMARY KEY (z, x, y))")
     con.execute("CREATE TABLE IF NOT EXISTS _errors "
                 "(z INTEGER, x INTEGER, y INTEGER, PRIMARY KEY (z, x, y))")
+    con.execute("CREATE TABLE IF NOT EXISTS _coverage "
+                "(x INTEGER, y INTEGER, PRIMARY KEY (x, y))")
     for k, v in {"name": layer, "format": "png", "version": "1.0",
                  "type": "overlay" if mode == "full" else "baselayer",
                  "attribution": ATTRIBUTION,
@@ -582,6 +714,113 @@ def fill_descent(con, args, src, limits, bbox, zooms):
           f"empty {st['empty']:,}, err {st['err']:,}")
 
 
+def coverage_descent(con, args, src, limits, bbox, zooms):
+    """Fetch every tile the service's declared coverage touches, at every zoom.
+
+    Unlike descent/fill/mask this never infers a deeper zoom's candidates from a
+    shallower zoom's content, so scale-dependent rendering cannot strand content
+    behind a blank ancestor. The same footprint gates every zoom.
+
+    Bounded to the footprint, not a full grid: over Finnish waters it keeps
+    roughly a third of the extent rectangle, and off-footprint open sea and inland
+    are never requested.
+
+    Resumable and error-tracking like the descent path -- an error is recorded and
+    retried, never counted as absence."""
+    key = coverage_key(args, src)
+    footprint = load_coverage(con, key)
+    if footprint is None:
+        print(f"  building coverage footprint at z{args.coverage_zoom} "
+              f"({args.coverage_oversample}x oversample) ...")
+        footprint = build_coverage(src["extent"], args.coverage_zoom,
+                                   args.coverage_oversample)
+        store_coverage(con, footprint, key, args)
+    print(f"  coverage: {len(footprint):,} cells at z{args.coverage_zoom}")
+    above = coverage_ancestors(footprint, args.coverage_zoom, zooms[0])
+
+    def eligible(z, x, y):
+        if z >= args.coverage_zoom:
+            s = z - args.coverage_zoom
+            return (x >> s, y >> s) in footprint
+        return (x, y) in above[z]
+
+    recovered = retry_errors(con, src, args.concurrency)
+    if recovered:
+        print(f"  startup: recovered {recovered} previously-failed tile(s)")
+    start = resume_point(con, args, zooms)
+    if start >= len(zooms) and not con.execute("SELECT count(*) FROM _errors").fetchone()[0]:
+        print("already complete")
+        con.close()
+        return
+
+    totals = {"ok": 0, "empty": 0, "err": 0}
+    for z in zooms[start:]:
+        cmin, cmax, rmin, rmax = clamped_bounds(limits[z], bbox, z)
+        if cmin > cmax or rmin > rmax:
+            sys.exit(f"z{z} has an empty tile rectangle -- check --bbox ordering "
+                     f"(minlon,minlat,maxlon,maxlat). Nothing was marked complete.")
+        cands = [(x, y) for y in range(rmin, rmax + 1) for x in range(cmin, cmax + 1)
+                 if eligible(z, x, y)]
+        rect = (cmax - cmin + 1) * (rmax - rmin + 1)
+        already = fetched_at(con, z) | data_tiles_at(con, z)
+        todo = [c for c in cands if c not in already]
+        zst = {"ok": 0, "empty": 0, "err": 0}
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            for i in range(0, len(todo), args.batch):
+                chunk = todo[i:i + args.batch]
+                for x, y, status, data in pool.map(lambda c: fetch(src, z, *c), chunk):
+                    zst[status] += 1
+                    if status == "err":
+                        con.execute("INSERT OR IGNORE INTO _errors (z, x, y) VALUES (?,?,?)",
+                                    (z, x, y))
+                        continue
+                    con.execute("INSERT OR IGNORE INTO _fetched (z, x, y) VALUES (?,?,?)",
+                                (z, x, y))
+                    if status == "ok":
+                        store_tile(con, z, x, y, data)
+                con.commit()
+                print(f"\r  z{z:<2} req {sum(zst.values()):>7}/{len(todo):<7} "
+                      f"data={zst['ok']:>6} empty={zst['empty']:>7} err={zst['err']}",
+                      end="", flush=True)
+        print(f"   (coverage kept {len(cands):,} of {rect:,})")
+        if zst["err"]:
+            print(f"  z{z}: retried errors, recovered "
+                  f"{retry_errors(con, src, args.concurrency, rounds=2)}")
+        for k in zst:
+            totals[k] += zst[k]
+        # a zoom whose errors did not clear is not complete: leave the marker
+        # where it is so the next run re-walks it rather than skipping past
+        if con.execute("SELECT count(*) FROM _errors WHERE z=?", (z,)).fetchone()[0]:
+            print(f"  z{z}: unrecovered errors, not marking complete")
+            break
+        set_meta(con, "completed_zoom", z)
+        set_meta(con, "run_shape", run_shape(args))
+        con.execute("DELETE FROM _fetched WHERE z=?", (z,))
+        con.commit()
+
+    b = compute_bounds(con)
+    if b:
+        set_meta(con, "bounds", "{:.5f},{:.5f},{:.5f},{:.5f}".format(*b))
+    set_meta(con, "minzoom", str(zooms[0]))
+    set_meta(con, "maxzoom", str(zooms[-1]))
+    con.commit()
+    remaining = con.execute("SELECT count(*) FROM _errors").fetchone()[0]
+    if remaining == 0:
+        con.execute("DROP TABLE IF EXISTS _fetched")
+        con.execute("DROP TABLE IF EXISTS _errors")
+        con.execute("DROP TABLE IF EXISTS _coverage")
+        con.commit()
+        con.execute("VACUUM")
+    stored = con.execute("SELECT count(*) FROM tiles").fetchone()[0]
+    con.close()
+    print(f"\n{src['layer']} [coverage]: requested {sum(totals.values()):,}, "
+          f"stored {stored:,}, empty {totals['empty']:,}, unrecovered errors {remaining:,}")
+    if remaining:
+        print(f"  {remaining:,} tiles still failing -- the archive is INCOMPLETE; "
+              f"re-run to retry them before treating it as finished")
+    print(f"  wrote {args.out}")
+
+
 def run(args):
     src = parse_source(args.source, args.layer)
 
@@ -597,10 +836,14 @@ def run(args):
     # mask and descent both prune on an out-of-band "no tile here" signal. A WMS
     # answers out-of-coverage with a transparent 200, indistinguishable from the
     # placeholder band they are built to tunnel through, so neither ever prunes.
+    if args.mode == "coverage" and src["extent"] is None:
+        sys.exit(f"--mode coverage reads the service's declared coverage layer, which the "
+                 f"{src['kind']} source does not publish; it declares per-zoom tile limits "
+                 f"instead, so use --mode fill or full there")
     if args.mode in ("mask", "descent") and not src["empty_on_4xx"]:
         sys.exit(f"--mode {args.mode} prunes on 400/404, which the {src['kind']} source "
                  f"never returns; every empty tile would be tunnelled instead. "
-                 f"Use --mode full (bounded by --bbox) until the coverage mode lands.")
+                 f"Use --mode coverage, which bounds the run to the declared footprint.")
     if args.repair and args.refresh:
         sys.exit("--repair and --refresh do different things; pass one")
     if args.refresh and not src["conditional"]:
@@ -611,6 +854,10 @@ def run(args):
     init_db(con, src, args.mode)
 
     if args.repair:
+        if get_meta(con, "coverage_key"):
+            sys.exit("--repair re-derives candidates by quadtree descent, the inference "
+                     "coverage mode exists to avoid; it would under-cover this archive and "
+                     "still report a verdict. Re-run --mode coverage instead.")
         repair(con, args, src, limits, bbox, zooms)
         return
 
@@ -626,13 +873,15 @@ def run(args):
         fill_descent(con, args, src, limits, bbox, zooms)
         return
 
+    if args.mode == "coverage":
+        coverage_descent(con, args, src, limits, bbox, zooms)
+        return
+
     startup = retry_errors(con, src, args.concurrency)
     if startup:
         print(f"startup: recovered {startup} previously-failed tile(s)")
 
-    completed = get_meta(con, "completed_zoom")
-    completed = int(completed) if completed is not None else None
-    start_idx = zooms.index(completed) + 1 if completed in zooms else 0
+    start_idx = resume_point(con, args, zooms)
     if start_idx >= len(zooms):
         print("already complete"); return
 
@@ -680,6 +929,7 @@ def run(args):
             print(f"  z{z}: retried errors, recovered {rec}")
 
         set_meta(con, "completed_zoom", z)
+        set_meta(con, "run_shape", run_shape(args))
         con.execute("DELETE FROM _fetched WHERE z=?", (z,))
         con.commit()
         frontier = data_tiles_at(con, z)
@@ -719,7 +969,15 @@ def main():
                    help='wmts: required, e.g. "Rannikkokartat public". '
                         f'wms: defaults to "{WMS_LAYER}"')
     p.add_argument("--out", required=True)
-    p.add_argument("--mode", choices=["descent", "full", "mask", "fill"], default="fill")
+    p.add_argument("--mode", choices=["descent", "full", "mask", "fill", "coverage"],
+                   default=None, help="default: coverage for wms, fill for wmts")
+    p.add_argument("--coverage-zoom", type=int, default=11,
+                   help="coverage mode: zoom whose tiles the footprint is built on. "
+                        "Deeper means a tighter footprint but more coverage renders, "
+                        "and shrinks the one-cell dilation margin")
+    p.add_argument("--coverage-oversample", type=int, default=16,
+                   help="coverage mode: pixels per footprint cell when rendering the "
+                        "coverage layer; 16 is where the footprint stops changing")
     p.add_argument("--solid-zoom", type=int, default=11,
                    help="fill mode: last dense zoom before the placeholder band; "
                         "its content defines the footprint the fill is bounded to")
@@ -740,6 +998,13 @@ def main():
     args = p.parse_args()
     if args.source == "wmts" and not args.layer:
         p.error("--layer is required for --source wmts")   # exit 2, with usage
+    if args.mode is None:
+        args.mode = "coverage" if args.source == "wms" else "fill"
+    if not 6 <= args.coverage_zoom <= 14:
+        p.error("--coverage-zoom outside 6..14: shallower degenerates into the full "
+                "grid, deeper makes the footprint build larger than the download")
+    if not 1 <= args.coverage_oversample <= 64:
+        p.error("--coverage-oversample outside 1..64")
     run(args)
 
 

@@ -30,6 +30,34 @@ edition date, so `refresh` and `currency` do not apply to WMS-sourced files —
 keeping one current means re-downloading it. Because out-of-coverage arrives as a
 transparent 200 rather than a 404, `--mode mask` and `--mode descent` are refused
 on this source: both prune on 400/404 and would tunnel through every empty tile.
+`coverage` is the mode for this source, and is its default.
+
+**Mode: coverage (WMS only).** Every other mode decides a deeper zoom's candidates
+from a shallower zoom's content. That holds for a pre-rendered pyramid but not for
+a WMS rendering S-57 on demand: usage-band visibility is scale-gated, so a cell can
+draw nothing at one scale and a full harbour chart at another, and following
+content strands whatever sits behind a blank ancestor. So the footprint is read
+from the service's own `coverage` layer instead, and the same footprint gates every
+zoom.
+
+The parent `coverage` layer renders exactly the union of `coverage.1`–`coverage.9`
+(verified pixel-for-pixel), so one request replaces nine. `coverage.1` alone is not
+enough — Traficom's usage bands are not nested, and Saimaa carries Coastal cover
+with no General above it.
+
+Footprint cells are rendered `--coverage-oversample` pixels across (default 16,
+where the footprint stops changing) and max-pooled, then dilated by one cell.
+Coarse rasterisation over-includes at polygon boundaries but drops the occasional
+small cell, so the dilation is what makes the result independent of the sampling
+resolution; it costs about 8% more cells. The build asserts the footprint does not
+touch the edge of the configured extent, so an extent that crops real coverage
+fails loudly rather than silently losing what lies beyond.
+
+Verified against `full` on a box straddling the footprint edge (Åland outer
+skerries, z8–13): 219 requests against full's 347, the same 46 content tiles, none
+missed. Inland Lapland and the open Baltic prune to zero requests. Not yet
+oracle-compared at z0–7 or z14–16, and the comparison set is still one straddle
+box — see the tracking issue before treating deep zooms as verified.
 
 Attribution required: *"Source: Traficom. Not for navigation use. Does not meet
 official nautical chart requirements."*
