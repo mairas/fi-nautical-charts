@@ -10,10 +10,26 @@ sets from Finnish open nautical charts.
   `WGS84_Pseudo-Mercator` tile matrix is standard web-mercator XYZ (z0–15 for
   the marine layers). This is the authoritative, license-clean source.
 
+- **Traficom S-57 ENC WMS** (`--source wms`) — the electronic navigational chart
+  rendered server-side to raster. Endpoint `https://julkinen.traficom.fi/s57/wms`,
+  layer `cells`, style `style-id-202` ("Full"). A different product from the raster
+  charts above, not a replacement for any of them.
+
 The rendered raster charts are **only** available through the WMTS view service;
 Traficom's bulk download service offers vector shapefiles (WFS) and depth GeoTIFFs
 (WCS), not the chart images. So tile-by-tile WMTS fetching is the route to raster
 MBTiles — legitimate here because the WMTS is the CC BY 4.0 distribution.
+
+The same argument covers the ENC WMS independently: its own `GetCapabilities`
+declares `AccessConstraints` of CC BY 4.0, *"Lähde: Traficom. Ei navigointikäyttöön.
+Ei täytä asianmukaisen merikartan vaatimuksia."*
+
+The WMS has no `TileMatrixSetLimits`, so its per-zoom tile rectangles are derived
+from a configured extent instead. It also serves no `Last-Modified`, `ETag` or
+edition date, so `refresh` and `currency` do not apply to WMS-sourced files —
+keeping one current means re-downloading it. Because out-of-coverage arrives as a
+transparent 200 rather than a 404, `--mode mask` and `--mode descent` are refused
+on this source: both prune on 400/404 and would tunnel through every empty tile.
 
 Attribution required: *"Source: Traficom. Not for navigation use. Does not meet
 official nautical chart requirements."*

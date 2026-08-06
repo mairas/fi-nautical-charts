@@ -3,13 +3,22 @@
 # requires-python = ">=3.10"
 # dependencies = ["requests", "pillow", "numpy"]
 # ///
-"""Download a Traficom WMTS raster layer to MBTiles, minimising empty requests.
+"""Download a Traficom raster chart layer to MBTiles, minimising empty requests.
+
+Two sources, selected with --source:
+
+  wmts  (default) the rasteripalvelu WMTS chart products (Merikarttasarjat,
+        Rannikkokartat, Satamakartat, ...). Per-zoom tile rectangles come from
+        the service's own TileMatrixSetLimits.
+  wms   the S-57 ENC rendered server-side to raster (GetMap). A WMS has no
+        declared tile rectangle, so each zoom's rectangle is derived from the
+        source's geographic extent instead. No conditional-request support.
 
 Two levers keep empty-tile requests down:
 
   1. TileMatrixSetLimits (from GetCapabilities) bound each zoom to the layer's
      declared col/row rectangle -> no out-of-range (HTTP 400) requests.
-  2. Quadtree descent (default): at zoom z+1 only the four children of tiles
+  2. Quadtree descent: at zoom z+1 only the four children of tiles
      that had data at zoom z are requested. Blank ocean/inland subtrees are
      pruned. This assumes "parent empty => all children empty" -- true for a
      base chart (Rannikkokartat), NOT for large-scale-only overlays. For
@@ -17,9 +26,11 @@ Two levers keep empty-tile requests down:
      limits rectangle, skip transparent tiles).
 
 Standard web-mercator XYZ: WMTS TileMatrix=z, TileCol=x, TileRow=y (y down).
-MBTiles stores TMS rows, so rows are flipped on write. Empty = HTTP 400/404 or
-a fully-transparent 200 PNG; those are skipped. Resumable: an _fetched sidecar
-plus a completed_zoom marker let an interrupted run continue.
+MBTiles stores TMS rows, so rows are flipped on write. A fully-transparent 200
+PNG is empty on either source; 400/404 is empty only on WMTS, where it means
+out-of-range -- a WMS answers those only for a malformed request, so there they
+are errors. Resumable: an _fetched sidecar plus a completed_zoom marker let an
+interrupted run continue.
 """
 
 from __future__ import annotations
@@ -33,6 +44,7 @@ import sqlite3
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlencode
 
 import numpy as np
 import requests
@@ -40,13 +52,19 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-CAPS = ("https://julkinen.traficom.fi/rasteripalvelu/wmts"
-        "?service=WMTS&request=GetCapabilities")
-TILE = ("https://julkinen.traficom.fi/rasteripalvelu/wmts"
-        "?service=WMTS&request=GetTile&version=1.0.0&style="
-        "&tilematrixset=WGS84_Pseudo-Mercator&format=image/png"
-        "&layer=Traficom:{layer}"
-        "&tilematrix=WGS84_Pseudo-Mercator:{z}&tilecol={x}&tilerow={y}")
+WMTS_CAPS = ("https://julkinen.traficom.fi/rasteripalvelu/wmts"
+             "?service=WMTS&request=GetCapabilities")
+WMTS_TILE = ("https://julkinen.traficom.fi/rasteripalvelu/wmts"
+             "?service=WMTS&request=GetTile&version=1.0.0&style="
+             "&tilematrixset=WGS84_Pseudo-Mercator&format=image/png"
+             "&layer=Traficom:{layer}"
+             "&tilematrix=WGS84_Pseudo-Mercator:{z}&tilecol={x}&tilerow={y}")
+TILE_PX = 256                            # tile edge; alpha_mask reshapes on this
+WMS = "https://julkinen.traficom.fi/s57/wms"
+WMS_LAYER = "cells"                      # "S-57 ENC Layer"
+WMS_STYLE = "style-id-202"               # "Full": soundings, contours, land detail
+WMS_EXTENT = (18.5, 59.0, 32.0, 70.2)    # Finnish waters, incl. Saimaa and the Bothnian Bay
+MERC_R = 20037508.342789244              # web-mercator half-circumference, metres
 ATTRIBUTION = ("© Traficom. Not for navigation use. "
                "Does not meet official nautical chart requirements.")
 
@@ -66,9 +84,58 @@ def session():
     return s
 
 
+def parse_source(kind, layer):
+    """Source descriptor: what to fetch, and how this service behaves.
+
+    conditional  -- honours If-Modified-Since (304), so --refresh can delta-check
+    empty_on_4xx -- 400/404 means "no tile here" rather than a broken request
+    extent       -- geographic coverage, when the service declares no tile limits
+    """
+    if kind == "wmts":
+        return {"kind": "wmts", "layer": layer, "conditional": True,
+                "empty_on_4xx": True, "extent": None}
+    if kind == "wms":
+        return {"kind": "wms", "layer": layer or WMS_LAYER, "conditional": False,
+                "empty_on_4xx": False, "extent": WMS_EXTENT}
+    sys.exit(f"unknown source kind: {kind}")
+
+
+def url_for(src, z, x, y):
+    if src["kind"] == "wmts":
+        return WMTS_TILE.format(layer=requests.utils.quote(src["layer"]), z=z, x=x, y=y)
+    span = 2 * MERC_R / (1 << z)
+    bbox = (-MERC_R + x * span, MERC_R - (y + 1) * span,
+            -MERC_R + (x + 1) * span, MERC_R - y * span)
+    return WMS + "?" + urlencode({
+        "SERVICE": "WMS", "REQUEST": "GetMap", "VERSION": "1.1.1",
+        "LAYERS": src["layer"], "STYLES": WMS_STYLE, "SRS": "EPSG:3857",
+        "BBOX": ",".join(f"{v:.6f}" for v in bbox),
+        "WIDTH": TILE_PX, "HEIGHT": TILE_PX, "FORMAT": "image/png",
+        "TRANSPARENT": "true",
+        # without this a server configured for INIMAGE renders the error as an
+        # opaque PNG, which would classify as chart data and seed the fill
+        "EXCEPTIONS": "application/vnd.ogc.se_xml"})
+
+
+def bbox_limits(extent, minzoom, maxzoom):
+    """Per-zoom tile rectangles derived from a geographic extent -- the stand-in
+    for TileMatrixSetLimits on a service that declares none. Every zoom in range
+    gets a key: run() takes its zoom list from these keys, so a missing one is a
+    silently skipped zoom."""
+    minlon, minlat, maxlon, maxlat = extent
+    limits = {}
+    for z in range(minzoom, maxzoom + 1):
+        last = (1 << z) - 1
+        limits[z] = (max(0, min(last, lon2x(minlon, z))),
+                     max(0, min(last, lon2x(maxlon, z))),
+                     max(0, min(last, lat2y(maxlat, z))),
+                     max(0, min(last, lat2y(minlat, z))))
+    return limits
+
+
 def parse_limits(layer):
     import re
-    xml = session().get(CAPS, timeout=90).text
+    xml = session().get(WMTS_CAPS, timeout=90).text
     block = next((b for b in xml.split("<Layer>")
                   if f"<ows:Identifier>Traficom:{layer}</ows:Identifier>" in b), None)
     if block is None:
@@ -104,26 +171,50 @@ def y2lat(y, z):
     return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / (1 << z)))))
 
 
-def fetch(layer, z, x, y, ims=None):
+def _get_tile(src, z, x, y, ims=None):
+    """The one HTTP call site. Classifies more finely than callers need:
+
+      ok / blank (transparent 200) / outside (no tile) / notmodified / err
+
+    fetch() narrows blank and outside to "empty"; fetch_masked() needs them
+    apart, since a blank tile is tunnelled through and an outside tile is pruned.
+    """
+    if ims and not src["conditional"]:
+        raise ValueError(f"{src['kind']} source does not support If-Modified-Since")
     headers = {"If-Modified-Since": ims} if ims else None
     try:
-        r = session().get(TILE.format(layer=requests.utils.quote(layer), z=z, x=x, y=y),
-                          timeout=30, headers=headers)
-    except requests.RequestException:
-        return x, y, "err", None
-    if r.status_code == 304:
-        return x, y, "notmodified", None
-    if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
-        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
-        if img.getchannel("A").getextrema()[1] == 0:
-            return x, y, "empty", None
-        return x, y, "ok", r.content
-    if r.status_code in (400, 404):
-        return x, y, "empty", None
-    return x, y, "err", None
+        r = session().get(url_for(src, z, x, y), timeout=30, headers=headers)
+        if r.status_code == 304:
+            return "notmodified", None
+        if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
+            img = Image.open(io.BytesIO(r.content)).convert("RGBA")
+            if img.getchannel("A").getextrema()[1] == 0:
+                return "blank", None
+            return "ok", r.content
+    except (requests.RequestException, OSError, ValueError):
+        # an undecodable body is an err like any other: it belongs in _errors,
+        # not in a traceback that kills a multi-hour run mid-batch
+        return "err", None
+    if r.status_code in (400, 404) and src["empty_on_4xx"]:
+        return "outside", None
+    return "err", None
 
 
-def init_db(con, layer, mode):
+def fetch(src, z, x, y, ims=None):
+    status, data = _get_tile(src, z, x, y, ims)
+    return x, y, ("empty" if status in ("blank", "outside") else status), data
+
+
+def init_db(con, src, mode):
+    layer = src["layer"]
+    has_meta = con.execute("SELECT name FROM sqlite_master WHERE type='table' "
+                           "AND name='metadata'").fetchone()
+    prior = dict(con.execute("SELECT name, value FROM metadata "
+                             "WHERE name IN ('source', 'source_layer')")) if has_meta else {}
+    if prior and (prior.get("source"), prior.get("source_layer")) != (src["kind"], layer):
+        sys.exit(f"existing archive is {prior.get('source')}:{prior.get('source_layer')}; "
+                 f"refusing to write {src['kind']}:{layer} into it. Mixing sources in one "
+                 f"file interleaves two chart products with nothing to tell them apart.")
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
     con.execute("CREATE TABLE IF NOT EXISTS tiles "
@@ -138,8 +229,13 @@ def init_db(con, layer, mode):
     for k, v in {"name": layer, "format": "png", "version": "1.0",
                  "type": "overlay" if mode == "full" else "baselayer",
                  "attribution": ATTRIBUTION,
-                 "description": f"Traficom {layer} (WMTS, mode={mode})"}.items():
+                 "description": f"Traficom {layer} ({src['kind'].upper()}, mode={mode})"}.items():
         con.execute("INSERT OR IGNORE INTO metadata (name, value) VALUES (?, ?)", (k, v))
+    # provenance must be written on every run, not INSERT OR IGNORE'd: it is what
+    # the guard above and the currency/refresh tooling dispatch on, and a key that
+    # only ever lands on a fresh file can never identify one already created
+    for k, v in {"source": src["kind"], "source_layer": layer}.items():
+        con.execute("INSERT OR REPLACE INTO metadata (name, value) VALUES (?, ?)", (k, v))
     con.commit()
 
 
@@ -217,7 +313,7 @@ def gen_candidates(z, limits, bbox, frontier, mode, full_until):
     return cands, rect
 
 
-def retry_errors(con, layer, concurrency, rounds=3):
+def retry_errors(con, src, concurrency, rounds=3):
     """Re-fetch tiles recorded in _errors; store recoveries, drop resolved ones."""
     recovered = 0
     for _ in range(rounds):
@@ -226,7 +322,7 @@ def retry_errors(con, layer, concurrency, rounds=3):
             break
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             results = list(pool.map(
-                lambda t: (t[0],) + fetch(layer, t[0], t[1], t[2]), errs))
+                lambda t: (t[0],) + fetch(src, t[0], t[1], t[2]), errs))
         for z, x, y, status, data in results:
             if status == "err":
                 continue
@@ -239,11 +335,11 @@ def retry_errors(con, layer, concurrency, rounds=3):
     return recovered
 
 
-def repair(con, args, limits, bbox, zooms):
+def repair(con, args, src, limits, bbox, zooms):
     """Re-derive the candidate set from stored data and re-fetch any tile absent
     from the archive. Recovers tiles that failed on the original run (which may
     predate error tracking), while re-confirming empties harmlessly."""
-    print(f"repair: re-deriving missing tiles for {args.layer} ...")
+    print(f"repair: re-deriving missing tiles for {src['layer']} ...")
     frontier = None
     total = 0
     for z in zooms:
@@ -253,7 +349,7 @@ def repair(con, args, limits, bbox, zooms):
         if absent:
             con.executemany("INSERT OR IGNORE INTO _errors (z, x, y) VALUES (?,?,?)", absent)
             con.commit()
-            rec = retry_errors(con, args.layer, args.concurrency)
+            rec = retry_errors(con, src, args.concurrency)
             total += rec
             print(f"  z{z}: {len(absent):,} absent -> recovered {rec}")
         frontier = data_tiles_at(con, z)
@@ -268,7 +364,7 @@ def repair(con, args, limits, bbox, zooms):
     print(f"repair done: recovered {total}, {stored:,} stored, {remaining} still failing")
 
 
-def refresh(con, args, limits, bbox, zooms):
+def refresh(con, args, src, limits, bbox, zooms):
     """Re-check the existing coverage with If-Modified-Since = the day after the
     last download, so only tiles reseded since (new editions) transfer data;
     unchanged tiles return 304. Existing coverage only -- new chart areas need a
@@ -286,7 +382,7 @@ def refresh(con, args, limits, bbox, zooms):
         cands, _ = gen_candidates(z, limits, bbox, frontier, args.mode, args.full_until)
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             results = list(pool.map(
-                lambda c: fetch(args.layer, z, c[0], c[1], ims), cands))
+                lambda c: fetch(src, z, c[0], c[1], ims), cands))
         for x, y, status, data in results:
             checked += 1
             row = (1 << z) - 1 - y
@@ -315,7 +411,7 @@ def alpha_mask(img, res=32):
     """res×res boolean coverage mask: a cell is True if any of its pixels are
     opaque (charted). Max-pooled so boundaries over-include -> no gaps."""
     a = np.asarray(img.getchannel("A"))
-    b = 256 // res
+    b = TILE_PX // res
     return a.reshape(res, b, res, b).max(axis=(1, 3)) > 0
 
 
@@ -328,23 +424,18 @@ def _quadrant(mask, qx, qy):
     return np.repeat(np.repeat(sub, 2, 0), 2, 1)
 
 
-def fetch_masked(layer, z, x, y, res=32):
-    try:
-        r = session().get(TILE.format(layer=requests.utils.quote(layer), z=z, x=x, y=y),
-                          timeout=30)
-    except requests.RequestException:
-        return "err", None, None
-    if r.status_code == 200 and r.headers.get("content-type", "").startswith("image"):
-        img = Image.open(io.BytesIO(r.content)).convert("RGBA")
-        if img.getchannel("A").getextrema()[1] == 0:
-            return "placeholder", None, None   # transparent -> tunnel through
-        return "content", r.content, alpha_mask(img, res)
-    if r.status_code in (400, 404):
+def fetch_masked(src, z, x, y, res=32):
+    status, data = _get_tile(src, z, x, y)
+    if status == "ok":
+        return "content", data, alpha_mask(Image.open(io.BytesIO(data)).convert("RGBA"), res)
+    if status == "blank":
+        return "placeholder", None, None       # transparent -> tunnel through
+    if status == "outside":
         return "outside", None, None           # off-sheet / no tile -> prune
     return "err", None, None
 
 
-def mask_descent(con, args, limits, bbox, zooms):
+def mask_descent(con, args, src, limits, bbox, zooms):
     """Descend guided by the alpha footprint. Fetch a child only where an
     ancestor content tile is opaque; tunnel through transparent placeholder
     tiles (carrying the ancestor's mask) to reach deep content behind them.
@@ -356,7 +447,6 @@ def mask_descent(con, args, limits, bbox, zooms):
     (Helsinki: 29 z15 tiles missed vs full). Mask prunes those. Use for quick
     previews / coverage estimates only; use --mode full for an authoritative,
     gap-free chart."""
-    RES = 32
     st = {"content": 0, "placeholder": 0, "outside": 0, "err": 0, "req": 0}
 
     z0 = zooms[0]
@@ -365,7 +455,7 @@ def mask_descent(con, args, limits, bbox, zooms):
     frontier = {}
     with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
         for (x, y), (status, data, mask) in zip(
-                seed, pool.map(lambda c: fetch_masked(args.layer, z0, c[0], c[1]), seed)):
+                seed, pool.map(lambda c: fetch_masked(src, z0, c[0], c[1]), seed)):
             st[status] += 1; st["req"] += 1
             if status == "content":
                 store_tile(con, z0, x, y, data); frontier[(x, y)] = mask
@@ -389,7 +479,7 @@ def mask_descent(con, args, limits, bbox, zooms):
             for i in range(0, len(items), args.batch):
                 chunk = items[i:i + args.batch]
                 for ((cx, cy), inh), (status, data, mask) in zip(
-                        chunk, pool.map(lambda kv: fetch_masked(args.layer, z, kv[0][0], kv[0][1]),
+                        chunk, pool.map(lambda kv: fetch_masked(src, z, kv[0][0], kv[0][1]),
                                         chunk)):
                     st[status] += 1; st["req"] += 1
                     if status == "content":
@@ -408,11 +498,11 @@ def mask_descent(con, args, limits, bbox, zooms):
     con.commit()
     stored = con.execute("SELECT count(*) FROM tiles").fetchone()[0]
     con.close()
-    print(f"\n{args.layer} [mask]: requested {st['req']:,}, stored {stored:,}, "
+    print(f"\n{src['layer']} [mask]: requested {st['req']:,}, stored {stored:,}, "
           f"placeholder-tunnelled {st['placeholder']:,}, err {st['err']:,}")
 
 
-def fill_descent(con, args, limits, bbox, zooms):
+def fill_descent(con, args, src, limits, bbox, zooms):
     """Footprint-seeded flood fill (no full grid). Full-fetch the solid low zoom
     (--solid-zoom, the last zoom before the placeholder band) to get the complete
     chart footprint; then for each deeper zoom flood-fill the content outward from
@@ -429,7 +519,7 @@ def fill_descent(con, args, limits, bbox, zooms):
 
     def fetch_batch(z, batch):
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
-            return list(pool.map(lambda c: fetch(args.layer, z, c[0], c[1]), batch))
+            return list(pool.map(lambda c: fetch(src, z, c[0], c[1]), batch))
 
     def record(z, x, y, status, data):
         st["req"] += 1
@@ -465,7 +555,7 @@ def fill_descent(con, args, limits, bbox, zooms):
         half = 1 << (s - 1)
         for fx, fy in foot:
             push(((fx << s) + half, (fy << s) + half))
-        for px, py in content[z - 1]:
+        for px, py in content.get(z - 1, set()):
             for dx in (0, 1):
                 for dy in (0, 1):
                     push((2 * px + dx, 2 * py + dy))
@@ -488,37 +578,55 @@ def fill_descent(con, args, limits, bbox, zooms):
     con.commit()
     stored = con.execute("SELECT count(*) FROM tiles").fetchone()[0]
     con.close()
-    print(f"\n{args.layer} [fill]: requested {st['req']:,}, stored {stored:,}, "
+    print(f"\n{src['layer']} [fill]: requested {st['req']:,}, stored {stored:,}, "
           f"empty {st['empty']:,}, err {st['err']:,}")
 
 
 def run(args):
-    limits = parse_limits(args.layer)
+    src = parse_source(args.source, args.layer)
+
+    if src["extent"] is None:
+        limits = parse_limits(src["layer"])
+    else:
+        limits = bbox_limits(src["extent"], args.minzoom, args.maxzoom)
     zooms = sorted(z for z in limits if args.minzoom <= z <= args.maxzoom)
     if not zooms:
         sys.exit("no zoom levels in range")
     bbox = tuple(float(v) for v in args.bbox.split(",")) if args.bbox else None
 
+    # mask and descent both prune on an out-of-band "no tile here" signal. A WMS
+    # answers out-of-coverage with a transparent 200, indistinguishable from the
+    # placeholder band they are built to tunnel through, so neither ever prunes.
+    if args.mode in ("mask", "descent") and not src["empty_on_4xx"]:
+        sys.exit(f"--mode {args.mode} prunes on 400/404, which the {src['kind']} source "
+                 f"never returns; every empty tile would be tunnelled instead. "
+                 f"Use --mode full (bounded by --bbox) until the coverage mode lands.")
+    if args.repair and args.refresh:
+        sys.exit("--repair and --refresh do different things; pass one")
+    if args.refresh and not src["conditional"]:
+        sys.exit(f"--refresh needs If-Modified-Since, which the {src['kind']} source "
+                 f"does not support; re-download instead")
+
     con = sqlite3.connect(args.out)
-    init_db(con, args.layer, args.mode)
+    init_db(con, src, args.mode)
 
     if args.repair:
-        repair(con, args, limits, bbox, zooms)
+        repair(con, args, src, limits, bbox, zooms)
         return
 
     if args.refresh:
-        refresh(con, args, limits, bbox, zooms)
+        refresh(con, args, src, limits, bbox, zooms)
         return
 
     if args.mode == "mask":
-        mask_descent(con, args, limits, bbox, zooms)
+        mask_descent(con, args, src, limits, bbox, zooms)
         return
 
     if args.mode == "fill":
-        fill_descent(con, args, limits, bbox, zooms)
+        fill_descent(con, args, src, limits, bbox, zooms)
         return
 
-    startup = retry_errors(con, args.layer, args.concurrency)
+    startup = retry_errors(con, src, args.concurrency)
     if startup:
         print(f"startup: recovered {startup} previously-failed tile(s)")
 
@@ -545,7 +653,7 @@ def run(args):
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             for i in range(0, len(todo), args.batch):
                 chunk = todo[i:i + args.batch]
-                for x, y, status, data in pool.map(lambda c: fetch(args.layer, z, *c), chunk):
+                for x, y, status, data in pool.map(lambda c: fetch(src, z, *c), chunk):
                     zst[status] += 1
                     if status == "err":
                         con.execute("INSERT OR IGNORE INTO _errors (z, x, y) VALUES (?,?,?)",
@@ -568,7 +676,7 @@ def run(args):
         totals["req"] += zst["ok"] + zst["empty"] + zst["err"]
 
         if zst["err"]:
-            rec = retry_errors(con, args.layer, args.concurrency, rounds=2)
+            rec = retry_errors(con, src, args.concurrency, rounds=2)
             print(f"  z{z}: retried errors, recovered {rec}")
 
         set_meta(con, "completed_zoom", z)
@@ -595,7 +703,7 @@ def run(args):
     stored = con.execute("SELECT count(*) FROM tiles").fetchone()[0]
     con.close()
     saved = (1 - totals["req"] / rect_total) * 100 if rect_total else 0
-    print(f"\n{args.layer} [{args.mode}]: requested {totals['req']:,}, "
+    print(f"\n{src['layer']} [{args.mode}]: requested {totals['req']:,}, "
           f"stored {stored:,}, empty {totals['empty']:,}, unrecovered errors {remaining:,}")
     print(f"  full-limits rectangle would be {rect_total:,} requests "
           f"-> descent saved {saved:.1f}%")
@@ -603,8 +711,13 @@ def run(args):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Download a Traficom WMTS layer to MBTiles")
-    p.add_argument("--layer", required=True, help='e.g. "Rannikkokartat public"')
+    p = argparse.ArgumentParser(description="Download a Traficom chart layer to MBTiles")
+    p.add_argument("--source", choices=["wmts", "wms"], default="wmts",
+                   help="wmts: rasteripalvelu chart products (default). "
+                        "wms: S-57 ENC rendered to raster")
+    p.add_argument("--layer", default=None,
+                   help='wmts: required, e.g. "Rannikkokartat public". '
+                        f'wms: defaults to "{WMS_LAYER}"')
     p.add_argument("--out", required=True)
     p.add_argument("--mode", choices=["descent", "full", "mask", "fill"], default="fill")
     p.add_argument("--solid-zoom", type=int, default=11,
@@ -624,7 +737,10 @@ def main():
     p.add_argument("--refresh", action="store_true",
                    help="If-Modified-Since delta: re-fetch only tiles reseded "
                         "since the stamped download date (existing coverage only)")
-    run(p.parse_args())
+    args = p.parse_args()
+    if args.source == "wmts" and not args.layer:
+        p.error("--layer is required for --source wmts")   # exit 2, with usage
+    run(args)
 
 
 if __name__ == "__main__":
