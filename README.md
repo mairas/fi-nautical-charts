@@ -53,28 +53,37 @@ resolution; it costs about 8% more cells. The build asserts the footprint does n
 touch the edge of the configured extent, so an extent that crops real coverage
 fails loudly rather than silently losing what lies beyond.
 
-**Verification.** `./run verify-coverage` runs coverage and `full` over the same
-area and diffs the content tiles; `mask` checks two footprint properties the diff
-cannot see. Results:
+**Verification.** `./run verify-coverage oracle` runs coverage and `full` over the
+same area and diffs the content tiles; `mask` checks two footprint properties the
+diff cannot see. Every result below names its zoom range, because the pruning a
+run exercises depends on it.
 
 - **Whole extent, z0–10**: 1,556 content tiles, **0 missed**, at 55% fewer
-  requests (2,042 against 4,586). At z11 the mask is tight — 4,667 tiles carry all
-  4,319 content tiles that enumerating 13,203 finds.
-- **Deep zoom, z12–16**: 0 missed on Helsinki, Vänö, Bogskär and Saimaa (the band
-  discontinuity), and on three boxes reaching from charted cells out past the mask
-  edge — `span-kemi`, `span-border`, `span-coast` — which prune 25–37% while
-  finding every one of full's 2,184 / 3,225 / 619 content tiles.
-- **Off the footprint**: inland Lapland and the open Baltic prune to zero
-  requests; `full` spends 1,425 and 2,662 confirming the same emptiness.
+  requests (2,042 against 4,586). Below z7 the projected footprint keeps the whole
+  extent rectangle, so that band compares two identical enumerations and the saving
+  is earned at z7–z10. At z11 the mask is tight — 4,667 tiles carry all 4,319
+  content tiles that enumerating 13,203 finds.
+- **Deep zoom, z12–16**: 0 missed on the five `span-*` boxes, which reach from
+  charted cells through the dilation ring to cells outside the mask and so prune
+  24–52% while still finding every content tile `full` does. One per coverage edge.
+- **Containment only, z12–16**: 0 missed on Helsinki, Vänö, Bogskär and Saimaa
+  (the band discontinuity). These lie wholly inside the mask, so coverage
+  enumerates exactly what `full` does — they show it keeps what it should, and
+  nothing about pruning.
+- **Off the footprint, z12–14**: inland Lapland and the open Baltic prune to zero
+  requests; `full` spends 389 and 701 confirming the same emptiness.
 - **Chunking**: a footprint assembled from 18 chunks equals one assembled from 2,
-  cell for cell.
+  cell for cell. Both come from `build_coverage` itself, not a copy of its loop.
 - **Containment**: built at z13 — a finer pixel grid, different chunk boundaries,
   4,096 samples per z11 cell against 256 — every projected cell falls inside the
-  shipped mask.
+  shipped mask, which is 4.9% larger than the fine build reaches.
 
-A box wholly inside the footprint prunes nothing, so it tests only that coverage
-keeps what full finds; the `mask` command reports each box's measured class, and a
-box tagged `straddle` that prunes nothing is a failure, not a pass.
+Scope of the claim: the deep-zoom evidence is five windows on a footprint whose
+perimeter is 340 cells, so it samples the boundary rather than covering it. A box
+can also pass while testing nothing, so each carries the relation it is meant to
+have — `inside`, `straddle` or `outside` — and the run fails if that does not
+hold: an `inside` box that prunes, a `straddle` box that does not, an `outside`
+box that requests anything, or an oracle side that finds no content at all.
 
 **Cost** (`verify-coverage cost`, sampled over the footprint rather than over the
 boxes, whose bytes per tile span 15×). Bytes per tile *fall* with depth, 5.6 kB at
@@ -87,10 +96,17 @@ level costs about 2.9× its parent rather than 4×:
 | z15 | 1.59M | 2.4 GB | ~15 h |
 | z16 | 6.37M | 6.7 GB | ~49 h |
 
-**z15 is the cap**, and the default. z16 renders no additional chart features —
-only larger symbols — so it would buy legibility for 64% of the bytes and 70% of
-the time. Adding it later costs its own 34.5 h plus about an hour, since a re-run
-keeps every stored tile and re-requests only the ~10% that were empty.
+**z15 is the cap**, and the default. z16 does carry genuine new detail — `./run
+native-zoom --zmin 14 --zmax 16` scores the z15→z16 transition at 0.073 median
+novelty against a 0.03 threshold — but less than half of what z15 adds (0.160),
+with 89% of its pixels exactly reproducible by upscaling its parent. Paying 64% of
+the bytes and 70% of the time for that is the trade being declined, not an absence
+of detail. Adding it later costs its own 34.5 h plus 1.5–2 h, since a re-run keeps
+every stored tile and re-requests only the ~10% that were empty.
+
+Cost figures come from one sampling burst on one network, so treat the hours as an
+order of magnitude. Bytes per tile is heavy-tailed, so its error is cv/√n rather
+than the 1/√n that would apply to the content rate.
 
 Attribution required: *"Source: Traficom. Not for navigation use. Does not meet
 official nautical chart requirements."*
@@ -128,10 +144,14 @@ The `public` suffix marks the openly-licensed subset of each product.
 ./run dl --source wms --out mbtiles/fi-enc.mbtiles
 
 # Check coverage mode against brute-force enumeration before trusting a run.
+# Class assertions hold from the coverage zoom (11) down, so keep --minzoom there.
 ./run verify-coverage oracle --box span-kemi --minzoom 12 --maxzoom 16
-./run verify-coverage oracle --whole-extent --maxzoom 10
+./run verify-coverage oracle --whole-extent          # z0-10; deeper is millions
 ./run verify-coverage mask          # chunking + containment + box classes
 ./run verify-coverage cost          # price a full run from a footprint sample
+
+# Is the deepest level real detail, or an upscale of the one above it?
+./run native-zoom mbtiles/fi-enc.mbtiles --zmin 14 --zmax 16
 ```
 
 Failed tiles are recorded in an `_errors` table and retried automatically —
