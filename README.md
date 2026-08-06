@@ -53,11 +53,44 @@ resolution; it costs about 8% more cells. The build asserts the footprint does n
 touch the edge of the configured extent, so an extent that crops real coverage
 fails loudly rather than silently losing what lies beyond.
 
-Verified against `full` on a box straddling the footprint edge (Åland outer
-skerries, z8–13): 219 requests against full's 347, the same 46 content tiles, none
-missed. Inland Lapland and the open Baltic prune to zero requests. Not yet
-oracle-compared at z0–7 or z14–16, and the comparison set is still one straddle
-box — see the tracking issue before treating deep zooms as verified.
+**Verification.** `./run verify-coverage` runs coverage and `full` over the same
+area and diffs the content tiles; `mask` checks two footprint properties the diff
+cannot see. Results:
+
+- **Whole extent, z0–10**: 1,556 content tiles, **0 missed**, at 55% fewer
+  requests (2,042 against 4,586). At z11 the mask is tight — 4,667 tiles carry all
+  4,319 content tiles that enumerating 13,203 finds.
+- **Deep zoom, z12–16**: 0 missed on Helsinki, Vänö, Bogskär and Saimaa (the band
+  discontinuity), and on three boxes reaching from charted cells out past the mask
+  edge — `span-kemi`, `span-border`, `span-coast` — which prune 25–37% while
+  finding every one of full's 2,184 / 3,225 / 619 content tiles.
+- **Off the footprint**: inland Lapland and the open Baltic prune to zero
+  requests; `full` spends 1,425 and 2,662 confirming the same emptiness.
+- **Chunking**: a footprint assembled from 18 chunks equals one assembled from 2,
+  cell for cell.
+- **Containment**: built at z13 — a finer pixel grid, different chunk boundaries,
+  4,096 samples per z11 cell against 256 — every projected cell falls inside the
+  shipped mask.
+
+A box wholly inside the footprint prunes nothing, so it tests only that coverage
+keeps what full finds; the `mask` command reports each box's measured class, and a
+box tagged `straddle` that prunes nothing is a failure, not a pass.
+
+**Cost** (`verify-coverage cost`, sampled over the footprint rather than over the
+boxes, whose bytes per tile span 15×). Bytes per tile *fall* with depth, 5.6 kB at
+z11 to 1.0 kB at z16, since the same ink spreads over four times the tiles, so a
+level costs about 2.9× its parent rather than 4×:
+
+| Cap | Requests | Storage | Time at `--concurrency 8` |
+|-----|---------:|--------:|--------------------------:|
+| z14 | 397k | 0.9 GB | ~5 h |
+| z15 | 1.59M | 2.4 GB | ~15 h |
+| z16 | 6.37M | 6.7 GB | ~49 h |
+
+**z15 is the cap**, and the default. z16 renders no additional chart features —
+only larger symbols — so it would buy legibility for 64% of the bytes and 70% of
+the time. Adding it later costs its own 34.5 h plus about an hour, since a re-run
+keeps every stored tile and re-requests only the ~10% that were empty.
 
 Attribution required: *"Source: Traficom. Not for navigation use. Does not meet
 official nautical chart requirements."*
@@ -90,6 +123,15 @@ The `public` suffix marks the openly-licensed subset of each product.
 
 # Retry tiles that failed on an earlier run (e.g. transient network errors).
 ./run dl --layer "Rannikkokartat public" --out mbtiles/rannikkokartat.mbtiles --repair
+
+# Download the ENC. WMS source defaults to --mode coverage and --maxzoom 15.
+./run dl --source wms --out mbtiles/fi-enc.mbtiles
+
+# Check coverage mode against brute-force enumeration before trusting a run.
+./run verify-coverage oracle --box span-kemi --minzoom 12 --maxzoom 16
+./run verify-coverage oracle --whole-extent --maxzoom 10
+./run verify-coverage mask          # chunking + containment + box classes
+./run verify-coverage cost          # price a full run from a footprint sample
 ```
 
 Failed tiles are recorded in an `_errors` table and retried automatically —
