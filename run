@@ -58,6 +58,12 @@ function currency {
 ################################################################################
 # Process
 
+function strip-nodata {
+  #@ Remove the opaque black off-sheet fill some layers serve (run before downscale)
+  #@ Category: Process
+  uv run strip_nodata.py "$@"
+}
+
 function downscale {
   #@ Rebuild lower zoom levels by anti-aliased downscaling from the deepest level
   #@ Category: Process

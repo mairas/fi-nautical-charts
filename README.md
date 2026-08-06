@@ -159,6 +159,42 @@ after each zoom during a download, and at the start of any resumed run. If a
 run finished before error tracking existed, `--repair` re-derives the expected
 tiles and re-fetches whatever is missing from the archive.
 
+## Stripping the off-sheet fill
+
+Some layers render the area outside their sheets as **opaque black** rather than
+leaving it transparent, so a viewer draws black wedges along every sheet edge.
+Whole tiles are affected, and so are the tiles the sheet boundary crosses, which
+come back part chart and part black. Measured on the 2026-06 downloads:
+
+| layer | tiles carrying fill |
+|-------|--------------------:|
+| `Merikarttasarjat public` | 30,625 |
+| `Rannikkokartat public` | 24,547 |
+| `Yleiskartat 250k` | 8,849 |
+| `Veneilykartat public` | 8,148 |
+| `Satamakartat` | 121 |
+
+Colour cannot separate the fill from chart ink — ink is pure `(0,0,0)` too, and
+fills up to 5% of an ordinary tile. Shape can: the fill is a solid region tens of
+pixels across, ink is strokes a few pixels wide. `strip-nodata` erodes the black
+mask to find what is thick, then grows those seeds back through the mask so the
+region is recovered exactly to its own hard edge.
+
+```bash
+./run strip-nodata mbtiles/fi-yleiskartat250k-2026-06-02.mbtiles --scan   # report only
+./run strip-nodata mbtiles/fi-yleiskartat250k-2026-06-02.mbtiles
+```
+
+**Run it before `downscale`.** Averaging black into a parent turns it grey, and
+grey is indistinguishable from chart content — no later pass can find it.
+
+Verified both directions: across 22 tiles well inside coverage it removes 0
+pixels at every erosion radius from 2 to 8, and every pixel it does remove was
+pure-black-opaque before and is transparent after (audited over all 121
+Satamakartat rewrites). On the Åland–Sweden boundary the wedges go from 4/5/18/63
+visibly dark tiles at z8–z11 to 0/0/3/13, the remainder being ordinary tiles
+around 1% dark, which is text.
+
 ## Downscaling the pyramid
 
 Traficom serves each layer's lower zoom levels as crude rescales of the deepest
