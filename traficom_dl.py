@@ -213,9 +213,27 @@ def build_coverage(extent, zoom, over):
 
 def coverage_ancestors(footprint, zoom, minzoom):
     """Footprint cells projected up to each zoom above `zoom`, so eligibility at a
-    coarse zoom is a set lookup rather than a walk over every descendant cell."""
-    return {z: {(x >> (zoom - z), y >> (zoom - z)) for (x, y) in footprint}
-            for z in range(minzoom, zoom)}
+    coarse zoom is a set lookup rather than a walk over every descendant cell,
+    then dilated by one cell.
+
+    This dilation answers a different problem from build_coverage's. At overview
+    scale the chart layer paints generalised ink outside the coverage layer's own
+    polygons: the z4 tile north of the declared limit renders 495 opaque pixels
+    where the coverage layer, asked for the same box, renders none. Ask for that
+    ground area at z8 instead and both layers are empty, so it is a property of
+    the scale, not of the data.
+
+    Such spill is bounded in pixels rather than in metres, so the margin must be
+    too. One cell is 256 px at every zoom, against the ~40 px the spill measured
+    at z4 -- unlike a fixed ground margin, which would be far too small up there
+    and pointlessly large down here."""
+    out = {}
+    for z in range(minzoom, zoom):
+        s = zoom - z
+        cells = {(x >> s, y >> s) for (x, y) in footprint}
+        out[z] = {(x + dx, y + dy) for (x, y) in cells
+                  for dx in (-1, 0, 1) for dy in (-1, 0, 1)}
+    return out
 
 
 def coverage_key(args, src):
