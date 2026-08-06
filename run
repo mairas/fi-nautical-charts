@@ -33,6 +33,12 @@ function dl {
   uv run traficom_dl.py "$@"
 }
 
+function verify-coverage {
+  #@ Check coverage mode against the full oracle, and the footprint against itself
+  #@ Category: Download
+  uv run verify_coverage.py "$@"
+}
+
 function refresh {
   #@ Delta-refresh a chart file via If-Modified-Since, then re-stamp dates
   #@ Category: Download
