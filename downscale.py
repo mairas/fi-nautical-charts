@@ -80,6 +80,14 @@ def box_downscale_2x(block: np.ndarray) -> np.ndarray:
     return out.astype(np.uint8)
 
 
+def scratch_path(path: Path) -> Path:
+    """Where the build actually happens. The documented invocation writes over a
+    deployed chart, and a run that dies partway would otherwise leave a
+    syntactically valid one-level file at that path with no previous version
+    behind it."""
+    return path.with_suffix(path.suffix + ".partial")
+
+
 def create_output(path: Path) -> sqlite3.Connection:
     if path.exists():
         path.unlink()
@@ -161,7 +169,8 @@ def build(inp: Path, out: Path, source_zoom: int | None, min_zoom: int | None, j
         sys.exit(f"nothing to do: min-zoom {mzoom} >= source-zoom {szoom}")
 
     print(f"{inp.name}: source z{szoom}, regenerate z{szoom - 1}..z{mzoom} -> {out.name}")
-    con = create_output(out)
+    tmp = scratch_path(out)
+    con = create_output(tmp)
     con.execute("ATTACH DATABASE ? AS src", (f"file:{inp}?mode=ro",))
     con.execute("INSERT INTO tiles SELECT * FROM src.tiles WHERE zoom_level>=? OR zoom_level<?",
                 (szoom, mzoom))
@@ -203,6 +212,7 @@ def build(inp: Path, out: Path, source_zoom: int | None, min_zoom: int | None, j
     con.execute("VACUUM")
     con.commit()
     con.close()
+    os.replace(tmp, out)
     print(f"done: {out}")
 
 
