@@ -30,12 +30,14 @@ a box wholly outside tests that pruning happens at all.
 from __future__ import annotations
 
 import argparse
+import random
 import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -57,10 +59,24 @@ BOXES = {
     # straddling: pruning must not cut real chart area
     "diagonal":  ("22.6758,64.6991,23.3789,64.9979", "straddle", "Bothnian Bay, boundary crosses cells diagonally"),
     "diagonal2": ("29.5312,66.0894,30.2344,66.3728", "straddle", "eastern border, boundary crosses cells diagonally"),
-    # 2x2 z11 windows cut from the two boundary regions above, small enough that
-    # brute-force enumeration to z16 stays affordable
-    "diagonal-deep":  ("22.8516,64.7741,23.2031,64.9235", "straddle", "Bothnian Bay boundary, deep-zoom window"),
-    "diagonal2-deep": ("29.5312,66.2315,29.8828,66.3728", "straddle", "eastern border boundary, deep-zoom window"),
+    # 2x2 z11 windows that straddle the *dilated* mask, half in and half out, so
+    # deep zooms are actually pruned rather than merely enumerated. Picked off
+    # the mask itself: a window drawn around the raw footprint's edge looks like
+    # a boundary but dilation swallows it whole, and then it tests nothing.
+    # One per edge, since each is a different neighbour (Sweden, Norway, Russia,
+    # open sea) and the coverage may end differently against each.
+    "edge-north": ("23.3789,66.5133,23.7305,66.6530", "straddle", "head of the Bothnian Bay"),
+    "edge-west":  ("18.6328,60.1524,18.9844,60.3269", "straddle", "western limit, toward Sweden"),
+    "edge-south": ("20.5664,58.6312,20.9180,58.8137", "straddle", "southern limit, open Baltic"),
+    "edge-east":  ("30.4102,62.4311,30.7617,62.5933", "straddle", "eastern limit, toward Russia"),
+    # The boxes above prune, but their kept cells are all dilation ring, which is
+    # empty by construction -- so they show only that pruning loses nothing where
+    # there is nothing. These are wider, spanning charted cells through the ring
+    # to cells outside the mask, so full finds content on one side while coverage
+    # prunes the other. That is the pairing that can actually expose a bad prune.
+    "span-kemi":   ("23.5547,65.8028,24.2578,65.9465", "straddle", "Bothnian Bay coast through the mask edge"),
+    "span-border": ("29.8828,65.8028,30.5859,65.9465", "straddle", "eastern border through the mask edge"),
+    "span-coast":  ("21.7969,64.3209,22.5000,64.4728", "straddle", "Ostrobothnian coast through the mask edge"),
     # outside: pruning must reduce these to zero requests
     "lapland":   ("25.50,67.50,25.80,67.65",   "outside",   "inland, no navigable water"),
     "baltic":    ("20.00,58.30,20.40,58.60",   "outside",   "open sea inside the extent, south of the footprint"),
@@ -166,6 +182,15 @@ def oracle(args):
         print(f"\n  FAIL: an outside box must prune to zero requests, "
               f"got {cstat['requested']:,}")
         return 1
+    # A straddling box that prunes nothing passes for the wrong reason: coverage
+    # enumerated the same tiles full did, so the diff proves only that they agree
+    # where nothing was at stake. Dilation absorbs a window drawn around the raw
+    # footprint edge, which is exactly how such a box gets mistagged.
+    if klass == "straddle" and cstat["requested"] >= fstat["requested"]:
+        print(f"\n  FAIL: {args.box} is tagged straddle but pruned nothing "
+              f"({cstat['requested']:,} of full's {fstat['requested']:,}); it lies "
+              f"inside the dilated mask, so this run tested no pruning")
+        return 1
     if extra_total:
         print(f"\n  FAIL: coverage stored {extra_total:,} tiles full did not; "
               f"coverage candidates must be a subset of full's")
@@ -249,6 +274,51 @@ def mask(args):
     return 1 if fails else 0
 
 
+def cost(args):
+    """What a full run would fetch and store, from a random sample of the real
+    footprint rather than from whichever boxes happened to get picked.
+
+    Named boxes are chosen to stress correctness -- dense water, boundaries --
+    so their byte averages are not the footprint's. Sampling uniformly over
+    every tile the footprint implies at a zoom gives an estimate that is
+    actually about the run being priced."""
+    rng = random.Random(args.seed)
+    src = T.parse_source("wms", None)
+    fp = sorted(T.build_coverage(T.WMS_EXTENT, args.coverage_zoom,
+                                 args.coverage_oversample))
+    print(f"footprint: {len(fp):,} cells at z{args.coverage_zoom}, "
+          f"sampling {args.samples} tiles per zoom (seed {args.seed})\n")
+    print(f"  {'zoom':>4} {'tiles':>11} {'content':>8} {'KB/tile':>8} "
+          f"{'GB':>7} {'hours':>7}")
+    tot_gb = tot_h = 0.0
+    for z in args.zooms:
+        s = z - args.coverage_zoom
+        total = len(fp) * (1 << s) ** 2
+        picks = [(( cx << s) + rng.randrange(1 << s),
+                  ( cy << s) + rng.randrange(1 << s))
+                 for cx, cy in (fp[rng.randrange(len(fp))]
+                                for _ in range(args.samples))]
+        t0 = time.monotonic()
+        with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+            res = list(pool.map(lambda c: T.fetch(src, z, c[0], c[1]), picks))
+        secs = time.monotonic() - t0
+        sizes = [len(d) for (_, _, st, d) in res if st == "ok"]
+        errs = sum(1 for r in res if r[2] == "err")
+        rate = len(sizes) / len(res)
+        kb = (sum(sizes) / len(sizes) / 1024) if sizes else 0.0
+        gb = total * rate * kb * 1024 / 1e9
+        hours = total / (len(res) / secs) / 3600
+        tot_gb += gb
+        tot_h += hours
+        print(f"  {z:>4} {total:>11,} {rate:>7.1%} {kb:>8.1f} {gb:>7.1f} {hours:>7.1f}"
+              + (f"   ({errs} errors)" if errs else ""))
+    print(f"\n  cumulative: {tot_gb:.1f} GB, {tot_h:.1f} h at "
+          f"concurrency {args.concurrency}")
+    print(f"  (sampling error on KB/tile is ~1/sqrt({args.samples}) "
+          f"= {100 / args.samples ** 0.5:.0f}% per zoom)")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -270,11 +340,22 @@ def main():
     m.add_argument("--fine-zoom", type=int, default=13,
                    help="zoom for the independent, finer-geometry build")
 
+    c = sub.add_parser("cost", help="price a full run from a footprint sample")
+    c.add_argument("--samples", type=int, default=300)
+    c.add_argument("--zooms", default="11,12,13,14,15,16",
+                   type=lambda v: [int(t) for t in v.split(",")])
+    c.add_argument("--seed", type=int, default=1)
+    c.add_argument("--concurrency", type=int, default=8)
+    c.add_argument("--coverage-zoom", type=int, default=11)
+    c.add_argument("--coverage-oversample", type=int, default=16)
+
     args = p.parse_args()
     if args.cmd == "oracle":
         if getattr(args, "whole_extent", False):
             args.bbox, args.box = None, None
         sys.exit(oracle(args))
+    if args.cmd == "cost":
+        sys.exit(cost(args))
     sys.exit(mask(args))
 
 
