@@ -188,6 +188,39 @@ region is recovered exactly to its own hard edge.
 **Run it before `downscale`.** Averaging black into a parent turns it grey, and
 grey is indistinguishable from chart content — no later pass can find it.
 
+### The white beyond the chart limits
+
+The same layers also render the area beyond the Finnish EEZ as **opaque white**,
+which occludes whatever basemap sits under the chart. This half of the problem
+needs a different method, because white is not a colour the chart reserves for
+off-sheet: open sea is white too, and locally the two are identical — same
+colour, same solidity. Only what encloses them differs.
+
+So the second pass works on the **tile grid**, not on pixels. A tile is *marked*
+if any opaque pixel of it is non-white, *featureless* otherwise. Flood the grid
+inward from beyond the data, crossing only featureless tiles; a marked tile is a
+wall. Featureless tiles the flood reaches are outside and get deleted; those it
+cannot reach are enclosed by chart content — open water between soundings — and
+stay. Marked tiles are never modified.
+
+Tile granularity is what makes this safe rather than a limitation. The EEZ line
+is dashed, and at pixel scale a flood slips between the dashes and empties water
+that is well inside coverage; at tile scale every tile the line crosses holds
+some of it, so the fence is unbroken. And since the only action is deleting whole
+tiles that carry nothing, no chart pixel can be lost — there is no radius or
+threshold to mistune.
+
+The deepest zoom decides the boundary, since it resolves it most finely. Coarser
+zooms cannot refine it: a coarse tile is marked when *any* part of its ground has
+content, so it can say "something here" but never where. Ancestors then follow
+their descendants — a tile whose deeper detail survives is kept whatever its own
+rendering shows, or the pyramid gains holes that appear and vanish as you zoom.
+
+Verified per chart by comparing against a `--skip-offeez` build: chart markings
+are identical at every zoom, to the pixel, while off-sheet tiles go (9,254 on
+Yleiskartat, 2,901 on Rannikkokartat). A one-tile white margin survives where a
+tile straddles the limit, since such a tile is marked and therefore untouched.
+
 Verified both directions: across 22 tiles well inside coverage it removes 0
 pixels at every erosion radius from 2 to 8, and every pixel it does remove was
 pure-black-opaque before and is transparent after (audited over all 121

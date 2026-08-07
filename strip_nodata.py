@@ -28,6 +28,7 @@ import io
 import os
 import sqlite3
 import sys
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -37,6 +38,83 @@ from scipy import ndimage
 
 RADIUS = 4          # erosion radius; ink vanishes by 2, fills survive past 8
 MIN_FILL = 64       # ignore specks: a real fill is far larger than this
+TILE = 256
+WHITE_LUM = 250     # above this an opaque pixel counts as blank paper
+
+
+def tile_has_marks(blob):
+    """True if the tile carries anything but blank paper. Deliberately generous:
+    one non-white opaque pixel is enough, so any doubt makes a tile untouchable."""
+    a = np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA"))
+    op = a[..., 3] == 255
+    if not op.any():
+        return False
+    return bool((op & (a[..., :3].mean(axis=2) <= WHITE_LUM)).any())
+
+
+def classify(con, z):
+    """(marked, featureless) tile sets at one zoom, in XYZ coordinates."""
+    marked, feat = set(), set()
+    for x, row, blob in con.execute("SELECT tile_column, tile_row, tile_data FROM tiles "
+                                    "WHERE zoom_level=?", (z,)):
+        (marked if tile_has_marks(blob) else feat).add((x, (1 << z) - 1 - row))
+    return marked, feat
+
+
+def flood_outside(marked, feat):
+    """Featureless tiles reachable from beyond the data, walking the tile grid.
+
+    A marked tile is a wall. That is what makes the dashed EEZ line work here:
+    at pixel scale the fill slips between the dashes, but every tile the line
+    crosses holds some of them, so at tile scale the fence is unbroken.
+
+    Featureless tiles the walk cannot reach are enclosed by chart content --
+    open water between soundings -- and are kept."""
+    present = marked | feat
+    if not present:
+        return set()
+    xs = [p[0] for p in present]
+    ys = [p[1] for p in present]
+    x0, x1, y0, y1 = min(xs) - 1, max(xs) + 1, min(ys) - 1, max(ys) + 1
+    seen, q = set(), deque()
+    for x in range(x0, x1 + 1):
+        for y in (y0, y1):
+            if (x, y) not in seen:
+                seen.add((x, y)); q.append((x, y))
+    for y in range(y0, y1 + 1):
+        for x in (x0, x1):
+            if (x, y) not in seen:
+                seen.add((x, y)); q.append((x, y))
+    while q:
+        x, y = q.popleft()
+        for n in ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)):
+            if not (x0 <= n[0] <= x1 and y0 <= n[1] <= y1) or n in seen or n in marked:
+                continue
+            seen.add(n); q.append(n)
+    return feat & seen
+
+
+def offsheet_plan(con, zs):
+    """Which tiles to delete at each zoom, agreed across every zoom.
+
+    The deepest zoom sets the boundary, because it resolves it most finely.
+    Coarser zooms cannot refine it: a coarse tile is marked when any part of its
+    ground carries content, so it can say "something here" but never where.
+
+    Ancestors follow their descendants. A tile whose deeper detail survives is
+    depicting something, whatever its own rendering shows, so it stays -- without
+    that the pyramid gains holes that appear and vanish as you zoom."""
+    deep = max(zs)
+    drops = {z: flood_outside(*classify(con, z)) for z in zs}
+    present_deep = {(x, (1 << deep) - 1 - r) for x, r in
+                    con.execute("SELECT tile_column, tile_row FROM tiles WHERE zoom_level=?", (deep,))}
+    kept_deep = present_deep - drops[deep]
+    plan = {}
+    for z in zs:
+        s = deep - z
+        protected = {(d[0] >> s, d[1] >> s) for d in kept_deep} if s >= 0 else set()
+        plan[z] = drops[z] - protected
+    return plan, drops
 
 
 def nodata_mask(a: np.ndarray, radius: int) -> np.ndarray:
@@ -90,7 +168,7 @@ def scan(src: Path, radius: int) -> None:
     con.close()
 
 
-def run(src: Path, out: Path, radius: int, jobs: int) -> None:
+def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
     # built beside the target and moved into place at the end, so a run that
     # dies partway cannot leave a valid-looking partial chart where the good
     # one was
@@ -135,8 +213,28 @@ def run(src: Path, out: Path, radius: int, jobs: int) -> None:
             if zr or zd:
                 print(f"  z{z:<3} rewrote {zr:>6}, dropped {zd:>5}")
 
-    con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
-                ("nodata_stripped", f"opaque-black-r{radius}"))
+    stamp = f"opaque-black-r{radius}"
+    if offeez:
+        # classified from the black-stripped tiles, so removed fill cannot pose
+        # as a marking and wall the flood out of its own region
+        print("  planning off-EEZ removal across all zooms ...")
+        plan, drops = offsheet_plan(con, zs)
+        for z in zs:
+            dis = len(drops[z]) - len(plan[z])
+            if drops[z]:
+                print(f"  z{z:<3} off-EEZ: {len(drops[z]):>6} flood-reachable, "
+                      f"{dis:>5} kept (deeper detail survives), {len(plan[z]):>6} to drop")
+        total = 0
+        for z in zs:
+            for x, y in plan[z]:
+                con.execute("DELETE FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
+                            (z, x, (1 << z) - 1 - y))
+                total += 1
+            con.commit()
+        print(f"  off-EEZ total: {total} tiles dropped, 0 modified")
+        stamp += "+offeez-tilelevel"
+
+    con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", ("nodata_stripped", stamp))
     con.commit()
     con.execute("VACUUM")
     con.close()
@@ -152,6 +250,8 @@ def main():
                    help=f"erosion radius separating fill from ink (default {RADIUS})")
     p.add_argument("--jobs", type=int, default=0, help="worker processes (default: all cores)")
     p.add_argument("--scan", action="store_true", help="report what would change, write nothing")
+    p.add_argument("--skip-offeez", action="store_true",
+                   help="leave the blank white beyond the chart limits in place")
     args = p.parse_args()
     if not args.input.exists():
         sys.exit(f"no such file: {args.input}")
@@ -159,7 +259,7 @@ def main():
         scan(args.input, args.radius)
         return
     out = args.out or args.input.with_suffix(".stripped.mbtiles")
-    run(args.input, out, args.radius, args.jobs or None)
+    run(args.input, out, args.radius, args.jobs or None, not args.skip_offeez)
 
 
 if __name__ == "__main__":
