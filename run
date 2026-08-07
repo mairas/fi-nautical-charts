@@ -40,7 +40,7 @@ function verify-coverage {
 }
 
 function refresh {
-  #@ Delta-refresh a chart file via If-Modified-Since, then re-stamp dates
+  #@ Delta-refresh a chart file via If-Modified-Since, then relabel it
   #@ Category: Download
   local f="$1"
   local layer; layer=$(sqlite3 "$f" "SELECT value FROM metadata WHERE name='wmts_layer'")
@@ -50,7 +50,7 @@ function refresh {
 }
 
 function currency {
-  #@ Sample source Last-Modified, stamp metadata, rename fi-<layer>-<date>.mbtiles
+  #@ Label a chart set from its recorded currency, rename fi-<layer>-<date>.mbtiles
   #@ Category: Download
   python3 currency.py "$@"
 }

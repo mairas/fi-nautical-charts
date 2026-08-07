@@ -315,6 +315,13 @@ def stamp_zoom_range(con):
         set_meta(con, "maxzoom", str(hi))
 
 
+def finish_run(con):
+    """What only a finished run can state about the archive."""
+    stamp_zoom_range(con)
+    flush_editions(con)
+    set_meta(con, "downloaded", datetime.date.today().isoformat())
+
+
 def parse_limits(layer):
     import re
     xml = session().get(WMTS_CAPS, timeout=90).text
@@ -374,6 +381,58 @@ def strip_fill(arr, original):
     return buf.getvalue()
 
 
+EDITION_LAG = 60    # seconds
+
+_editions = {"newest": None, "oldest": None}
+_editions_lock = threading.Lock()
+
+
+def note_edition(headers):
+    """Record a tile's edition date, unless the server just rendered it for us.
+
+    Last-Modified is the only edition signal the WMTS offers, and it is not one
+    for every tile: GeoWebCache renders a tile it does not hold on demand and
+    stamps it with the moment it stored it, so our own requests manufacture
+    dates indistinguishable from a reseed. Reading them back later as editions
+    is what made a set report the day we downloaded it as its edition.
+
+    The response's own Date header settles it, and only during the request that
+    caused it. A tile made for us is stamped within that request; a cached one
+    is days or years older -- measured against Traficom, 0 s versus 71 and 1740
+    days, so the threshold is nowhere near anything. Both timestamps come from
+    the server's clock, so neither our clock nor our timezone enters it."""
+    lm, served = headers.get("Last-Modified"), headers.get("Date")
+    if not lm or not served:
+        return
+    try:
+        made_at = email.utils.parsedate_to_datetime(lm)
+        served_at = email.utils.parsedate_to_datetime(served)
+    except (TypeError, ValueError):
+        return
+    if (served_at - made_at).total_seconds() < EDITION_LAG:
+        return
+    day = made_at.date().isoformat()
+    with _editions_lock:
+        for key, pick in (("newest", max), ("oldest", min)):
+            seen = _editions[key]
+            _editions[key] = day if seen is None else pick(seen, day)
+
+
+def flush_editions(con):
+    """Fold the editions seen so far into the archive's own record.
+
+    Merged, not overwritten: a resumed run sees only the tiles it still had to
+    fetch, and a refresh only the ones that changed. ISO dates sort by date."""
+    with _editions_lock:
+        newest, oldest = _editions["newest"], _editions["oldest"]
+    if newest is None:
+        return
+    prior_new = get_meta(con, "source_updated")
+    prior_old = get_meta(con, "source_updated_oldest")
+    set_meta(con, "source_updated", max(newest, prior_new) if prior_new else newest)
+    set_meta(con, "source_updated_oldest", min(oldest, prior_old) if prior_old else oldest)
+
+
 def _get_tile(src, z, x, y, ims=None):
     """The one HTTP call site. Classifies more finely than callers need:
 
@@ -393,10 +452,13 @@ def _get_tile(src, z, x, y, ims=None):
             img = Image.open(io.BytesIO(r.content)).convert("RGBA")
             if img.getchannel("A").getextrema()[1] == 0:
                 return "blank", None
+            data = r.content
             if src["nodata_fill"]:
                 data = strip_fill(np.asarray(img), r.content)
-                return ("blank", None) if data is None else ("ok", data)
-            return "ok", r.content
+                if data is None:
+                    return "blank", None
+            note_edition(r.headers)   # only tiles we keep speak for the set's currency
+            return "ok", data
     except (requests.RequestException, OSError, ValueError):
         # an undecodable body is an err like any other: it belongs in _errors,
         # not in a traceback that kills a multi-hour run mid-batch
@@ -621,11 +683,15 @@ def refresh(con, args, src, limits, bbox, zooms):
                 cur = con.execute("DELETE FROM tiles WHERE zoom_level=? AND "
                                   "tile_column=? AND tile_row=?", (z, x, row))
                 removed += cur.rowcount
+        flush_editions(con)
         con.commit()
         frontier = data_tiles_at(con, z)
         print(f"\r  z{z:<2} checked {checked:,}  updated {updated:,}  removed {removed:,}",
               end="", flush=True)
     print()
+    # only now: refresh reads this as its If-Modified-Since baseline, so advancing
+    # it before every zoom is checked would make the next run skip what this one
+    # never reached
     set_meta(con, "downloaded", datetime.date.today().isoformat())
     con.commit()
     con.close()
@@ -712,6 +778,7 @@ def mask_descent(con, args, src, limits, bbox, zooms):
                         store_tile(con, z, cx, cy, data); new_frontier[(cx, cy)] = mask
                     elif status == "placeholder":
                         new_frontier[(cx, cy)] = inh
+                flush_editions(con)
                 con.commit()
         frontier = new_frontier
         print(f"\r  z{z:<2} req {st['req']:>8}  content {st['content']:>7}  "
@@ -720,7 +787,7 @@ def mask_descent(con, args, src, limits, bbox, zooms):
     b = compute_bounds(con)
     if b:
         set_meta(con, "bounds", "{:.5f},{:.5f},{:.5f},{:.5f}".format(*b))
-    stamp_zoom_range(con)
+    finish_run(con)
     con.commit()
     stored = con.execute("SELECT count(*) FROM tiles").fetchone()[0]
     con.close()
@@ -761,6 +828,7 @@ def fill_descent(con, args, src, limits, bbox, zooms):
         for i in range(0, len(cands), args.batch):
             for x, y, status, data in fetch_batch(z, cands[i:i + args.batch]):
                 record(z, x, y, status, data)
+            flush_editions(con)
             con.commit()
         print(f"  z{z} footprint: {len(content[z])} content")
     foot = content.get(Zs, set())
@@ -792,6 +860,7 @@ def fill_descent(con, args, src, limits, bbox, zooms):
                 if record(z, x, y, status, data):
                     push((x + 1, y)); push((x - 1, y)); push((x, y + 1)); push((x, y - 1))
                     push((x + 1, y + 1)); push((x - 1, y - 1)); push((x + 1, y - 1)); push((x - 1, y + 1))
+            flush_editions(con)
             con.commit()
             print(f"\r  z{z:<2} flood: content {len(content[z]):>7}  queued {len(q):>7}  "
                   f"req {st['req']:>8}", end="", flush=True)
@@ -800,7 +869,7 @@ def fill_descent(con, args, src, limits, bbox, zooms):
     b = compute_bounds(con)
     if b:
         set_meta(con, "bounds", "{:.5f},{:.5f},{:.5f},{:.5f}".format(*b))
-    stamp_zoom_range(con)
+    finish_run(con)
     con.commit()
     stored = con.execute("SELECT count(*) FROM tiles").fetchone()[0]
     con.close()
@@ -876,6 +945,7 @@ def coverage_descent(con, args, src, limits, bbox, zooms):
                                 (z, x, y))
                     if status == "ok":
                         store_tile(con, z, x, y, data)
+                flush_editions(con)
                 con.commit()
                 print(f"\r  z{z:<2} req {sum(zst.values()):>7}/{len(todo):<7} "
                       f"data={zst['ok']:>6} empty={zst['empty']:>7} err={zst['err']}",
@@ -899,7 +969,7 @@ def coverage_descent(con, args, src, limits, bbox, zooms):
     b = compute_bounds(con)
     if b:
         set_meta(con, "bounds", "{:.5f},{:.5f},{:.5f},{:.5f}".format(*b))
-    stamp_zoom_range(con)
+    finish_run(con)
     con.commit()
     remaining = con.execute("SELECT count(*) FROM _errors").fetchone()[0]
     if remaining == 0:
@@ -1023,10 +1093,8 @@ def run(args):
                     con.execute("INSERT OR IGNORE INTO _fetched (z, x, y) VALUES (?,?,?)",
                                 (z, x, y))
                     if status == "ok":
-                        row = (1 << z) - 1 - y
-                        con.execute("INSERT OR IGNORE INTO tiles "
-                                    "(zoom_level, tile_column, tile_row, tile_data) "
-                                    "VALUES (?,?,?,?)", (z, x, row, sqlite3.Binary(data)))
+                        store_tile(con, z, x, y, data)
+                flush_editions(con)
                 con.commit()
                 print(f"\r  z{z:<2} req {zst['ok']+zst['empty']+zst['err']:>7}/"
                       f"{len(todo):<7} data={zst['ok']:>6} empty={zst['empty']:>7} "
@@ -1052,7 +1120,7 @@ def run(args):
     b = compute_bounds(con)
     if b:
         set_meta(con, "bounds", "{:.5f},{:.5f},{:.5f},{:.5f}".format(*b))
-    stamp_zoom_range(con)
+    finish_run(con)
     con.commit()
 
     remaining = con.execute("SELECT count(*) FROM _errors").fetchone()[0]
