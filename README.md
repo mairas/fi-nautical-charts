@@ -271,29 +271,35 @@ upscale, confirming the deepest level is worth downscaling from.
 ## Currency and refresh
 
 Traficom reseeds its tile cache region by region, so a set spans a range of
-edition dates, readable from each tile's `Last-Modified` header. `currency.py`
-samples these, stamps `source_updated` (newest) / `source_updated_oldest` /
-`downloaded` into the MBTiles metadata, and renames the file:
+edition dates, carried by each tile's `Last-Modified`. The downloader reads them
+as it fetches and stamps `source_updated` (newest) / `source_updated_oldest`
+into the MBTiles metadata. `currency.py` turns those into the text a chart
+client shows, and renames the file. It contacts nothing:
 
 ```bash
 ./run currency mbtiles/rannikkokartat.mbtiles --rename   # -> fi-rannikkokartat-2026-06-29.mbtiles
 ```
 
-On-demand tiles (ones our own download forced GeoWebCache to generate) carry
-today's date, so they're excluded from `source_updated` — it reflects real
-editions, not our footprint. That exclusion only holds on the day of the
-download: months later those tiles read back as an ordinary edition of the day
-we fetched them. So never re-sample a set to fix its labelling —
+Fetch time is the only moment an edition date can be read at all. `Last-Modified`
+is not one for every tile: GeoWebCache renders a tile it does not hold on demand
+and stamps it with the moment it stored it, so our own requests manufacture dates
+that read exactly like a reseed. Sampling a set later cannot separate them — in a
+401-tile sample of veneilykartat the newest real edition and our own footprint
+were three tiles each.
 
-```bash
-./run currency mbtiles/fi-rannikkokartat-2026-06-29.mbtiles --restamp
-```
+During the request that caused it, though, the two are unmistakable. The
+response's own `Date` header says when the server answered, and a tile it made
+for us is stamped inside that request: measured against Traficom, **0 s** for a
+tile rendered on demand versus 71 and 1740 days for cached ones. Both timestamps
+come from the server's clock, so neither our clock nor our timezone enters it.
 
-rebuilds `name` and `description` from the dates the file already carries,
-touching no network and leaving `downloaded` alone. Reach for it when the
-naming rules change: the name is written once, at download time, and
-`strip-nodata` and `downscale` both copy metadata verbatim, so rebuilding a
-chart carries its original name forward rather than refreshing it.
+The consequence is that currency is recorded, never re-derived. A set that never
+recorded it has none, and `currency.py` says so rather than inventing one — as it
+does for WMS-sourced sets, which have no edition date at any time. Relabelling
+after a naming change is free and safe, though, since it reads only what is
+already stored: worth knowing because `strip-nodata` and `downscale` copy
+metadata verbatim, so rebuilding a chart carries its old name forward rather than
+refreshing it.
 
 Keep a set current without re-downloading it:
 
