@@ -281,7 +281,19 @@ samples these, stamps `source_updated` (newest) / `source_updated_oldest` /
 
 On-demand tiles (ones our own download forced GeoWebCache to generate) carry
 today's date, so they're excluded from `source_updated` — it reflects real
-editions, not our footprint.
+editions, not our footprint. That exclusion only holds on the day of the
+download: months later those tiles read back as an ordinary edition of the day
+we fetched them. So never re-sample a set to fix its labelling —
+
+```bash
+./run currency mbtiles/fi-rannikkokartat-2026-06-29.mbtiles --restamp
+```
+
+rebuilds `name` and `description` from the dates the file already carries,
+touching no network and leaving `downloaded` alone. Reach for it when the
+naming rules change: the name is written once, at download time, and
+`strip-nodata` and `downscale` both copy metadata verbatim, so rebuilding a
+chart carries its original name forward rather than refreshing it.
 
 Keep a set current without re-downloading it:
 

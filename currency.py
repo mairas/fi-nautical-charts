@@ -34,6 +34,22 @@ def slug(layer):
     return layer.lower().replace(" public", "").replace(" ", "").split("erikois")[0]
 
 
+def human_text(layer, newest, oldest, downloaded):
+    """The reader-facing name and description, derived wholly from stamped facts.
+
+    Freeboard truncates chart labels around 28 characters, so the name leads with
+    the Finnish product name -- the part a Finnish sailor recognises -- and the
+    English descriptor lives in the description instead."""
+    label, fin = HUMAN.get(slug(layer), ("Nautical charts", layer.replace(" public", "")))
+    return {
+        "name": f"{fin} {newest}",
+        "description": (f"Finnish {label.lower()} (Traficom {fin}, WMTS, CC BY 4.0). "
+                        f"Source updated {newest} (oldest sampled region {oldest}); "
+                        f"downloaded {downloaded}. Not for navigation use; does not meet "
+                        f"official nautical chart requirements."),
+    }
+
+
 def last_modified(layer, z, x, y):
     q = {"service": "WMTS", "request": "GetTile", "version": "1.0.0", "style": "",
          "tilematrixset": "WGS84_Pseudo-Mercator", "format": "image/png",
@@ -71,38 +87,51 @@ def main():
     p.add_argument("mbtiles")
     p.add_argument("--country", default="fi")
     p.add_argument("--rename", action="store_true")
+    p.add_argument("--restamp", action="store_true",
+                   help="rebuild name and description from the dates already stamped, "
+                        "without sampling the source")
     args = p.parse_args()
 
     con = sqlite3.connect(args.mbtiles)
     meta = dict(con.execute("SELECT name, value FROM metadata").fetchall())
     layer = meta.get("wmts_layer") or meta.get("name")
-    newest, oldest, n = sample_dates(con, layer)
-    if not newest:
-        raise SystemExit("no Last-Modified sampled; is the layer name correct?")
 
-    sl = slug(layer)
-    label, fin = HUMAN.get(sl, ("Nautical charts", layer.replace(" public", "")))
-    today = datetime.date.today().isoformat()
+    if args.restamp:
+        # Sampling again would move `downloaded` to today, which would be a lie:
+        # the tiles are the ones we already have. So take every date from the file.
+        missing = [k for k in ("wmts_layer", "source_updated", "source_updated_oldest",
+                               "downloaded") if k not in meta]
+        if missing:
+            raise SystemExit(f"--restamp rebuilds text from an existing stamp, and "
+                             f"{os.path.basename(args.mbtiles)} is missing "
+                             f"{', '.join(missing)}; run without --restamp first.")
+        newest, oldest = meta["source_updated"], meta["source_updated_oldest"]
+        downloaded, n = meta["downloaded"], None
+    else:
+        newest, oldest, n = sample_dates(con, layer)
+        if not newest:
+            raise SystemExit("no Last-Modified sampled; is the layer name correct?")
+        downloaded = datetime.date.today().isoformat()
+
     stamp = {
         "wmts_layer": layer,
-        "name": f"{fin} {newest}",
-        "source_updated": newest.isoformat(),
-        "source_updated_oldest": oldest.isoformat(),
-        "downloaded": today,
-        "description": (f"Finnish {label.lower()} (Traficom {fin}, WMTS, CC BY 4.0). "
-                        f"Source updated {newest} (oldest sampled region {oldest}); "
-                        f"downloaded {today}. Not for navigation use; does not meet "
-                        f"official nautical chart requirements."),
+        "source_updated": str(newest),
+        "source_updated_oldest": str(oldest),
+        "downloaded": downloaded,
+        **human_text(layer, newest, oldest, downloaded),
     }
     con.executemany("INSERT OR REPLACE INTO metadata (name, value) VALUES (?, ?)",
                     list(stamp.items()))
     con.commit()
     con.close()
-    print(f"{os.path.basename(args.mbtiles)}: sampled {n} tiles -> "
-          f"newest {newest}, oldest {oldest}")
+    if n is None:
+        print(f"{os.path.basename(args.mbtiles)}: name -> {stamp['name']}")
+    else:
+        print(f"{os.path.basename(args.mbtiles)}: sampled {n} tiles -> "
+              f"newest {newest}, oldest {oldest}")
 
     if args.rename:
-        newname = f"{args.country}-{sl}-{newest.isoformat()}.mbtiles"
+        newname = f"{args.country}-{slug(layer)}-{newest}.mbtiles"
         newpath = os.path.join(os.path.dirname(args.mbtiles) or ".", newname)
         os.rename(args.mbtiles, newpath)
         print(f"  renamed -> {newname}")
