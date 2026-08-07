@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["requests", "pillow", "numpy"]
+# dependencies = ["requests", "pillow", "numpy", "scipy"]
 # ///
 """Download a Traficom raster chart layer to MBTiles, minimising empty requests.
 
@@ -51,6 +51,8 @@ import requests
 from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from strip_nodata import MIN_FILL as NODATA_MIN_FILL, RADIUS as NODATA_RADIUS, nodata_mask
 
 WMTS_CAPS = ("https://julkinen.traficom.fi/rasteripalvelu/wmts"
              "?service=WMTS&request=GetCapabilities")
@@ -104,13 +106,16 @@ def parse_source(kind, layer):
     conditional  -- honours If-Modified-Since (304), so --refresh can delta-check
     empty_on_4xx -- 400/404 means "no tile here" rather than a broken request
     extent       -- geographic coverage, when the service declares no tile limits
+    nodata_fill  -- renders off-sheet as opaque black instead of transparency,
+                    so it needs stripping on the way in (see strip_nodata)
     """
     if kind == "wmts":
         return {"kind": "wmts", "layer": layer, "conditional": True,
-                "empty_on_4xx": True, "extent": None}
+                "empty_on_4xx": True, "extent": None, "nodata_fill": True}
     if kind == "wms":
+        # the ENC answers out-of-coverage with a genuinely transparent PNG
         return {"kind": "wms", "layer": layer or WMS_LAYER, "conditional": False,
-                "empty_on_4xx": False, "extent": WMS_EXTENT}
+                "empty_on_4xx": False, "extent": WMS_EXTENT, "nodata_fill": False}
     sys.exit(f"unknown source kind: {kind}")
 
 
@@ -348,6 +353,27 @@ def y2lat(y, z):
     return math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / (1 << z)))))
 
 
+def strip_fill(arr, original):
+    """Drop the opaque black off-sheet fill, returning None if nothing survives.
+
+    Stored as served it paints black wedges along every sheet edge, and once a
+    downscale averages it into a parent it turns grey, which no later pass can
+    identify. Cheaper to refuse it here than to clean it afterwards.
+
+    Tiles without fill are returned byte-for-byte as the server sent them; only
+    the ones actually carrying it are re-encoded."""
+    m = nodata_mask(arr, NODATA_RADIUS)
+    if m.sum() < NODATA_MIN_FILL:
+        return original
+    a = arr.copy()
+    a[m] = (255, 255, 255, 0)
+    if a[..., 3].max() == 0:
+        return None
+    buf = io.BytesIO()
+    Image.fromarray(a, "RGBA").save(buf, format="PNG")
+    return buf.getvalue()
+
+
 def _get_tile(src, z, x, y, ims=None):
     """The one HTTP call site. Classifies more finely than callers need:
 
@@ -367,6 +393,9 @@ def _get_tile(src, z, x, y, ims=None):
             img = Image.open(io.BytesIO(r.content)).convert("RGBA")
             if img.getchannel("A").getextrema()[1] == 0:
                 return "blank", None
+            if src["nodata_fill"]:
+                data = strip_fill(np.asarray(img), r.content)
+                return ("blank", None) if data is None else ("ok", data)
             return "ok", r.content
     except (requests.RequestException, OSError, ValueError):
         # an undecodable body is an err like any other: it belongs in _errors,

@@ -140,6 +140,14 @@ The `public` suffix marks the openly-licensed subset of each product.
 # Retry tiles that failed on an earlier run (e.g. transient network errors).
 ./run dl --layer "Rannikkokartat public" --out mbtiles/rannikkokartat.mbtiles --repair
 
+# Build order for a raster layer. strip-nodata must come first: downscaling
+# averages the source's off-sheet fill into the levels below, and a grey average
+# cannot be told from chart content afterwards.
+./run dl --layer "Rannikkokartat public" --out mbtiles/rk.mbtiles
+./run strip-nodata mbtiles/rk.mbtiles --out mbtiles/rk.stripped.mbtiles
+./run downscale mbtiles/rk.stripped.mbtiles --out mbtiles/rk.final.mbtiles
+./run currency mbtiles/rk.final.mbtiles --rename
+
 # Download the ENC. WMS source defaults to --mode coverage and --maxzoom 15.
 ./run dl --source wms --out mbtiles/fi-enc.mbtiles
 
@@ -158,6 +166,75 @@ Failed tiles are recorded in an `_errors` table and retried automatically —
 after each zoom during a download, and at the start of any resumed run. If a
 run finished before error tracking existed, `--repair` re-derives the expected
 tiles and re-fetches whatever is missing from the archive.
+
+## Stripping the off-sheet fill
+
+Some layers render the area outside their sheets as **opaque black** rather than
+leaving it transparent, so a viewer draws black wedges along every sheet edge.
+Whole tiles are affected, and so are the tiles the sheet boundary crosses, which
+come back part chart and part black. Measured on the 2026-06 downloads:
+
+| layer | tiles carrying fill |
+|-------|--------------------:|
+| `Merikarttasarjat public` | 30,625 |
+| `Rannikkokartat public` | 24,547 |
+| `Yleiskartat 250k` | 8,849 |
+| `Veneilykartat public` | 8,148 |
+| `Satamakartat` | 121 |
+
+Colour cannot separate the fill from chart ink — ink is pure `(0,0,0)` too, and
+fills up to 5% of an ordinary tile. Shape can: the fill is a solid region tens of
+pixels across, ink is strokes a few pixels wide. `strip-nodata` erodes the black
+mask to find what is thick, then grows those seeds back through the mask so the
+region is recovered exactly to its own hard edge.
+
+```bash
+./run strip-nodata mbtiles/fi-yleiskartat250k-2026-06-02.mbtiles --scan   # report only
+./run strip-nodata mbtiles/fi-yleiskartat250k-2026-06-02.mbtiles
+```
+
+**Run it before `downscale`.** Averaging black into a parent turns it grey, and
+grey is indistinguishable from chart content — no later pass can find it.
+
+### The white beyond the chart limits
+
+The same layers also render the area beyond the Finnish EEZ as **opaque white**,
+which occludes whatever basemap sits under the chart. This half of the problem
+needs a different method, because white is not a colour the chart reserves for
+off-sheet: open sea is white too, and locally the two are identical — same
+colour, same solidity. Only what encloses them differs.
+
+So the second pass works on the **tile grid**, not on pixels. A tile is *marked*
+if any opaque pixel of it is non-white, *featureless* otherwise. Flood the grid
+inward from beyond the data, crossing only featureless tiles; a marked tile is a
+wall. Featureless tiles the flood reaches are outside and get deleted; those it
+cannot reach are enclosed by chart content — open water between soundings — and
+stay. Marked tiles are never modified.
+
+Tile granularity is what makes this safe rather than a limitation. The EEZ line
+is dashed, and at pixel scale a flood slips between the dashes and empties water
+that is well inside coverage; at tile scale every tile the line crosses holds
+some of it, so the fence is unbroken. And since the only action is deleting whole
+tiles that carry nothing, no chart pixel can be lost — there is no radius or
+threshold to mistune.
+
+The deepest zoom decides the boundary, since it resolves it most finely. Coarser
+zooms cannot refine it: a coarse tile is marked when *any* part of its ground has
+content, so it can say "something here" but never where. Ancestors then follow
+their descendants — a tile whose deeper detail survives is kept whatever its own
+rendering shows, or the pyramid gains holes that appear and vanish as you zoom.
+
+Verified per chart by comparing against a `--skip-offeez` build: chart markings
+are identical at every zoom, to the pixel, while off-sheet tiles go (9,254 on
+Yleiskartat, 2,901 on Rannikkokartat). A one-tile white margin survives where a
+tile straddles the limit, since such a tile is marked and therefore untouched.
+
+Verified both directions: across 22 tiles well inside coverage it removes 0
+pixels at every erosion radius from 2 to 8, and every pixel it does remove was
+pure-black-opaque before and is transparent after (audited over all 121
+Satamakartat rewrites). On the Åland–Sweden boundary the wedges go from 4/5/18/63
+visibly dark tiles at z8–z11 to 0/0/3/13, the remainder being ordinary tiles
+around 1% dark, which is text.
 
 ## Downscaling the pyramid
 
