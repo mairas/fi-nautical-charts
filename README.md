@@ -140,6 +140,14 @@ The `public` suffix marks the openly-licensed subset of each product.
 # Retry tiles that failed on an earlier run (e.g. transient network errors).
 ./run dl --layer "Rannikkokartat public" --out mbtiles/rannikkokartat.mbtiles --repair
 
+# Build order for a raster layer. strip-nodata must come first: downscaling
+# averages the source's off-sheet fill into the levels below, and a grey average
+# cannot be told from chart content afterwards.
+./run dl --layer "Rannikkokartat public" --out mbtiles/rk.mbtiles
+./run strip-nodata mbtiles/rk.mbtiles --out mbtiles/rk.stripped.mbtiles
+./run downscale mbtiles/rk.stripped.mbtiles --out mbtiles/rk.final.mbtiles
+./run currency mbtiles/rk.final.mbtiles --rename
+
 # Download the ENC. WMS source defaults to --mode coverage and --maxzoom 15.
 ./run dl --source wms --out mbtiles/fi-enc.mbtiles
 
