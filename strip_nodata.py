@@ -40,6 +40,7 @@ RADIUS = 4          # erosion radius; ink vanishes by 2, fills survive past 8
 MIN_FILL = 64       # ignore specks: a real fill is far larger than this
 TILE = 256
 WHITE_LUM = 250     # above this an opaque pixel counts as blank paper
+BATCH = 2000        # tiles held in memory at once
 
 
 def tile_has_marks(blob):
@@ -145,16 +146,34 @@ def _strip(task):
     return (z, x, row, buf.getvalue(), n)
 
 
+def batches(con, z, size):
+    """One zoom's tiles in fixed-size batches, walking the key order.
+
+    Not a plain cursor: the caller deletes and updates rows as it goes, and not
+    LIMIT/OFFSET either, since a delete shifts every later offset and would skip
+    tiles. Advancing past the last key read is stable under both."""
+    last = (-1, -1)
+    while True:
+        rows = con.execute(
+            "SELECT tile_column, tile_row, tile_data FROM tiles WHERE zoom_level=? "
+            "AND (tile_column, tile_row) > (?, ?) ORDER BY tile_column, tile_row LIMIT ?",
+            (z, last[0], last[1], size)).fetchall()
+        if not rows:
+            return
+        yield rows
+        last = (rows[-1][0], rows[-1][1])
+
+
 def scan(src: Path, radius: int) -> None:
     con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
     zs = [z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level")]
     print(f"=== {src.name} ===")
     total = 0
     for z in zs:
-        rows = con.execute("SELECT tile_column, tile_row, tile_data FROM tiles "
-                           "WHERE zoom_level=?", (z,)).fetchall()
-        hit = px = 0
-        for x, row, blob in rows:
+        hit = px = seen = 0
+        for x, row, blob in con.execute("SELECT tile_column, tile_row, tile_data FROM tiles "
+                                        "WHERE zoom_level=?", (z,)):
+            seen += 1
             a = np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA"))
             n = int(nodata_mask(a, radius).sum())
             if n >= MIN_FILL:
@@ -162,8 +181,8 @@ def scan(src: Path, radius: int) -> None:
                 px += n
         total += hit
         if hit:
-            print(f"  z{z:<3} {hit:>6} of {len(rows):>7} tiles carry no-data fill "
-                  f"({100 * hit / len(rows):5.1f}%), {px / 65536:.0f} tiles' worth of pixels")
+            print(f"  z{z:<3} {hit:>6} of {seen:>7} tiles carry no-data fill "
+                  f"({100 * hit / seen:5.1f}%), {px / 65536:.0f} tiles' worth of pixels")
     print(f"  {total} tiles would be rewritten")
     con.close()
 
@@ -191,23 +210,26 @@ def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
     rewritten = dropped = 0
     with ProcessPoolExecutor(max_workers=jobs) as pool:
         for z in zs:
-            rows = con.execute("SELECT tile_column, tile_row, tile_data FROM tiles "
-                               "WHERE zoom_level=?", (z,)).fetchall()
-            tasks = [(z, x, row, blob, radius) for x, row, blob in rows]
             zr = zd = 0
-            for res in pool.map(_strip, tasks, chunksize=32):
-                if res is None:
-                    continue
-                rz, rx, rrow, data, _ = res
-                if data is None:
-                    con.execute("DELETE FROM tiles WHERE zoom_level=? AND tile_column=? "
-                                "AND tile_row=?", (rz, rx, rrow))
-                    zd += 1
-                else:
-                    con.execute("UPDATE tiles SET tile_data=? WHERE zoom_level=? AND "
-                                "tile_column=? AND tile_row=?", (sqlite3.Binary(data), rz, rx, rrow))
-                    zr += 1
-            con.commit()
+            # a batch at a time: the deepest zoom of a chart series runs to
+            # hundreds of thousands of tiles, and holding every blob -- once for
+            # the read and again for the task list -- outgrows a small machine
+            for rows in batches(con, z, BATCH):
+                tasks = [(z, x, row, blob, radius) for x, row, blob in rows]
+                for res in pool.map(_strip, tasks, chunksize=32):
+                    if res is None:
+                        continue
+                    rz, rx, rrow, data, _ = res
+                    if data is None:
+                        con.execute("DELETE FROM tiles WHERE zoom_level=? AND tile_column=? "
+                                    "AND tile_row=?", (rz, rx, rrow))
+                        zd += 1
+                    else:
+                        con.execute("UPDATE tiles SET tile_data=? WHERE zoom_level=? AND "
+                                    "tile_column=? AND tile_row=?",
+                                    (sqlite3.Binary(data), rz, rx, rrow))
+                        zr += 1
+                con.commit()
             rewritten += zr
             dropped += zd
             if zr or zd:
