@@ -77,7 +77,22 @@ function native-zoom {
 }
 
 ################################################################################
+# Publish
+
+function publish {
+  #@ Copy processed sets into the served directory and write the manifest
+  #@ Category: Publish
+  uv run publish.py "$@"
+}
+
+################################################################################
 # Utility Commands
+
+function test {
+  #@ Run the test suite
+  #@ Category: Utility
+  uv run --with pytest pytest "$@"
+}
 
 function deps {
   #@ Report tool dependencies
