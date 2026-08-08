@@ -77,7 +77,24 @@ function native-zoom {
 }
 
 ################################################################################
+# Publish
+
+function publish {
+  #@ Copy processed sets into the served directory and write the manifest
+  #@ Category: Publish
+  uv run publish.py "$@"
+}
+
+################################################################################
 # Utility Commands
+
+function test {
+  #@ Run the test suite
+  #@ Category: Utility
+  # Named explicitly: a bare pytest collects the whole tree, including scratch
+  # files and _local/, so a stray test elsewhere would fail the suite.
+  uv run --with 'pytest>=8,<9' pytest test_publish.py "$@"
+}
 
 function deps {
   #@ Report tool dependencies

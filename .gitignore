@@ -5,3 +5,4 @@ out/
 __pycache__/
 .venv/
 _local/
+.pytest_cache/
