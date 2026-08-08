@@ -147,6 +147,7 @@ The `public` suffix marks the openly-licensed subset of each product.
 ./run strip-nodata mbtiles/rk.mbtiles --out mbtiles/rk.stripped.mbtiles
 ./run downscale mbtiles/rk.stripped.mbtiles --out mbtiles/rk.final.mbtiles
 ./run currency mbtiles/rk.final.mbtiles --rename
+./run publish mbtiles/rk.final.mbtiles --dest /srv/charts
 
 # Download the ENC. WMS source defaults to --mode coverage and --maxzoom 15.
 ./run dl --source wms --out mbtiles/fi-enc.mbtiles
@@ -350,5 +351,49 @@ areas but **not complete** — content that appears only at the deepest zoom in 
 spot the coarser tile leaves transparent gets pruned (verified: 29 z15 tiles
 missed at Helsinki). Fast previews only; `full` for authoritative charts.
 
+## Publishing
+
+`publish` puts finished sets into the directory a web server exposes, and writes
+`charts.json` beside them describing every set present:
+
+```bash
+./run publish work/*.processed.mbtiles --dest /srv/charts
+```
+
+It stages each file *inside* the destination, reads back what it wrote, and only
+then renames it into place. Both halves matter. Staging in the destination keeps
+the rename on one filesystem, where it is atomic — a client either gets the whole
+old file or the whole new one, never a partial write. Reading back is what an
+upload cannot do: a transfer that silently truncated three of five files went
+unnoticed for six days, because size and exit status both looked plausible.
+
+Naming and retention follow from the metadata rather than from the working file:
+the destination name is rebuilt from the layer and `source_updated` the file
+carries, and any older edition of that same layer is removed once the new one is
+in place. A run that fails at any point publishes nothing and leaves the previous
+set exactly as it was, so a failed refresh degrades to stale charts, never to
+missing or half-written ones.
+
+The manifest closes a gap the filenames cannot. A name records the *source*
+edition, so the fill-strip and off-EEZ work changed the tiles without changing
+any name, and anything caching by URL kept serving the old content. Each entry
+therefore carries `sha256`, `bytes`, `source_edition` and `processing` — the
+stamps `strip-nodata` and `downscale` leave in the file — alongside a `pipeline`
+version for the run as a whole:
+
+```json
+{
+  "filename": "fi-veneilykartat-2026-06-21.mbtiles",
+  "bytes": 245039104,
+  "sha256": "…",
+  "source_edition": "2026-06-21",
+  "processing": "opaque-black-r4+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-08"
+}
+```
+
+Run `currency` before publishing when the naming rules have changed since the
+set was downloaded: `strip-nodata` and `downscale` copy metadata verbatim, so a
+rebuilt chart carries its old name forward until relabelled.
+
 Python tools run via [uv](https://docs.astral.sh/uv/) with PEP 723 inline
-dependencies — no manual environment setup.
+dependencies — no manual environment setup. `./run test` runs the suite.
