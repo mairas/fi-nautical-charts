@@ -503,6 +503,46 @@ def test_an_unreadable_chart_in_the_destination_still_yields_a_manifest(tmp_path
     assert "readable" not in entries["fi-veneilykartat-2026-06-21.mbtiles"]
 
 
+def test_the_manifest_declares_its_own_format_version(tmp_path, dest):
+    """A consumer that meets a version it does not know should refuse rather
+    than guess, which it can only do if the number is there from the start."""
+    publish.publish([make_mbtiles(tmp_path / "a.mbtiles")], dest)
+    assert manifest_of(dest)["schema"] == publish.SCHEMA
+
+
+def test_each_chart_carries_the_layer_key_that_survives_a_new_edition(tmp_path, dest):
+    """`filename` changes every edition, so it is not something a consumer can
+    track a chart by. Without this the only handle is parsing the filename."""
+    publish.publish([make_mbtiles(tmp_path / "a.mbtiles")], dest)
+    (first,) = manifest_of(dest)["charts"]
+
+    newer = make_mbtiles(tmp_path / "b.mbtiles", dict(META, source_updated="2026-07-19"))
+    publish.publish([newer], dest)
+    (second,) = manifest_of(dest)["charts"]
+
+    assert first["layer"] == "fi-veneilykartat"
+    assert second["layer"] == first["layer"]
+    assert second["filename"] != first["filename"]
+
+
+def test_the_layer_key_prefixes_the_filename(tmp_path, dest):
+    harbour = dict(META, wmts_layer="Yleiskartat 250k public", source_updated="2026-06-02")
+    publish.publish([make_mbtiles(tmp_path / "a.mbtiles", harbour)], dest)
+
+    (entry,) = manifest_of(dest)["charts"]
+    assert entry["layer"] == "fi-yleiskartat250k"
+    assert entry["filename"].startswith(entry["layer"] + "-")
+
+
+def test_an_unreadable_chart_has_no_layer_to_report(tmp_path, dest):
+    junk = dest / "fi-enc-2026-01-01.mbtiles"
+    junk.write_bytes(b"not a database")
+    publish.publish([make_mbtiles(tmp_path / "a.mbtiles")], dest)
+
+    entries = {e["filename"]: e for e in manifest_of(dest)["charts"]}
+    assert entries[junk.name]["layer"] is None
+
+
 def test_generated_is_a_utc_instant_not_a_bare_local_date(tmp_path, dest):
     """Two publishes on one day are routine -- a scheduled run and a manual
     retry -- and a consumer polling for changes needs to tell them apart."""

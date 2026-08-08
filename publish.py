@@ -44,6 +44,10 @@ from pathlib import Path
 from currency import slug
 
 MANIFEST = "charts.json"
+# Fields may be added at any time without a bump; an existing field never
+# changes meaning or type without one. A consumer meeting a higher number
+# should refuse rather than guess.
+SCHEMA = 1
 STAGING = ".staging"
 LOCK = ".publish.lock"
 CHUNK = 4 << 20
@@ -192,10 +196,24 @@ def pipeline_version() -> str:
         return "unknown"
 
 
+def layer_of(meta: dict) -> str | None:
+    """The layer a file belongs to, or None if it does not record one.
+
+    Unlike layer_prefix this never refuses: the manifest describes whatever is
+    in the destination, including files this tool did not put there.
+    """
+    try:
+        return layer_prefix(meta)
+    except Unpublishable:
+        return None
+
+
 def manifest_entry(name: str, size: int, sha: str, meta: dict | None) -> dict:
     if meta is None:
-        return {"filename": name, "bytes": size, "sha256": sha, "readable": False}
+        return {"filename": name, "layer": None, "bytes": size, "sha256": sha,
+                "readable": False}
     return {"filename": name,
+            "layer": layer_of(meta),
             "bytes": size,
             "sha256": sha,
             "source_edition": meta.get("source_updated"),
@@ -213,7 +231,8 @@ def fsync_dir(path: Path) -> None:
 
 
 def write_manifest(dest: Path, charts: list[dict], pipeline: str) -> Path:
-    body = {"generated": datetime.datetime.now(datetime.timezone.utc)
+    body = {"schema": SCHEMA,
+            "generated": datetime.datetime.now(datetime.timezone.utc)
             .isoformat(timespec="seconds"),
             "pipeline": pipeline,
             "charts": sorted(charts, key=lambda e: e["filename"])}
