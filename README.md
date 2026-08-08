@@ -407,9 +407,11 @@ any name, and anything caching by URL kept serving the old content.
 
 | Field | Meaning |
 |---|---|
+| `schema` | Format version. Fields may be added without a bump; an existing field never changes meaning or type without one. Refuse a number you do not know rather than guessing |
 | `generated` | RFC 3339 UTC instant the manifest was written, not when the charts were built |
 | `pipeline` | `git describe` of the code that ran, or `unknown` outside a checkout. An opaque token: not orderable, not comparable across repos |
-| `filename` | Resolves relative to the manifest's own URL |
+| `filename` | Resolves relative to the manifest's own URL. Changes with every edition, so track a chart by `layer` instead |
+| `layer` | The chart this file is an edition of, and the prefix of its filename. Stable across editions. Null for a file that records no layer |
 | `bytes`, `sha256` | Size and lowercase-hex digest of the complete file as served |
 | `source_edition`, `source_edition_oldest` | Newest and oldest tile edition dates the download recorded. Null for a source that publishes no edition date |
 | `processing` | The stamps `strip-nodata` and `downscale` leave in the file, or `none` |
@@ -418,11 +420,13 @@ any name, and anything caching by URL kept serving the old content.
 
 ```json
 {
+  "schema": 1,
   "generated": "2026-08-08T11:36:40+00:00",
   "pipeline": "37dab52",
   "charts": [
     {
       "filename": "fi-veneilykartat-2026-06-21.mbtiles",
+      "layer": "fi-veneilykartat",
       "bytes": 245039104,
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
