@@ -146,7 +146,7 @@ The `public` suffix marks the openly-licensed subset of each product.
 ./run dl --layer "Rannikkokartat public" --out mbtiles/rk.mbtiles
 ./run strip-nodata mbtiles/rk.mbtiles --out mbtiles/rk.stripped.mbtiles
 ./run downscale mbtiles/rk.stripped.mbtiles --out mbtiles/rk.final.mbtiles
-./run currency mbtiles/rk.final.mbtiles --rename
+./run currency mbtiles/rk.final.mbtiles      # relabel; publish names the file itself
 ./run publish mbtiles/rk.final.mbtiles --dest /srv/charts
 
 # Download the ENC. WMS source defaults to --mode coverage and --maxzoom 15.
@@ -357,43 +357,89 @@ missed at Helsinki). Fast previews only; `full` for authoritative charts.
 `charts.json` beside them describing every set present:
 
 ```bash
-./run publish work/*.processed.mbtiles --dest /srv/charts
+./run publish mbtiles/*.final.mbtiles --dest /srv/charts
 ```
 
-It stages each file *inside* the destination, reads back what it wrote, and only
-then renames it into place. Both halves matter. Staging in the destination keeps
-the rename on one filesystem, where it is atomic — a client either gets the whole
-old file or the whole new one, never a partial write. Reading back is what an
-upload cannot do: a transfer that silently truncated three of five files went
-unnoticed for six days, because size and exit status both looked plausible.
+Each file is copied into `<dest>/.staging/`, read back and compared against what
+was read from the source, and only then renamed into place. Both halves matter.
+Staging inside the destination keeps the rename on one filesystem, where it is
+atomic — a client gets the whole old file or the whole new one, never a partial
+write. Reading back is what an upload cannot do: a transfer that silently
+truncated three of five files went unnoticed for six days, because size and exit
+status both looked plausible.
 
-Naming and retention follow from the metadata rather than from the working file:
-the destination name is rebuilt from the layer and `source_updated` the file
-carries, and any older edition of that same layer is removed once the new one is
-in place. A run that fails at any point publishes nothing and leaves the previous
-set exactly as it was, so a failed refresh degrades to stale charts, never to
-missing or half-written ones.
+**The staging directory and `.publish.lock` are dotfiles inside the served
+directory**, and a partially written chart lives there for as long as a multi-GB
+copy takes. nginx serves dotfiles unless told not to, so deny them:
+
+```nginx
+location ~ /\. { deny all; }
+```
+
+Everything that can refuse a run happens before the first rename — truncation
+checks, name validation, staging, verification, and building the whole manifest
+— so a refusal leaves the previous set exactly as it was and a failed refresh
+degrades to stale charts, never to missing or half-written ones. Past that point
+only the renames, the retirements and one small manifest write remain; a failure
+there raises `PartiallyPublished` rather than `Unpublishable`, so a caller can
+tell "nothing happened" from "the destination changed and the run stopped".
+
+A run is refused if a source is shorter than its own SQLite header says it is
+(`strip-nodata` and `downscale` both run with `journal_mode=OFF`, so a killed
+writer leaves a partial file rather than rolling back, and a faithful copy of a
+truncated file verifies perfectly); if a source has an uncheckpointed `-wal`,
+whose contents copying the database file alone would drop; if two sources are
+different editions of one layer, which would each retire the other; if the
+metadata produces anything but a `fi-<layer>-<date>.mbtiles` name, since that
+name reaches `open`, `glob` and `unlink`; or if another publish holds the
+destination lock.
+
+Naming and retirement come from metadata, not filenames. The destination name is
+rebuilt from the layer and `source_updated` the file carries, so the working
+filename does not matter and `currency --rename` is not a prerequisite. A file
+already in the destination is retired only when its *own* metadata records the
+same layer and an older edition — matching on the filename would also hit build
+variants, hand-placed files, and a newer edition being republished over.
 
 The manifest closes a gap the filenames cannot. A name records the *source*
 edition, so the fill-strip and off-EEZ work changed the tiles without changing
-any name, and anything caching by URL kept serving the old content. Each entry
-therefore carries `sha256`, `bytes`, `source_edition` and `processing` — the
-stamps `strip-nodata` and `downscale` leave in the file — alongside a `pipeline`
-version for the run as a whole:
+any name, and anything caching by URL kept serving the old content.
+
+| Field | Meaning |
+|---|---|
+| `generated` | RFC 3339 UTC instant the manifest was written, not when the charts were built |
+| `pipeline` | `git describe` of the code that ran, or `unknown` outside a checkout. An opaque token: not orderable, not comparable across repos |
+| `filename` | Resolves relative to the manifest's own URL |
+| `bytes`, `sha256` | Size and lowercase-hex digest of the complete file as served |
+| `source_edition`, `source_edition_oldest` | Newest and oldest tile edition dates the download recorded. Null for a source that publishes no edition date |
+| `processing` | The stamps `strip-nodata` and `downscale` leave in the file, or `none` |
+| `name` | The label a chart client shows |
+| `readable` | Present and `false` only for a file in the destination this tool cannot open as MBTiles. Such a file still gets a size and a digest |
 
 ```json
 {
-  "filename": "fi-veneilykartat-2026-06-21.mbtiles",
-  "bytes": 245039104,
-  "sha256": "…",
-  "source_edition": "2026-06-21",
-  "processing": "opaque-black-r4+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-08"
+  "generated": "2026-08-08T11:36:40+00:00",
+  "pipeline": "37dab52",
+  "charts": [
+    {
+      "filename": "fi-veneilykartat-2026-06-21.mbtiles",
+      "bytes": 245039104,
+      "sha256": "ad697da38f74…",
+      "source_edition": "2026-06-21",
+      "source_edition_oldest": "2025-01-20",
+      "processing": "opaque-black-r4+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-08",
+      "name": "Veneilykartat 2026-06-21"
+    }
+  ]
 }
 ```
 
-Run `currency` before publishing when the naming rules have changed since the
-set was downloaded: `strip-nodata` and `downscale` copy metadata verbatim, so a
-rebuilt chart carries its old name forward until relabelled.
+A retired edition disappears as soon as its replacement is in place, so a cached
+manifest can name a file that now 404s; re-fetch `charts.json` rather than
+treating it as an error. Run `currency` before publishing when the naming rules
+have changed since the set was downloaded: `strip-nodata` and `downscale` copy
+metadata verbatim, so a rebuilt chart carries its old label forward until
+relabelled.
 
 Python tools run via [uv](https://docs.astral.sh/uv/) with PEP 723 inline
 dependencies — no manual environment setup. `./run test` runs the suite.
