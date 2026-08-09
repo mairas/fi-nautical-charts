@@ -74,15 +74,18 @@ def classify(con, z):
     return marked, feat
 
 
-def flood_outside(marked, feat):
-    """Featureless tiles reachable from beyond the data, walking the tile grid.
+def walk_outside(marked, feat):
+    """Every cell the walk reaches from beyond the data, empty ones included.
 
     A marked tile is a wall. That is what makes the dashed EEZ line work here:
     at pixel scale the fill slips between the dashes, but every tile the line
     crosses holds some of them, so at tile scale the fence is unbroken.
 
-    Featureless tiles the walk cannot reach are enclosed by chart content --
-    open water between soundings -- and are kept."""
+    Cells with no tile at all are outside by definition and the walk crosses
+    them freely -- and they are returned, because a chart tile at the very edge
+    of the data has nothing but empty space on its outward side, and a caller
+    asking "does this tile face the outside?" has to be able to see it.
+    """
     present = marked | feat
     if not present:
         return set()
@@ -104,7 +107,15 @@ def flood_outside(marked, feat):
             if not (x0 <= n[0] <= x1 and y0 <= n[1] <= y1) or n in seen or n in marked:
                 continue
             seen.add(n); q.append(n)
-    return feat & seen
+    return seen
+
+
+def flood_outside(marked, feat):
+    """Featureless tiles reachable from beyond the data.
+
+    Those the walk cannot reach are enclosed by chart content -- open water
+    between soundings -- and are kept."""
+    return feat & walk_outside(marked, feat)
 
 
 def offsheet_plan(con, zs):
@@ -193,8 +204,8 @@ def edge_tiles(ink, plain, black):
 
     Returns the off-sheet tiles and the chart tiles that abut them.
     """
-    reached = flood_outside(ink, plain)
-    offsheet = {t for t in reached if black.get(t, 0) >= MIN_FILL}
+    reached = walk_outside(ink, plain)
+    offsheet = {t for t in reached & plain if black.get(t, 0) >= MIN_FILL}
     straddling = {}
     for x, y in ink:
         sides = "".join(s for (dx, dy), s in AROUND.items()
