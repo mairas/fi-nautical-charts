@@ -11,11 +11,21 @@ Whole tiles are affected, and so are the tiles the sheet boundary crosses, which
 come back part chart and part black.
 
 Colour cannot separate the two: chart ink is pure (0,0,0) as well, and fills up
-to 5% of an ordinary tile. Shape can. The no-data fill is a solid region tens of
-pixels across; ink is strokes a few pixels wide. Eroding the black mask leaves
-seeds only inside the fill, and growing those seeds back through the mask
-recovers the region exactly to its own hard edge -- which is genuinely hard, the
-source anti-aliases the boundary not at all.
+to 5% of an ordinary tile. Neither can shape alone. Eroding the black mask does
+leave seeds inside the fill, but Traficom sets place names in heavy serif
+capitals, and at native zoom their strokes survive the same erosion -- so the
+local test called HELSINKI a no-data fill and deleted it, leaving the hollow
+anti-aliased outline behind. It cost 6-12% of the ink on interior tiles.
+
+Position separates them. The fill is not a shape inside a tile but a region of
+the tile grid: it lies beyond the last sheet and runs to the edge of the data,
+so the same walk that finds the water outside the EEZ finds it. Only tiles that
+walk reaches, and the chart tiles they touch, are examined at all; the interior
+is never a candidate, whatever its ink looks like. Within those tiles, eroding
+seeds the fill and growing them back recovers it exactly to its own hard edge --
+which is genuinely hard, the source anti-aliases the boundary not at all -- but
+the growth runs through the solid black only, since at a sheet edge the chart's
+own ink abuts the fill and connectivity would otherwise follow it out.
 
 Run this on the raw download, before downscaling. Averaging black into a parent
 turns it grey, and grey is indistinguishable from chart content.
@@ -38,6 +48,8 @@ from scipy import ndimage
 
 RADIUS = 4          # erosion radius; ink vanishes by 2, fills survive past 8
 MIN_FILL = 64       # ignore specks: a real fill is far larger than this
+FILL_FRACTION = .95 # above this a tile is off-sheet rather than chart
+THIN = 2            # strokes narrower than this survive as ink, not fill
 TILE = 256
 WHITE_LUM = 250     # above this an opaque pixel counts as blank paper
 BATCH = 2000        # tiles held in memory at once
@@ -118,6 +130,48 @@ def offsheet_plan(con, zs):
     return plan, drops
 
 
+def _survey(task):
+    """One tile's character: how black it is, and whether it draws anything else."""
+    z, x, row, blob = task
+    a = np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA"))
+    opaque = a[..., 3] == 255
+    black = opaque & (a[..., :3].max(axis=2) == 0)
+    other = opaque & (a[..., :3].mean(axis=2) <= WHITE_LUM) & ~black
+    return x, row, float(black.mean()), bool(other.any())
+
+
+def survey(con, z, pool):
+    """Split one zoom's tiles into solid fill, chart content, and blank paper."""
+    fill, content, blank = set(), set(), set()
+    for rows in batches(con, z, BATCH):
+        tasks = [(z, x, row, blob) for x, row, blob in rows]
+        for x, row, frac, other in pool.map(_survey, tasks, chunksize=32):
+            xy = (x, (1 << z) - 1 - row)
+            (content if other else fill if frac >= FILL_FRACTION else blank).add(xy)
+    return fill, content, blank
+
+
+def edge_tiles(fill, content, blank):
+    """Tiles where off-sheet fill can be, and only those.
+
+    The fill is not a shape to recognise inside a tile. It is a region of the
+    tile grid: it lies beyond the last sheet and runs to the edge of the data,
+    so the same walk that finds the water outside the EEZ finds it. A tile the
+    walk cannot reach is enclosed by chart, and whatever black it holds is ink
+    -- however thick, and Traficom sets place names heavy enough that no local
+    shape test can tell them from fill.
+
+    Returns the fill to blank out, and the straddling chart tiles to examine.
+    """
+    reached = flood_outside(content, fill | blank)
+    outside = fill & reached
+    straddling = {c for c in content
+                  if any(n in outside for n in
+                         ((c[0] + 1, c[1]), (c[0] - 1, c[1]),
+                          (c[0], c[1] + 1), (c[0], c[1] - 1)))}
+    return outside, straddling
+
+
 def nodata_mask(a: np.ndarray, radius: int) -> np.ndarray:
     """Pixels belonging to a solid opaque-black region rather than to chart ink."""
     black = (a[..., :3].max(axis=2) == 0) & (a[..., 3] == 255)
@@ -127,7 +181,14 @@ def nodata_mask(a: np.ndarray, radius: int) -> np.ndarray:
     seeds = ndimage.binary_erosion(black, structure=k)
     if not seeds.any():
         return np.zeros_like(black)
-    return ndimage.binary_propagation(seeds, mask=black)
+    # Grown back through the solid part of the black, not through all of it.
+    # Reconstruction follows connectivity, and at a sheet edge the chart's own
+    # ink abuts the fill, so propagating through every black pixel runs down
+    # those strokes and takes them too. An opening drops anything thinner than
+    # ink while leaving a straight boundary exactly where it was, which is what
+    # the fill has -- the source anti-aliases it not at all.
+    solid = ndimage.binary_opening(black, structure=np.ones((2 * THIN + 1,) * 2, bool))
+    return ndimage.binary_propagation(seeds, mask=solid)
 
 
 def _strip(task):
@@ -211,11 +272,22 @@ def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
     with ProcessPoolExecutor(max_workers=jobs) as pool:
         for z in zs:
             zr = zd = 0
+            fill, content, blank = survey(con, z, pool)
+            outside, straddling = edge_tiles(fill, content, blank)
+            todo = sorted((x, (1 << z) - 1 - y) for (x, y) in outside | straddling)
+            if todo:
+                print(f"  z{z:<3} {len(outside)} off-sheet, {len(straddling)} straddling "
+                      f"of {len(fill) + len(content) + len(blank)} tiles")
             # a batch at a time: the deepest zoom of a chart series runs to
             # hundreds of thousands of tiles, and holding every blob -- once for
             # the read and again for the task list -- outgrows a small machine
-            for rows in batches(con, z, BATCH):
-                tasks = [(z, x, row, blob, radius) for x, row, blob in rows]
+            for i in range(0, len(todo), BATCH):
+                tasks = []
+                for x, row in todo[i:i + BATCH]:
+                    blob = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
+                                       "tile_column=? AND tile_row=?", (z, x, row)).fetchone()
+                    if blob:
+                        tasks.append((z, x, row, blob[0], radius))
                 for res in pool.map(_strip, tasks, chunksize=32):
                     if res is None:
                         continue
@@ -235,7 +307,7 @@ def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
             if zr or zd:
                 print(f"  z{z:<3} rewrote {zr:>6}, dropped {zd:>5}")
 
-    stamp = f"opaque-black-r{radius}"
+    stamp = f"opaque-black-r{radius}-edge"
     if offeez:
         # classified from the black-stripped tiles, so removed fill cannot pose
         # as a marking and wall the flood out of its own region
