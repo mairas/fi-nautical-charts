@@ -131,27 +131,50 @@ def offsheet_plan(con, zs):
 
 
 def _survey(task):
-    """One tile's character: how black it is, and whether it draws anything else."""
+    """One tile's character: how much of its ink is black, and how much is not.
+
+    Both counts are over opaque pixels only. Off-sheet fill routinely arrives
+    with a transparent margin where the fetched tile runs past the served
+    extent, and measuring against the whole 256x256 would read those tiles as
+    only nine-tenths black and let them pass for chart.
+    """
     z, x, row, blob = task
     a = np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA"))
     opaque = a[..., 3] == 255
     black = opaque & (a[..., :3].max(axis=2) == 0)
     other = opaque & (a[..., :3].mean(axis=2) <= WHITE_LUM) & ~black
-    return x, row, float(black.mean()), bool(other.any())
+    n = int(opaque.sum())
+    return x, row, int(black.sum()), int(other.sum()), n
 
 
 def survey(con, z, pool):
-    """Split one zoom's tiles into solid fill, chart content, and blank paper."""
-    fill, content, blank = set(), set(), set()
+    """One zoom's tiles as (ink, plain, black), in XYZ coordinates.
+
+    `ink` is everything that draws in a colour other than black -- chart, and
+    only chart. It is what walls the walk. `plain` is everything else: solid
+    fill, blank paper, and the tiles that are part of each. `black` counts the
+    opaque black pixels on every tile, so the caller can tell a tile with fill
+    to remove from one with nothing on it.
+    """
+    ink, plain, black = set(), set(), {}
     for rows in batches(con, z, BATCH):
         tasks = [(z, x, row, blob) for x, row, blob in rows]
-        for x, row, frac, other in pool.map(_survey, tasks, chunksize=32):
+        for x, row, blk, other, opaque in pool.map(_survey, tasks, chunksize=32):
             xy = (x, (1 << z) - 1 - row)
-            (content if other else fill if frac >= FILL_FRACTION else blank).add(xy)
-    return fill, content, blank
+            black[xy] = blk
+            (ink if other > MIN_FILL else plain).add(xy)
+    return ink, plain, black
 
 
-def edge_tiles(fill, content, blank):
+def neighbours(t):
+    """The eight tiles around one. A sheet edge crossing the grid diagonally
+    leaves chart tiles whose only contact with the fill is a corner."""
+    x, y = t
+    return ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1),
+            (x + 1, y + 1), (x + 1, y - 1), (x - 1, y + 1), (x - 1, y - 1))
+
+
+def edge_tiles(ink, plain, black):
     """Tiles where off-sheet fill can be, and only those.
 
     The fill is not a shape to recognise inside a tile. It is a region of the
@@ -161,21 +184,52 @@ def edge_tiles(fill, content, blank):
     -- however thick, and Traficom sets place names heavy enough that no local
     shape test can tell them from fill.
 
-    Returns the fill to blank out, and the straddling chart tiles to examine.
+    The walk is a protective mask, not a classifier: everything it reaches that
+    carries black is examined, and so is every chart tile it touches. Deciding
+    candidacy by class instead would exempt whole classes of tile that plainly
+    hold fill -- a sheet corner that is half fill and half blank paper draws no
+    colour at all, and is neither chart nor wholly off-sheet.
+
+    Returns the off-sheet tiles and the chart tiles that abut them.
     """
-    reached = flood_outside(content, fill | blank)
-    outside = fill & reached
-    straddling = {c for c in content
-                  if any(n in outside for n in
-                         ((c[0] + 1, c[1]), (c[0] - 1, c[1]),
-                          (c[0], c[1] + 1), (c[0], c[1] - 1)))}
-    return outside, straddling
+    reached = flood_outside(ink, plain)
+    offsheet = {t for t in reached if black.get(t, 0) >= MIN_FILL}
+    straddling = {t for t in ink if any(n in reached for n in neighbours(t))}
+    return offsheet, straddling
 
 
-def nodata_mask(a: np.ndarray, radius: int) -> np.ndarray:
-    """Pixels belonging to a solid opaque-black region rather than to chart ink."""
+class Leaked(RuntimeError):
+    """Tiles hold solid fill that the walk did not reach, so it would ship."""
+
+
+def leaked(black, candidates, z, cap=TILE * TILE * FILL_FRACTION):
+    """Refuse to leave a tile that is nothing but fill unexamined.
+
+    Selecting by position is only as good as the walk, and a walk that stops
+    short leaves black in the output while every counter reports success --
+    which is exactly how the previous selection shipped. This costs nothing:
+    the survey has already counted the black on every tile.
+    """
+    missed = sorted(t for t, n in black.items() if n >= cap and t not in candidates)
+    if missed:
+        raise Leaked(
+            f"z{z}: {len(missed)} tiles are at least {FILL_FRACTION:.0%} solid black "
+            f"but the walk did not reach them, so their fill would ship: "
+            f"{missed[:5]}{' ...' if len(missed) > 5 else ''}")
+
+
+def nodata_mask(a: np.ndarray, radius: int, protect: bool = True) -> np.ndarray:
+    """Pixels belonging to a solid opaque-black region rather than to chart ink.
+
+    `protect` buys ink safety with a little unremoved fill, so it is for tiles
+    that carry chart. On a tile the walk placed wholly outside the last sheet
+    there is no ink to protect, and the opening would only strand the fill in
+    corners too narrow to survive it.
+    """
     black = (a[..., :3].max(axis=2) == 0) & (a[..., 3] == 255)
     if not black.any():
+        return black
+    if not protect:
         return black
     k = np.ones((2 * radius + 1, 2 * radius + 1), bool)
     seeds = ndimage.binary_erosion(black, structure=k)
@@ -192,10 +246,10 @@ def nodata_mask(a: np.ndarray, radius: int) -> np.ndarray:
 
 
 def _strip(task):
-    z, x, row, blob, radius = task
+    z, x, row, blob, radius, protect = task
     img = Image.open(io.BytesIO(blob)).convert("RGBA")
     a = np.asarray(img).copy()
-    m = nodata_mask(a, radius)
+    m = nodata_mask(a, radius, protect)
     n = int(m.sum())
     if n < MIN_FILL:
         return None
@@ -272,22 +326,21 @@ def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
     with ProcessPoolExecutor(max_workers=jobs) as pool:
         for z in zs:
             zr = zd = 0
-            fill, content, blank = survey(con, z, pool)
-            outside, straddling = edge_tiles(fill, content, blank)
-            todo = sorted((x, (1 << z) - 1 - y) for (x, y) in outside | straddling)
+            ink, plain, black = survey(con, z, pool)
+            offsheet, straddling = edge_tiles(ink, plain, black)
+            candidates = offsheet | straddling
+            leaked(black, candidates, z)
+            todo = sorted(((x, (1 << z) - 1 - y), (x, y) in straddling)
+                          for (x, y) in candidates)
             if todo:
-                print(f"  z{z:<3} {len(outside)} off-sheet, {len(straddling)} straddling "
-                      f"of {len(fill) + len(content) + len(blank)} tiles")
-            # a batch at a time: the deepest zoom of a chart series runs to
-            # hundreds of thousands of tiles, and holding every blob -- once for
-            # the read and again for the task list -- outgrows a small machine
+                print(f"  z{z:<3} {len(offsheet)} off-sheet, {len(straddling)} straddling "
+                      f"of {len(ink) + len(plain)} tiles")
             for i in range(0, len(todo), BATCH):
                 tasks = []
-                for x, row in todo[i:i + BATCH]:
+                for (x, row), protect in todo[i:i + BATCH]:
                     blob = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
                                        "tile_column=? AND tile_row=?", (z, x, row)).fetchone()
-                    if blob:
-                        tasks.append((z, x, row, blob[0], radius))
+                    tasks.append((z, x, row, blob[0], radius, protect))
                 for res in pool.map(_strip, tasks, chunksize=32):
                     if res is None:
                         continue

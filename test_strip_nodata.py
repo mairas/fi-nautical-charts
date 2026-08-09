@@ -9,8 +9,8 @@ solid fill from line work. So most of what is asserted here is what must
 
 import io
 import sqlite3
-import subprocess
-import sys
+
+
 from pathlib import Path
 
 import numpy as np
@@ -36,6 +36,20 @@ def tile(kind: str) -> bytes:
         a[100:103, 20:230] = (0, 0, 0, 255)      # a thin ruled line: line work
         if kind == "content+type":
             a[150:200, 40:90] = (0, 0, 0, 255)   # a heavy letterform
+        if kind == "fill+margin":
+            # Off-sheet, but the fetched tile ran past the served extent, so a
+            # strip of it came back transparent. Measured against all 65536
+            # pixels this reads as 94.5% black; against its opaque pixels, 100%.
+            a[:, :] = (0, 0, 0, 255)
+            a[242:, :] = (0, 0, 0, 0)
+        if kind == "fill+speck":
+            # Off-sheet apart from a few pixels of a label that crossed the cut.
+            a[:, :] = (0, 0, 0, 255)
+            a[4:12, 4:12] = (200, 60, 130, 255)
+        if kind == "fill+paper":
+            # A sheet corner: half off-sheet, half blank paper, no ink at all.
+            a[:, :] = (255, 255, 255, 255)
+            a[:, :180] = (0, 0, 0, 255)
         if kind == "half-fill":
             # Off-sheet to the left, running off the tile edge. Chart ink is not
             # drawn over it, so the line restarts where the sheet does -- abutting
@@ -146,6 +160,65 @@ def test_a_chart_with_no_fill_at_all_is_left_completely_alone(tmp_path):
         a = read(out, x, y)
         b = np.asarray(Image.open(io.BytesIO(tile(layout[(x, y)]))).convert("RGBA"))
         assert a is not None and np.array_equal(a, b), f"tile {x},{y} was rewritten"
+
+
+@pytest.mark.parametrize("kind", ["fill+margin", "fill+speck", "fill+paper"])
+def test_off_sheet_tiles_that_are_not_perfectly_uniform_are_still_stripped(tmp_path, kind):
+    """Real off-sheet tiles are rarely a clean 256x256 of black. They come with
+    a transparent margin where the fetch ran past the extent, with a few pixels
+    of a label that crossed the sheet cut, or as a corner that is half blank
+    paper. Each of those used to fall into a class that was exempt."""
+    layout = dict(LAYOUT)
+    layout[(0, 1)] = kind
+    src = build(tmp_path / "src.mbtiles", layout)
+    out = tmp_path / "out.mbtiles"
+    sn.run(src, out, radius=sn.RADIUS, jobs=1, offeez=False)
+
+    a = read(out, 0, 1)
+    left = 0 if a is None else black_px(a)
+    assert left == 0, f"{left} px of off-sheet fill survived on a {kind} tile"
+
+
+def test_a_chart_tile_meeting_the_fill_only_at_a_corner_is_examined(tmp_path):
+    """A sheet edge crossing the grid diagonally leaves chart tiles whose only
+    contact with the off-sheet region is a corner."""
+    layout = {(0, 0): "fill", (1, 0): "content", (2, 0): "content",
+              (0, 1): "content", (1, 1): "half-fill", (2, 1): "content",
+              (0, 2): "content", (1, 2): "content", (2, 2): "content"}
+    src = build(tmp_path / "src.mbtiles", layout)
+    out = tmp_path / "out.mbtiles"
+    sn.run(src, out, radius=sn.RADIUS, jobs=1, offeez=False)
+
+    a = read(out, 1, 1)
+    assert a is not None
+    assert (a[:, :90, 3] == 0).all(), "diagonal-only neighbour of the fill was skipped"
+
+
+def test_a_run_that_would_leave_solid_fill_behind_refuses(tmp_path, monkeypatch):
+    """The guard that would have caught the previous selection before it shipped:
+    the survey has already counted the black on every tile, so a tile that is
+    nothing but fill and was not examined is a fact, not an inference."""
+    src = build(tmp_path / "src.mbtiles", LAYOUT)
+    out = tmp_path / "out.mbtiles"
+    monkeypatch.setattr(sn, "edge_tiles", lambda ink, plain, black: (set(), set()))
+
+    with pytest.raises(sn.Leaked, match="would ship"):
+        sn.run(src, out, radius=sn.RADIUS, jobs=1, offeez=False)
+
+
+def test_solid_black_the_walk_cannot_reach_stops_the_run(tmp_path):
+    """A tile enclosed by chart that is nothing but black is unexplained: the
+    walk says it is not off-sheet, and no chart draws a solid 256x256 square.
+    Rather than guess -- strip it and risk eating a legend panel, or keep it and
+    ship a black hole -- refuse and name the tile. It does not occur in any of
+    the Traficom layers, so this costs nothing until the day it means something."""
+    layout = {(x, y): "content" for x in range(3) for y in range(3)}
+    layout[(1, 1)] = "fill"
+    src = build(tmp_path / "enclosed.mbtiles", layout)
+
+    with pytest.raises(sn.Leaked, match=r"\(1, 1\)"):
+        sn.run(src, tmp_path / "enclosed-out.mbtiles",
+               radius=sn.RADIUS, jobs=1, offeez=False)
 
 
 def test_the_stamp_records_that_only_edges_were_examined(stripped):
