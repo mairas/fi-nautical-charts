@@ -265,6 +265,25 @@ reduction:
     --out mbtiles/fi-satamakartat-2026-06-29.downscaled.mbtiles
 ```
 
+**Downscale from the deepest *genuine* level, not the deepest one present.** The
+default source is the file's max zoom, which is right only when that level
+carries real detail. Where Traficom's own deepest level is itself an upscale,
+rebuilding from it propagates their interpolation through the whole pyramid, and
+the result is no better than what they served. `./run native-zoom` is what tells
+them apart — it scores how much each level adds over an upscale of its parent:
+
+| layer | genuine to | `--source-zoom` |
+|-------|-----------:|----------------:|
+| `Merikarttasarjat public` | z15 | default |
+| `Rannikkokartat public` | z15 | default |
+| `Satamakartat` | z15 | default |
+| `Yleiskartat 250k` | **z12** | `--source-zoom 12` |
+
+Yleiskartat is the exception: 94% of its z13 pixels reproduce exactly by
+nearest-neighbour from z12, so z13 is Traficom's upscale and z12 is the deepest
+real cartography. Downscaling it from z13 leaves the place names at z10 broken
+into illegible fragments; from z12 they come out clean.
+
 - Cascades one octave at a time (z15→z14→…), each level from the level above —
   a standard mip pyramid.
 - Each output pixel is the box average of the 2×2 block beneath it. For an exact
