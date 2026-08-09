@@ -328,26 +328,30 @@ def batches(con, z, size):
         last = (rows[-1][0], rows[-1][1])
 
 
-def scan(src: Path, radius: int) -> None:
+def scan(src: Path, radius: int, jobs: int) -> None:
+    """What a run would examine, by the same reckoning the run uses.
+
+    Answering this with the local shape test alone -- as a dry run naturally
+    wants to, having no output to survey against -- would count every interior
+    tile whose type is thick enough to seed the erosion, which is exactly the
+    set the run exists not to touch.
+    """
     con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
     zs = [z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level")]
     print(f"=== {src.name} ===")
     total = 0
-    for z in zs:
-        hit = px = seen = 0
-        for x, row, blob in con.execute("SELECT tile_column, tile_row, tile_data FROM tiles "
-                                        "WHERE zoom_level=?", (z,)):
-            seen += 1
-            a = np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA"))
-            n = int(nodata_mask(a, radius).sum())
-            if n >= MIN_FILL:
-                hit += 1
-                px += n
-        total += hit
-        if hit:
-            print(f"  z{z:<3} {hit:>6} of {seen:>7} tiles carry no-data fill "
-                  f"({100 * hit / seen:5.1f}%), {px / 65536:.0f} tiles' worth of pixels")
-    print(f"  {total} tiles would be rewritten")
+    with ProcessPoolExecutor(max_workers=jobs) as pool:
+        for z in zs:
+            ink, plain, black = survey(con, z, pool)
+            offsheet, straddling = edge_tiles(ink, plain, black)
+            seen = len(ink) + len(plain)
+            if offsheet or straddling:
+                px = sum(black.get(t, 0) for t in offsheet)
+                print(f"  z{z:<3} {len(offsheet):>6} off-sheet and {len(straddling):>5} "
+                      f"straddling of {seen:>7} tiles, {px / 65536:.0f} tiles' worth "
+                      f"of fill beyond the sheets")
+            total += len(offsheet) + len(straddling)
+    print(f"  {total} tiles would be examined")
     con.close()
 
 
@@ -452,7 +456,7 @@ def main():
     if not args.input.exists():
         sys.exit(f"no such file: {args.input}")
     if args.scan:
-        scan(args.input, args.radius)
+        scan(args.input, args.radius, args.jobs or None)
         return
     out = args.out or args.input.with_suffix(".stripped.mbtiles")
     run(args.input, out, args.radius, args.jobs or None, not args.skip_offeez)
