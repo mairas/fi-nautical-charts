@@ -166,12 +166,13 @@ def survey(con, z, pool):
     return ink, plain, black
 
 
-def neighbours(t):
-    """The eight tiles around one. A sheet edge crossing the grid diagonally
-    leaves chart tiles whose only contact with the fill is a corner."""
-    x, y = t
-    return ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1),
-            (x + 1, y + 1), (x + 1, y - 1), (x - 1, y + 1), (x - 1, y - 1))
+# dx, dy over the eight tiles around one, and the tile borders each lies past.
+# A sheet edge crossing the grid diagonally leaves chart tiles whose only
+# contact with the fill is a corner, so the diagonals are here too.
+AROUND = {(1, 0): "r", (-1, 0): "l", (0, 1): "b", (0, -1): "t",
+          (1, 1): "rb", (1, -1): "rt", (-1, 1): "lb", (-1, -1): "lt"}
+
+BORDER = {"l": np.s_[:, 0], "r": np.s_[:, -1], "t": np.s_[0, :], "b": np.s_[-1, :]}
 
 
 def edge_tiles(ink, plain, black):
@@ -194,8 +195,32 @@ def edge_tiles(ink, plain, black):
     """
     reached = flood_outside(ink, plain)
     offsheet = {t for t in reached if black.get(t, 0) >= MIN_FILL}
-    straddling = {t for t in ink if any(n in reached for n in neighbours(t))}
+    straddling = {}
+    for x, y in ink:
+        sides = "".join(s for (dx, dy), s in AROUND.items()
+                        if (x + dx, y + dy) in reached)
+        if sides:
+            straddling[(x, y)] = frozenset(sides)
     return offsheet, straddling
+
+
+def wholly_offsheet(a: np.ndarray) -> bool:
+    """True if the only thing on this tile is off-sheet fill.
+
+    The one question about fill a single tile can answer. Whether a black
+    region *within* a chart tile is fill or a place name needs the tile grid to
+    settle, but a tile that draws no chart at all cannot be showing a place
+    name, however solid its black -- so a caller with no positional context,
+    like the downloader, can still act on this much.
+    """
+    opaque = a[..., 3] == 255
+    n = int(opaque.sum())
+    if not n:
+        return False
+    black = opaque & (a[..., :3].max(axis=2) == 0)
+    other = opaque & (a[..., :3].mean(axis=2) <= WHITE_LUM) & ~black
+    return (int(black.sum()) >= MIN_FILL and int(other.sum()) <= MIN_FILL
+            and int(black.sum()) / n >= FILL_FRACTION)
 
 
 class Leaked(RuntimeError):
@@ -218,13 +243,36 @@ def leaked(black, candidates, z, cap=TILE * TILE * FILL_FRACTION):
             f"{missed[:5]}{' ...' if len(missed) > 5 else ''}")
 
 
-def nodata_mask(a: np.ndarray, radius: int, protect: bool = True) -> np.ndarray:
+def reaching(mask: np.ndarray, sides) -> np.ndarray:
+    """The parts of the mask that run off the tile past one of `sides`.
+
+    Off-sheet fill continues into the tile the walk came from, so on a chart
+    tile it always meets the border facing that tile. A place name set near the
+    sheet edge does not, and that is the whole difference between them once the
+    grid has narrowed the question to one tile.
+    """
+    labels, n = ndimage.label(mask)
+    if not n:
+        return mask
+    keep = set()
+    for s in sides:
+        keep.update(np.unique(labels[BORDER[s]]).tolist())
+    keep.discard(0)
+    return np.isin(labels, list(keep))
+
+
+def nodata_mask(a: np.ndarray, radius: int, protect: bool = True, sides=None) -> np.ndarray:
     """Pixels belonging to a solid opaque-black region rather than to chart ink.
 
     `protect` buys ink safety with a little unremoved fill, so it is for tiles
     that carry chart. On a tile the walk placed wholly outside the last sheet
     there is no ink to protect, and the opening would only strand the fill in
     corners too narrow to survive it.
+
+    `sides` names the tile borders the off-sheet region lies past, and confines
+    the result to black that reaches one of them. Without it the local shape
+    test is all that stands between a heavy place name and deletion, which is
+    not enough: Traficom's capitals seed the erosion exactly as a fill does.
     """
     black = (a[..., :3].max(axis=2) == 0) & (a[..., 3] == 255)
     if not black.any():
@@ -242,14 +290,15 @@ def nodata_mask(a: np.ndarray, radius: int, protect: bool = True) -> np.ndarray:
     # ink while leaving a straight boundary exactly where it was, which is what
     # the fill has -- the source anti-aliases it not at all.
     solid = ndimage.binary_opening(black, structure=np.ones((2 * THIN + 1,) * 2, bool))
-    return ndimage.binary_propagation(seeds, mask=solid)
+    grown = ndimage.binary_propagation(seeds, mask=solid)
+    return reaching(grown, sides) if sides else grown
 
 
 def _strip(task):
-    z, x, row, blob, radius, protect = task
+    z, x, row, blob, radius, sides = task
     img = Image.open(io.BytesIO(blob)).convert("RGBA")
     a = np.asarray(img).copy()
-    m = nodata_mask(a, radius, protect)
+    m = nodata_mask(a, radius, protect=bool(sides), sides=sides)
     n = int(m.sum())
     if n < MIN_FILL:
         return None
@@ -328,19 +377,19 @@ def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
             zr = zd = 0
             ink, plain, black = survey(con, z, pool)
             offsheet, straddling = edge_tiles(ink, plain, black)
-            candidates = offsheet | straddling
+            candidates = offsheet | straddling.keys()
             leaked(black, candidates, z)
-            todo = sorted(((x, (1 << z) - 1 - y), (x, y) in straddling)
+            todo = sorted(((x, (1 << z) - 1 - y), straddling.get((x, y)))
                           for (x, y) in candidates)
             if todo:
                 print(f"  z{z:<3} {len(offsheet)} off-sheet, {len(straddling)} straddling "
                       f"of {len(ink) + len(plain)} tiles")
             for i in range(0, len(todo), BATCH):
                 tasks = []
-                for (x, row), protect in todo[i:i + BATCH]:
+                for (x, row), sides in todo[i:i + BATCH]:
                     blob = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
                                        "tile_column=? AND tile_row=?", (z, x, row)).fetchone()
-                    tasks.append((z, x, row, blob[0], radius, protect))
+                    tasks.append((z, x, row, blob[0], radius, sides))
                 for res in pool.map(_strip, tasks, chunksize=32):
                     if res is None:
                         continue

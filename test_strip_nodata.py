@@ -50,6 +50,15 @@ def tile(kind: str) -> bytes:
             # A sheet corner: half off-sheet, half blank paper, no ink at all.
             a[:, :] = (255, 255, 255, 255)
             a[:, :180] = (0, 0, 0, 255)
+        if kind == "half-fill+type":
+            # The sheet edge, with a place name set clear of it. Strokes 10px
+            # wide: measured against real Traficom capitals, whose distance
+            # transform runs 5-8, i.e. 10-16px across.
+            a[:, :90] = (0, 0, 0, 255)
+            a[100:103, :90] = (0, 0, 0, 255)
+            a[150:210, 140:150] = (0, 0, 0, 255)   # stem
+            a[150:210, 190:200] = (0, 0, 0, 255)   # stem
+            a[175:185, 140:200] = (0, 0, 0, 255)   # crossbar
         if kind == "half-fill":
             # Off-sheet to the left, running off the tile edge. Chart ink is not
             # drawn over it, so the line restarts where the sheet does -- abutting
@@ -179,6 +188,26 @@ def test_off_sheet_tiles_that_are_not_perfectly_uniform_are_still_stripped(tmp_p
     assert left == 0, f"{left} px of off-sheet fill survived on a {kind} tile"
 
 
+def test_heavy_type_on_a_straddling_tile_survives(tmp_path):
+    """Being examined is not being stripped. A place name near the sheet edge
+    is thick enough to seed the erosion exactly as fill does, so on the one ring
+    of tiles the walk does hand to the local test, the original defect is still
+    reachable -- and 205 tiles at z13 of yleiskartat are in that ring."""
+    layout = dict(LAYOUT)
+    for y in (0, 1, 2):
+        layout[(1, y)] = "half-fill+type"
+    src = build(tmp_path / "src.mbtiles", layout)
+    out = tmp_path / "out.mbtiles"
+    sn.run(src, out, radius=sn.RADIUS, jobs=1, offeez=False)
+
+    a = read(out, 1, 1)
+    assert a is not None
+    letter = int((a[150:210, 140:200, 3] == 255).sum())
+    expected = int((read_source_kind("half-fill+type")[150:210, 140:200, 3] == 255).sum())
+    assert letter == expected, f"the letterform lost {expected - letter} of {expected} px"
+    assert (a[:, :90, 3] == 0).all(), "and the fill must still go"
+
+
 def test_a_chart_tile_meeting_the_fill_only_at_a_corner_is_examined(tmp_path):
     """A sheet edge crossing the grid diagonally leaves chart tiles whose only
     contact with the off-sheet region is a corner."""
@@ -200,7 +229,7 @@ def test_a_run_that_would_leave_solid_fill_behind_refuses(tmp_path, monkeypatch)
     nothing but fill and was not examined is a fact, not an inference."""
     src = build(tmp_path / "src.mbtiles", LAYOUT)
     out = tmp_path / "out.mbtiles"
-    monkeypatch.setattr(sn, "edge_tiles", lambda ink, plain, black: (set(), set()))
+    monkeypatch.setattr(sn, "edge_tiles", lambda ink, plain, black: (set(), {}))
 
     with pytest.raises(sn.Leaked, match="would ship"):
         sn.run(src, out, radius=sn.RADIUS, jobs=1, offeez=False)
@@ -237,3 +266,7 @@ def read_source(x: int, y: int):
     if key not in _SOURCE:
         _SOURCE[key] = np.asarray(Image.open(io.BytesIO(tile(key))).convert("RGBA"))
     return _SOURCE[key]
+
+
+def read_source_kind(kind: str):
+    return np.asarray(Image.open(io.BytesIO(tile(kind))).convert("RGBA"))
