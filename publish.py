@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = []
+# dependencies = ["pillow"]
 # ///
 """Publish processed chart sets, and describe what was published.
 
@@ -41,9 +41,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import index_page
+import preview
 from currency import slug
 
 MANIFEST = "charts.json"
+INDEX = "index.html"
+PREVIEWS = "previews"
 # Fields may be added at any time without a bump; an existing field never
 # changes meaning or type without one. A consumer meeting a higher number
 # should refuse rather than guess.
@@ -230,19 +234,51 @@ def fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def write_manifest(dest: Path, charts: list[dict], pipeline: str) -> Path:
-    body = {"schema": SCHEMA,
-            "generated": datetime.datetime.now(datetime.timezone.utc)
-            .isoformat(timespec="seconds"),
-            "pipeline": pipeline,
-            "charts": sorted(charts, key=lambda e: e["filename"])}
-    incoming = dest / f".{MANIFEST}.incoming"
+def replace_text(dest: Path, name: str, text: str) -> Path:
+    incoming = dest / f".{name}.incoming"
     with open(incoming, "w") as fh:
-        fh.write(json.dumps(body, indent=2) + "\n")
+        fh.write(text)
         fh.flush()
         os.fsync(fh.fileno())
-    target = dest / MANIFEST
+    target = dest / name
     os.replace(incoming, target)
+    return target
+
+
+def write_previews(dest: Path, samples: dict[str, bytes]) -> dict[str, tuple[str, str, int]]:
+    """Put the sample images beside the page, and say where each one landed."""
+    if not samples:
+        return {}
+    (dest / PREVIEWS).mkdir(exist_ok=True)
+    placed = {}
+    for layer, (data, place, zoom) in samples.items():
+        name = f"{PREVIEWS}/{layer}.png"
+        incoming = dest / f"{PREVIEWS}/.{layer}.png.incoming"
+        with open(incoming, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(incoming, dest / name)
+        placed[layer] = (name, place, zoom)
+    fsync_dir(dest / PREVIEWS)
+    return placed
+
+
+def write_manifest(dest: Path, charts: list[dict], pipeline: str,
+                   samples: dict | None = None) -> Path:
+    """Write the manifest and the index page from one set of facts.
+
+    The page a reader sees and the digests they verify against are written in
+    the same breath, so they cannot come to disagree.
+    """
+    generated = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    ordered = sorted(charts, key=lambda e: e["filename"])
+    body = {"schema": SCHEMA, "generated": generated, "pipeline": pipeline,
+            "charts": ordered}
+
+    placed = write_previews(dest, samples or {})
+    target = replace_text(dest, MANIFEST, json.dumps(body, indent=2) + "\n")
+    replace_text(dest, INDEX, index_page.render(ordered, generated, placed))
     fsync_dir(dest)
     return target
 
@@ -346,6 +382,7 @@ def _publish(sources: list[Path], dest: Path, verbose: bool) -> dict:
 
     staged_paths = []
     charts = []
+    samples = {}
     try:
         for src, name, _, meta in plan:
             staged = staging / name
@@ -358,8 +395,12 @@ def _publish(sources: list[Path], dest: Path, verbose: bool) -> dict:
                     f"({staged.stat().st_size} bytes written, digest {found[:12]} "
                     f"vs {written[:12]}); nothing was published")
             charts.append(manifest_entry(name, staged.stat().st_size, found, meta))
+            sample = preview.for_layer(staged, layer_prefix(meta))
+            if sample:
+                samples[layer_prefix(meta)] = sample
             if verbose:
-                print(f"  staged {name}  {staged.stat().st_size} bytes  {found[:12]}")
+                print(f"  staged {name}  {staged.stat().st_size} bytes  {found[:12]}"
+                      + ("  +sample" if sample else ""))
 
         keep = {name for _, name, _, _ in plan}
         doomed = []
@@ -395,7 +436,7 @@ def _publish(sources: list[Path], dest: Path, verbose: bool) -> dict:
                 print(f"  retired {old.name}")
         fsync_dir(dest)
 
-        manifest = write_manifest(dest, charts, pipeline)
+        manifest = write_manifest(dest, charts, pipeline, samples)
     except BaseException as exc:
         raise PartiallyPublished(
             f"{len(published)} of {len(plan)} renamed into place before failing: "
