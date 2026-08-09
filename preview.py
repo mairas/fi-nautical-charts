@@ -1,10 +1,9 @@
 """Render a sample of each chart set for the index page.
 
-A reader choosing between five sets of the same coast is really asking what
+A reader choosing between four sets of the same coast is really asking what
 each one draws. The names do not answer that and the file sizes certainly do
-not, so the page shows the same harbour from each chart at the zoom that set is
-meant to be read at -- and the one inland set at an inland place, since Hanko
-would show it empty.
+not, so the page shows the same harbour from each chart, at the zoom that set
+is meant to be read at.
 """
 
 from __future__ import annotations
@@ -20,15 +19,13 @@ TILE = 256
 SIZE = (760, 420)
 
 HANKO = ("Hanko Itäsatama", 59.8225, 22.9750)
-HIRVENSALMI = ("Hirvensalmi", 61.6339, 26.7861)
 
 # layer -> (place, lat, lon, zoom)
 SPOTS = {
     "fi-yleiskartat250k": (*HANKO, 10),
-    "fi-merikarttasarjat": (*HANKO, 13),
     "fi-rannikkokartat": (*HANKO, 13),
+    "fi-merikarttasarjat": (*HANKO, 13),
     "fi-satamakartat": (*HANKO, 15),
-    "fi-veneilykartat": (*HIRVENSALMI, 13),
 }
 
 

@@ -3,28 +3,35 @@
 import html
 import re
 
+import pytest
+
 import index_page
+import preview
 
 ENTRY = {
-    "filename": "fi-veneilykartat-2026-06-21.mbtiles",
-    "layer": "fi-veneilykartat",
+    "filename": "fi-satamakartat-2026-06-29.mbtiles",
+    "layer": "fi-satamakartat",
     "bytes": 249417728,
     "sha256": "d0fe1c15a850d68df2fb163344e5400e6fc4b4b27b2948dd191c97ebcb3f08f5",
-    "source_edition": "2026-06-21",
-    "source_edition_oldest": "2025-01-20",
-    "processing": "opaque-black-r4+offeez-tilelevel",
-    "name": "Veneilykartat 2026-06-21",
+    "source_edition": "2026-06-29",
+    "source_edition_oldest": "2024-11-16",
+    "processing": "opaque-black-r4-edge+offeez-tilelevel",
+    "name": "Satamakartat 2026-06-29",
 }
 
 
-def page(charts=None, generated="2026-08-09T09:53:27+00:00"):
-    return index_page.render([ENTRY] if charts is None else charts, generated)
+def page(charts=None, generated="2026-08-09T09:53:27+00:00", previews=None):
+    return index_page.render([ENTRY] if charts is None else charts, generated, previews)
+
+
+def entry(layer, **over):
+    return dict(ENTRY, layer=layer, filename=f"{layer}-2026-06-29.mbtiles", **over)
 
 
 def test_every_chart_is_listed_with_a_working_download_link():
     out = page()
     assert f'href="{ENTRY["filename"]}"' in out
-    assert "Veneilykartat" in out
+    assert "Satamakartat" in out
 
 
 def test_the_digest_is_shown_in_full_so_a_download_can_be_checked():
@@ -33,7 +40,7 @@ def test_the_digest_is_shown_in_full_so_a_download_can_be_checked():
 
 def test_the_edition_and_size_are_shown_in_units_a_reader_can_use():
     out = page()
-    assert "2026-06-21" in out
+    assert "2026-06-29" in out
     assert "237.9 MiB" in out, "249417728 bytes"
 
 
@@ -41,6 +48,12 @@ def test_the_not_for_navigation_warning_appears_in_both_languages():
     out = page()
     assert "Ei navigointikäyttöön" in out
     assert "Not for navigation" in out
+
+
+def test_the_uneven_rasterisation_of_older_material_is_disclosed():
+    out = page()
+    assert "Vanhemman materiaalin rasterointi on osin heikkolaatuista." in out
+    assert "older material" in out
 
 
 def test_the_licence_and_the_attribution_traficom_asks_for_are_present():
@@ -61,7 +74,7 @@ def test_the_page_links_to_each_related_project():
         assert url in out, url
 
 
-def test_the_page_fetches_nothing_from_anywhere(tmp_path):
+def test_the_page_fetches_nothing_from_anywhere():
     """These charts get downloaded onto boats. The page has to render with no
     connection to anything but the server it came from."""
     out = page()
@@ -81,27 +94,11 @@ def test_both_languages_are_marked_up_for_screen_readers_and_hyphenation():
     assert '<html lang="fi">' in out
 
 
-def test_an_unreadable_file_is_not_offered_for_download():
-    """It is in the manifest for whoever operates the server; it is not
-    something to hand a sailor."""
-    junk = {"filename": "fi-enc-2026-01-01.mbtiles", "layer": None,
-            "bytes": 14, "sha256": "ab" * 32, "readable": False}
-    out = page([ENTRY, junk])
-    assert "fi-enc-2026-01-01" not in out
-    assert ENTRY["filename"] in out
-
-
 def test_metadata_is_escaped_rather_than_injected():
     hostile = dict(ENTRY, filename='x"><script>alert(1)</script>.mbtiles')
     out = page([hostile])
     assert "<script>alert(1)</script>" not in out
     assert html.escape('x"><script>alert(1)</script>.mbtiles', quote=True) in out
-
-
-def test_a_layer_with_no_label_still_renders():
-    unknown = dict(ENTRY, layer="fi-tuntematon", name=None)
-    out = page([unknown])
-    assert "tuntematon" in out
 
 
 def test_the_generated_instant_is_shown_so_staleness_is_visible():
@@ -114,50 +111,99 @@ def test_human_size_rounds_the_way_a_download_page_should():
     assert index_page.human_size(512) == "512 B"
 
 
-def test_the_yleiskartat_products_get_a_label_of_their_own():
-    """Their scale is part of the product name, so it survives into the slug and
-    each needs its own entry; without one the page showed a bare slug."""
+# -- what is listed, and in what order ---------------------------------------
+
+def test_the_charts_are_listed_coarsest_first():
+    """The order a reader picks in: start at the overview and work down to the
+    harbour. Filename order would open with Merikarttasarjat."""
+    out = page([entry(l) for l in ["fi-satamakartat", "fi-merikarttasarjat",
+                                   "fi-rannikkokartat", "fi-yleiskartat250k"]])
+    seen, order = set(), []
+    for name in re.findall(r"Yleiskartat|Rannikkokartat|Merikarttasarjat|Satamakartat", out):
+        if name not in seen:
+            seen.add(name)
+            order.append(name)
+    assert order == ["Yleiskartat", "Rannikkokartat", "Merikarttasarjat", "Satamakartat"]
+
+
+def test_veneilykartat_is_not_listed():
+    """Dropped: its coverage is minimal and the name misleads."""
+    out = page([entry("fi-veneilykartat"), entry("fi-satamakartat")])
+    assert "Veneilykartat" not in out
+    assert "Satamakartat" in out
+
+
+def test_a_file_the_page_does_not_name_is_left_off_it():
+    """The manifest is the inventory; the page is a shortlist for a reader."""
+    out = page([entry("fi-satamakartat"), entry("fi-tuntematon")])
+    assert "tuntematon" not in out
+    assert "Satamakartat" in out
+
+
+def test_an_unreadable_file_is_not_offered_for_download():
+    junk = {"filename": "fi-enc-2026-01-01.mbtiles", "layer": None,
+            "bytes": 14, "sha256": "ab" * 32, "readable": False}
+    out = page([ENTRY, junk])
+    assert "fi-enc-2026-01-01" not in out
+    assert ENTRY["filename"] in out
+
+
+# -- the copy a reader actually reads ----------------------------------------
+
+def test_the_yleiskartat_product_is_named_rather_than_slugged():
+    """Its scale is part of the product name, so it survives into the slug and
+    the old lookup missed, leaving a bare `yleiskartat250k` on the page."""
     finnish, english = index_page.labels("fi-yleiskartat250k")
-    assert finnish == "Yleiskartat 250k"
-    assert english == "General charts 1:250 000"
+    assert finnish == "Yleiskartat"
+    assert english == "General charts"
 
 
-def test_the_source_chart_scale_is_shown_where_it_is_known():
-    out = page([dict(ENTRY, layer="fi-yleiskartat250k")])
-    assert "1:250 000" in out
-    assert "Mittakaava" in out
+@pytest.mark.parametrize("layer,scale", [
+    ("fi-yleiskartat250k", "1:250 000"),
+    ("fi-rannikkokartat", "1:50 000"),
+    ("fi-merikarttasarjat", "1:50 000"),
+    ("fi-satamakartat", "1:20 000"),
+])
+def test_each_set_states_the_scale_its_source_chart_is_drawn_at(layer, scale):
+    assert scale in page([entry(layer)])
 
 
-def test_no_scale_is_invented_for_a_layer_that_does_not_state_one():
-    """A wrong scale on a chart page is worse than a missing one."""
-    assert "Mittakaava" not in page([dict(ENTRY, layer="fi-rannikkokartat")])
+def test_the_series_keeps_the_name_traficom_gives_it():
+    """Merikarttasarjat, not Merikartat: it is a series of chart sheets, and the
+    shorter name claims something the product is not."""
+    finnish, english = index_page.labels("fi-merikarttasarjat")
+    assert finnish == "Merikarttasarjat"
+    assert english == "Nautical chart series"
 
+
+# -- samples -----------------------------------------------------------------
 
 def test_a_sample_image_is_shown_when_one_was_rendered():
-    out = index_page.render(
-        [ENTRY], "2026-08-09T09:53:27+00:00",
-        {"fi-veneilykartat": ("previews/fi-veneilykartat.png", "Hirvensalmi", 13)})
-    assert 'src="previews/fi-veneilykartat.png"' in out
-    assert "Hirvensalmi, z13" in out
+    out = page(previews={"fi-satamakartat":
+                         ("previews/fi-satamakartat.png", "Hanko Itäsatama", 15)})
+    assert 'src="previews/fi-satamakartat.png"' in out
+    assert "Hanko Itäsatama, z15" in out
     assert 'loading="lazy"' in out
     assert 'width="760" height="420"' in out, "reserve the box so the page does not jump"
-    assert "Veneilykartat at Hirvensalmi" in out
+    assert "Satamakartat at Hanko" in out
 
 
 def test_a_chart_with_no_sample_renders_without_a_figure():
     assert "<figure" not in page()
 
 
-def test_every_layer_that_gets_a_sample_is_one_we_publish():
-    import preview
-    known = {"fi-merikarttasarjat", "fi-rannikkokartat", "fi-satamakartat",
-             "fi-veneilykartat", "fi-yleiskartat250k"}
-    assert set(preview.SPOTS) == known, set(preview.SPOTS) ^ known
+def test_every_listed_chart_has_a_sample_and_every_sample_a_listing():
+    assert set(preview.SPOTS) == set(index_page.ORDER), \
+        set(preview.SPOTS) ^ set(index_page.ORDER)
 
 
-def test_the_inland_set_is_sampled_somewhere_inland():
-    """Hanko would show veneilykartat empty, which would read as broken."""
-    import preview
-    place, lat, lon, z = preview.SPOTS["fi-veneilykartat"]
-    assert place == "Hirvensalmi"
-    assert lat > 61 and lon > 26
+def test_the_samples_all_show_the_same_place_so_the_sets_can_be_compared():
+    places = {spot[0] for spot in preview.SPOTS.values()}
+    assert places == {"Hanko Itäsatama"}
+
+
+def test_each_set_is_sampled_at_the_zoom_it_is_meant_to_be_read_at():
+    zooms = {layer: spot[3] for layer, spot in preview.SPOTS.items()}
+    assert zooms["fi-yleiskartat250k"] < zooms["fi-rannikkokartat"]
+    assert zooms["fi-rannikkokartat"] == zooms["fi-merikarttasarjat"]
+    assert zooms["fi-satamakartat"] > zooms["fi-merikarttasarjat"]

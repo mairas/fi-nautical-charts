@@ -14,32 +14,29 @@ import html
 
 from currency import HUMAN
 
-# What each set is for. The choice between them is the one thing a reader
-# actually needs help with, and it is not derivable from the metadata.
-NOTES = {
-    "merikarttasarjat": ("Koko rannikko saaristoineen. Kattavin peruskartta.",
-                         "The whole coast including the archipelago. The most complete base."),
-    "merikarttasarja": ("Koko rannikko saaristoineen. Kattavin peruskartta.",
-                        "The whole coast including the archipelago. The most complete base."),
-    "rannikkokartat": ("Rannikkoalue. Sisäsaaristossa on kattavuusaukkoja.",
-                       "Coastal waters. Has coverage gaps in the inner archipelago."),
-    "satamakartat": ("Satamien yksityiskohtaiset kartat.",
-                     "Detailed charts of harbours."),
-    "veneilykartat": ("Veneilyreitit ja -alueet.",
-                      "Boating routes and areas."),
-    "yleiskartat250k": ("Yleiskuva mittakaavassa 1:250 000.",
-                        "Overview at 1:250,000."),
-    "yleiskartat": ("Pienimittakaavainen yleiskuva.",
-                    "Small-scale overview."),
-}
+# Every set the page shows, coarsest first, which is the order a reader picks in:
+# start with the overview and work down to the harbour. The choice between them
+# is the one thing a reader actually needs help with, and none of it is
+# derivable from the metadata, so name and description are both written here.
+#
+# layer -> (Finnish name, English name, Finnish description, English description)
+CHARTS = [
+    ("fi-yleiskartat250k", "Yleiskartat", "General charts",
+     "Aluevesien yleiskartta mittakaavassa 1:250 000.",
+     "General chart of Finnish territorial waters at 1:250,000."),
+    ("fi-rannikkokartat", "Rannikkokartat", "Coastal charts",
+     "Rannikkokartat 1:50 000.",
+     "Coastal charts at 1:50,000."),
+    ("fi-merikarttasarjat", "Merikarttasarjat", "Nautical chart series",
+     "Merikarttasarjat 1:50 000. Tarkoitettu ensisijaisesti veneilyyn.",
+     "Nautical chart series at 1:50,000. Intended primarily for boating."),
+    ("fi-satamakartat", "Satamakartat", "Harbour charts",
+     "Satamakartat 1:20 000. Satamien yksityiskohtaiset kartat.",
+     "Harbour charts at 1:20,000. Detailed charts of harbours."),
+]
 
-# The scale the source chart is drawn at. Only the yleiskartat products state
-# theirs, in the layer name itself; the rest are left out rather than guessed,
-# because a wrong scale on a chart page is worse than a missing one.
-SCALES = {
-    "yleiskartat100k": "1:100 000",
-    "yleiskartat250k": "1:250 000",
-}
+ORDER = {layer: i for i, (layer, *_) in enumerate(CHARTS)}
+COPY = {layer: rest for layer, *rest in CHARTS}
 
 LINKS = [
     ("Signal K", "https://signalk.org/",
@@ -68,18 +65,18 @@ def human_size(n: int) -> str:
 
 
 def labels(layer: str | None) -> tuple[str, str]:
-    key = (layer or "")[3:]
-    english, finnish = HUMAN.get(key, (None, None))
+    finnish, english, _, _ = COPY.get(layer or "", (None, None, None, None))
     if finnish:
         return finnish, english
-    return key or "—", ""
+    key = (layer or "")[3:]
+    english, finnish = HUMAN.get(key, (None, None))
+    return (finnish or key or "—"), (english or "")
 
 
 def chart_row(entry: dict, index: int, preview: tuple[str, str, int] | None = None) -> str:
     layer = entry.get("layer") or ""
     finnish, english = labels(layer)
-    note_fi, note_en = NOTES.get(layer[3:], ("", ""))
-    scale = SCALES.get(layer[3:])
+    _, _, note_fi, note_en = COPY.get(layer, (None, None, "", ""))
     e = html.escape
     figure = ""
     if preview:
@@ -89,8 +86,6 @@ def chart_row(entry: dict, index: int, preview: tuple[str, str, int] | None = No
           <img src="{e(src)}" alt="{e(finnish)} at {e(place)}" loading="lazy" width="760" height="420">
           <figcaption>{e(place)}, z{zoom}</figcaption>
         </figure>"""
-    scale_fact = (f"""
-          <div><dt>Mittakaava · Scale</dt><dd>{e(scale)}</dd></div>""" if scale else "")
     return f"""      <li class="chart" style="--i:{index}">
         <div class="chart-head">
           <h3><a href="{e(entry['filename'])}">{e(finnish)}</a></h3>
@@ -100,7 +95,7 @@ def chart_row(entry: dict, index: int, preview: tuple[str, str, int] | None = No
         <p class="note" lang="fi">{e(note_fi)}</p>
         <p class="note" lang="en">{e(note_en)}</p>{figure}
         <dl class="facts">
-          <div><dt>Laitos · Edition</dt><dd>{e(entry.get('source_edition') or '—')}</dd></div>{scale_fact}
+          <div><dt>Laitos · Edition</dt><dd>{e(entry.get('source_edition') or '—')}</dd></div>
           <div><dt>Koko · Size</dt><dd>{e(human_size(entry['bytes']))}</dd></div>
         </dl>
         <p class="digest"><span>sha256</span> <code>{e(entry['sha256'])}</code></p>
@@ -110,9 +105,13 @@ def chart_row(entry: dict, index: int, preview: tuple[str, str, int] | None = No
 def render(charts: list[dict], generated: str,
            previews: dict[str, tuple[str, str, int]] | None = None) -> str:
     previews = previews or {}
-    rows = "\n".join(chart_row(c, i, previews.get(c.get("layer") or ""))
-                     for i, c in enumerate(
-                         c for c in charts if c.get("readable") is not False))
+    # Only what CHARTS names, in the order it names it. Anything else in the
+    # directory stays in the manifest for whoever runs the server; the page is
+    # a shortlist for a reader, not an inventory.
+    listed = sorted((c for c in charts if (c.get("layer") or "") in ORDER),
+                    key=lambda c: ORDER[c["layer"]])
+    rows = "\n".join(chart_row(c, i, previews.get(c["layer"]))
+                     for i, c in enumerate(listed))
     links = "\n".join(
         f"""        <li><a href="{html.escape(url)}">{html.escape(name)}</a>
           <span lang="fi">{html.escape(fi)}</span>
@@ -278,13 +277,11 @@ footer code {{ font-family: var(--mono); }}
     <p lang="fi"><span class="lang">Suomeksi</span>Traficomin avoimet
     rasterimerikartat haettuna WMTS-rajapinnasta ja koottuna MBTiles-paketeiksi
     Signal K:ta ja Freeboard-SK:ta varten. Aineisto on Traficomin tuottamaa.
-    Paketointi ei muuta karttojen sisältöä; se karsii lehtien ulkopuolisen
-    täytön ja rakentaa pienemmät mittakaavatasot uudelleen.</p>
+    Vanhemman materiaalin rasterointi on osin heikkolaatuista.</p>
     <p lang="en"><span class="lang">In English</span>Traficom's open raster
     nautical charts, fetched from their WMTS service and packaged as MBTiles for
-    Signal K and Freeboard-SK. The data is produced by Traficom. Packaging does
-    not alter chart content; it strips the off-sheet fill and rebuilds the
-    smaller scales.</p>
+    Signal K and Freeboard-SK. The data is produced by Traficom. Some of the
+    older material has been rasterised at uneven quality.</p>
   </section>
 
   <section class="warning">
