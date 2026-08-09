@@ -41,9 +41,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+import index_page
 from currency import slug
 
 MANIFEST = "charts.json"
+INDEX = "index.html"
 # Fields may be added at any time without a bump; an existing field never
 # changes meaning or type without one. A consumer meeting a higher number
 # should refuse rather than guess.
@@ -230,19 +232,30 @@ def fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def write_manifest(dest: Path, charts: list[dict], pipeline: str) -> Path:
-    body = {"schema": SCHEMA,
-            "generated": datetime.datetime.now(datetime.timezone.utc)
-            .isoformat(timespec="seconds"),
-            "pipeline": pipeline,
-            "charts": sorted(charts, key=lambda e: e["filename"])}
-    incoming = dest / f".{MANIFEST}.incoming"
+def replace_text(dest: Path, name: str, text: str) -> Path:
+    incoming = dest / f".{name}.incoming"
     with open(incoming, "w") as fh:
-        fh.write(json.dumps(body, indent=2) + "\n")
+        fh.write(text)
         fh.flush()
         os.fsync(fh.fileno())
-    target = dest / MANIFEST
+    target = dest / name
     os.replace(incoming, target)
+    return target
+
+
+def write_manifest(dest: Path, charts: list[dict], pipeline: str) -> Path:
+    """Write the manifest and the index page from one set of facts.
+
+    The page a reader sees and the digests they verify against are written in
+    the same breath, so they cannot come to disagree.
+    """
+    generated = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    ordered = sorted(charts, key=lambda e: e["filename"])
+    body = {"schema": SCHEMA, "generated": generated, "pipeline": pipeline,
+            "charts": ordered}
+
+    target = replace_text(dest, MANIFEST, json.dumps(body, indent=2) + "\n")
+    replace_text(dest, INDEX, index_page.render(ordered, generated))
     fsync_dir(dest)
     return target
 

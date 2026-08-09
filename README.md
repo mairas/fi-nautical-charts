@@ -354,7 +354,7 @@ missed at Helsinki). Fast previews only; `full` for authoritative charts.
 ## Publishing
 
 `publish` puts finished sets into the directory a web server exposes, and writes
-`charts.json` beside them describing every set present:
+`charts.json` and `index.html` beside them describing every set present:
 
 ```bash
 ./run publish mbtiles/*.final.mbtiles --dest /srv/charts
@@ -437,6 +437,14 @@ any name, and anything caching by URL kept serving the old content.
   ]
 }
 ```
+
+`index.html` is the same facts for a reader: the chart list with sizes, editions
+and digests, what each set covers, the licence and Traficom's attribution, and
+the not-for-navigation warning. It is written from the manifest data in the same
+call, so the page and the digests cannot come to disagree, and it fetches
+nothing — no fonts, stylesheets or scripts — because these charts get downloaded
+onto boats with no connection to anything but the server they came from. Chart
+descriptions live in `index_page.py`; everything else comes from the metadata.
 
 A retired edition disappears as soon as its replacement is in place, so a cached
 manifest can name a file that now 404s; re-fetch `charts.json` rather than

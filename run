@@ -93,7 +93,7 @@ function test {
   #@ Category: Utility
   # Named explicitly: a bare pytest collects the whole tree, including scratch
   # files and _local/, so a stray test elsewhere would fail the suite.
-  uv run --with 'pytest>=8,<9' pytest test_publish.py "$@"
+  uv run --with 'pytest>=8,<9' pytest test_publish.py test_index_page.py "$@"
 }
 
 function deps {
