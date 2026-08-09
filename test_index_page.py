@@ -112,3 +112,52 @@ def test_human_size_rounds_the_way_a_download_page_should():
     assert index_page.human_size(249417728) == "237.9 MiB"
     assert index_page.human_size(4426489856) == "4.1 GiB"
     assert index_page.human_size(512) == "512 B"
+
+
+def test_the_yleiskartat_products_get_a_label_of_their_own():
+    """Their scale is part of the product name, so it survives into the slug and
+    each needs its own entry; without one the page showed a bare slug."""
+    finnish, english = index_page.labels("fi-yleiskartat250k")
+    assert finnish == "Yleiskartat 250k"
+    assert english == "General charts 1:250 000"
+
+
+def test_the_source_chart_scale_is_shown_where_it_is_known():
+    out = page([dict(ENTRY, layer="fi-yleiskartat250k")])
+    assert "1:250 000" in out
+    assert "Mittakaava" in out
+
+
+def test_no_scale_is_invented_for_a_layer_that_does_not_state_one():
+    """A wrong scale on a chart page is worse than a missing one."""
+    assert "Mittakaava" not in page([dict(ENTRY, layer="fi-rannikkokartat")])
+
+
+def test_a_sample_image_is_shown_when_one_was_rendered():
+    out = index_page.render(
+        [ENTRY], "2026-08-09T09:53:27+00:00",
+        {"fi-veneilykartat": ("previews/fi-veneilykartat.png", "Hirvensalmi", 13)})
+    assert 'src="previews/fi-veneilykartat.png"' in out
+    assert "Hirvensalmi, z13" in out
+    assert 'loading="lazy"' in out
+    assert 'width="760" height="420"' in out, "reserve the box so the page does not jump"
+    assert "Veneilykartat at Hirvensalmi" in out
+
+
+def test_a_chart_with_no_sample_renders_without_a_figure():
+    assert "<figure" not in page()
+
+
+def test_every_layer_that_gets_a_sample_is_one_we_publish():
+    import preview
+    known = {"fi-merikarttasarjat", "fi-rannikkokartat", "fi-satamakartat",
+             "fi-veneilykartat", "fi-yleiskartat250k"}
+    assert set(preview.SPOTS) == known, set(preview.SPOTS) ^ known
+
+
+def test_the_inland_set_is_sampled_somewhere_inland():
+    """Hanko would show veneilykartat empty, which would read as broken."""
+    import preview
+    place, lat, lon, z = preview.SPOTS["fi-veneilykartat"]
+    assert place == "Hirvensalmi"
+    assert lat > 61 and lon > 26

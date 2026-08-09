@@ -33,6 +33,14 @@ NOTES = {
                     "Small-scale overview."),
 }
 
+# The scale the source chart is drawn at. Only the yleiskartat products state
+# theirs, in the layer name itself; the rest are left out rather than guessed,
+# because a wrong scale on a chart page is worse than a missing one.
+SCALES = {
+    "yleiskartat100k": "1:100 000",
+    "yleiskartat250k": "1:250 000",
+}
+
 LINKS = [
     ("Signal K", "https://signalk.org/",
      "Veneen dataverkko, jolle nämä kartat on paketoitu.",
@@ -67,10 +75,22 @@ def labels(layer: str | None) -> tuple[str, str]:
     return key or "—", ""
 
 
-def chart_row(entry: dict, index: int) -> str:
-    finnish, english = labels(entry.get("layer"))
-    note_fi, note_en = NOTES.get((entry.get("layer") or "")[3:], ("", ""))
+def chart_row(entry: dict, index: int, preview: tuple[str, str, int] | None = None) -> str:
+    layer = entry.get("layer") or ""
+    finnish, english = labels(layer)
+    note_fi, note_en = NOTES.get(layer[3:], ("", ""))
+    scale = SCALES.get(layer[3:])
     e = html.escape
+    figure = ""
+    if preview:
+        src, place, zoom = preview
+        figure = f"""
+        <figure class="sample">
+          <img src="{e(src)}" alt="{e(finnish)} at {e(place)}" loading="lazy" width="760" height="420">
+          <figcaption>{e(place)}, z{zoom}</figcaption>
+        </figure>"""
+    scale_fact = (f"""
+          <div><dt>Mittakaava · Scale</dt><dd>{e(scale)}</dd></div>""" if scale else "")
     return f"""      <li class="chart" style="--i:{index}">
         <div class="chart-head">
           <h3><a href="{e(entry['filename'])}">{e(finnish)}</a></h3>
@@ -78,18 +98,21 @@ def chart_row(entry: dict, index: int) -> str:
           <a class="dl" href="{e(entry['filename'])}" download>Lataa · Download <span aria-hidden="true">↓</span></a>
         </div>
         <p class="note" lang="fi">{e(note_fi)}</p>
-        <p class="note" lang="en">{e(note_en)}</p>
+        <p class="note" lang="en">{e(note_en)}</p>{figure}
         <dl class="facts">
-          <div><dt>Laitos · Edition</dt><dd>{e(entry.get('source_edition') or '—')}</dd></div>
+          <div><dt>Laitos · Edition</dt><dd>{e(entry.get('source_edition') or '—')}</dd></div>{scale_fact}
           <div><dt>Koko · Size</dt><dd>{e(human_size(entry['bytes']))}</dd></div>
         </dl>
         <p class="digest"><span>sha256</span> <code>{e(entry['sha256'])}</code></p>
       </li>"""
 
 
-def render(charts: list[dict], generated: str) -> str:
-    rows = "\n".join(chart_row(c, i) for i, c in enumerate(
-        c for c in charts if c.get("readable") is not False))
+def render(charts: list[dict], generated: str,
+           previews: dict[str, tuple[str, str, int]] | None = None) -> str:
+    previews = previews or {}
+    rows = "\n".join(chart_row(c, i, previews.get(c.get("layer") or ""))
+                     for i, c in enumerate(
+                         c for c in charts if c.get("readable") is not False))
     links = "\n".join(
         f"""        <li><a href="{html.escape(url)}">{html.escape(name)}</a>
           <span lang="fi">{html.escape(fi)}</span>
@@ -197,6 +220,20 @@ ul.charts {{ list-style: none; margin: 0; padding: 0; }}
 .en-label {{ margin: 0; color: var(--paper-dim); font-size: .9rem; }}
 .note {{ margin: .7rem 0 0; max-width: 40rem; }}
 .note[lang="en"] {{ color: var(--paper-dim); margin-top: .15rem; }}
+
+.sample {{ margin: 1.3rem 0 0; }}
+.sample img {{
+  display: block; width: 100%; height: auto; max-width: 47rem;
+  border: 1px solid var(--rule);
+  /* A chart is drawn for paper. Left on the dark ground it glares, so it sits
+     back a little until the reader is actually looking at it. */
+  opacity: .88; transition: opacity .18s ease;
+}}
+.chart:hover .sample img {{ opacity: 1; }}
+.sample figcaption {{
+  margin-top: .45rem; font: 500 .66rem/1 var(--body); letter-spacing: .13em;
+  text-transform: uppercase; color: var(--paper-dim);
+}}
 
 .facts {{ display: flex; flex-wrap: wrap; gap: .4rem 2.5rem; margin: 1.1rem 0 0; }}
 .facts div {{ display: flex; align-items: baseline; gap: .6rem; }}

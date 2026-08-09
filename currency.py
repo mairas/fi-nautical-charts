@@ -23,6 +23,10 @@ HUMAN = {  # slug -> (english label, Finnish product name)
     "merikarttasarja": ("Nautical chart series", "Merikarttasarja"),
     "merikarttasarjat": ("Nautical chart series", "Merikarttasarjat"),
     "yleiskartat": ("General charts", "Yleiskartat"),
+    # The scale is part of the product name here, so it survives into the slug
+    # and each one needs its own entry.
+    "yleiskartat100k": ("General charts 1:100 000", "Yleiskartat 100k"),
+    "yleiskartat250k": ("General charts 1:250 000", "Yleiskartat 250k"),
 }
 
 
