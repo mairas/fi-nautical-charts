@@ -52,7 +52,8 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from strip_nodata import MIN_FILL as NODATA_MIN_FILL, RADIUS as NODATA_RADIUS, nodata_mask
+from strip_nodata import (MIN_FILL as NODATA_MIN_FILL, RADIUS as NODATA_RADIUS,
+                          nodata_mask, wholly_offsheet)
 
 WMTS_CAPS = ("https://julkinen.traficom.fi/rasteripalvelu/wmts"
              "?service=WMTS&request=GetCapabilities")
@@ -361,15 +362,20 @@ def y2lat(y, z):
 
 
 def strip_fill(arr, original):
-    """Drop the opaque black off-sheet fill, returning None if nothing survives.
+    """Drop tiles that are nothing but off-sheet fill, returning None for them.
 
-    Stored as served it paints black wedges along every sheet edge, and once a
-    downscale averages it into a parent it turns grey, which no later pass can
-    identify. Cheaper to refuse it here than to clean it afterwards.
+    A tile emptied here reports blank, which is what keeps the crawl from
+    descending into the sea beyond the last sheet -- so this is a pruning
+    decision as much as a cleaning one, and it has to be made per tile as the
+    tile arrives.
 
-    Tiles without fill are returned byte-for-byte as the server sent them; only
-    the ones actually carrying it are re-encoded."""
-    m = nodata_mask(arr, NODATA_RADIUS)
+    Only wholly off-sheet tiles qualify. Fill *within* a chart tile is left for
+    strip-nodata, which has the tile grid to tell it from a place name; deciding
+    that here, from one tile in isolation, is what ate HELSINKI. Everything else
+    is returned byte-for-byte as the server sent it."""
+    if not wholly_offsheet(arr):
+        return original
+    m = nodata_mask(arr, NODATA_RADIUS, protect=False)
     if m.sum() < NODATA_MIN_FILL:
         return original
     a = arr.copy()

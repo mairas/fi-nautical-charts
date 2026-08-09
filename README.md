@@ -173,21 +173,36 @@ tiles and re-fetches whatever is missing from the archive.
 Some layers render the area outside their sheets as **opaque black** rather than
 leaving it transparent, so a viewer draws black wedges along every sheet edge.
 Whole tiles are affected, and so are the tiles the sheet boundary crosses, which
-come back part chart and part black. Measured on the 2026-06 downloads:
-
-| layer | tiles carrying fill |
-|-------|--------------------:|
-| `Merikarttasarjat public` | 30,625 |
-| `Rannikkokartat public` | 24,547 |
-| `Yleiskartat 250k` | 8,849 |
-| `Veneilykartat public` | 8,148 |
-| `Satamakartat` | 121 |
+come back part chart and part black.
 
 Colour cannot separate the fill from chart ink — ink is pure `(0,0,0)` too, and
-fills up to 5% of an ordinary tile. Shape can: the fill is a solid region tens of
-pixels across, ink is strokes a few pixels wide. `strip-nodata` erodes the black
-mask to find what is thick, then grows those seeds back through the mask so the
-region is recovered exactly to its own hard edge.
+fills up to 5% of an ordinary tile. **Neither can shape.** Eroding the black mask
+does leave seeds inside a fill, but Traficom sets place names in heavy serif
+capitals whose strokes survive the same erosion, so a local test reads `HELSINKI`
+as a solid region and deletes it, leaving the hollow anti-aliased outline behind.
+
+**Position separates them.** The fill is not a shape inside a tile but a region
+of the tile grid: it lies beyond the last sheet and runs to the edge of the data,
+so the walk that finds the water outside the EEZ finds it too. Chart tiles wall
+that walk. Only tiles it reaches, and the chart tiles they touch, are examined at
+all — the interior is never a candidate, whatever its ink looks like.
+
+Inside an examined tile three things narrow it further. Fractions are measured
+over *opaque* pixels, since fill often arrives with a transparent margin where
+the fetch ran past the served extent. The seeds grow back through the solid black
+only, because at a sheet edge the chart's own ink abuts the fill and connectivity
+would otherwise run down it. And on a chart tile the result keeps only black that
+reaches the border facing the off-sheet region: fill continues into the tile the
+walk came from, a place name set clear of the edge does not.
+
+A tile that is 95% solid black and was *not* examined stops the run and is named.
+Selecting by position is only as good as the walk, and a walk that stops short
+would otherwise leave black in the output while every counter reported success.
+
+The downloader strips too, but only tiles that are nothing but fill — decidable
+from one tile, and what reports them blank so the crawl does not descend into the
+sea beyond the last sheet. Fill *within* a chart tile is left for `strip-nodata`,
+which has the grid to tell it from a place name.
 
 ```bash
 ./run strip-nodata mbtiles/fi-yleiskartat250k-2026-06-02.mbtiles --scan   # report only
@@ -230,12 +245,13 @@ are identical at every zoom, to the pixel, while off-sheet tiles go (9,254 on
 Yleiskartat, 2,901 on Rannikkokartat). A one-tile white margin survives where a
 tile straddles the limit, since such a tile is marked and therefore untouched.
 
-Verified both directions: across 22 tiles well inside coverage it removes 0
-pixels at every erosion radius from 2 to 8, and every pixel it does remove was
-pure-black-opaque before and is transparent after (audited over all 121
-Satamakartat rewrites). On the Åland–Sweden boundary the wedges go from 4/5/18/63
-visibly dark tiles at z8–z11 to 0/0/3/13, the remainder being ordinary tiles
-around 1% dark, which is text.
+Verified both directions on Yleiskartat, the layer with the most fill. Tiles that
+are essentially nothing but fill go from 4,127 at z13 to 1, and every tile that
+carries a place name — the ones a shape-only test hollowed out — comes through
+byte-identical to the source. The two halves check each other: the off-EEZ pass
+that follows classifies unstripped fill as a *marking*, so black left behind
+walls its flood, and its counts moving (9,294 tiles dropped, none kept at any
+zoom) is how an under-strip shows up even when the pixels are not inspected.
 
 ## Downscaling the pyramid
 
@@ -431,7 +447,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-r4+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-08",
+      "processing": "opaque-black-r4-edge+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]
