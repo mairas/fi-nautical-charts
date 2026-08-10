@@ -43,8 +43,8 @@ PUBLISHED_META = ARCHIVE_META | {
     "downscaled": "2026-08-09",
 }
 
-YLEIS = Layer("Yleiskartat 250k public", fill=True, limit=True)
-DEEPEST = Layer("Rannikkokartat public", fill=True)
+YLEIS = Layer("Yleiskartat 250k public", fill=True, blank=True)
+DEEPEST = Layer("Rannikkokartat public", fill=True, blank=True)
 ARCHIVE_NAME = "fi-yleiskartat250k-2026-06-02.mbtiles"
 
 
@@ -265,7 +265,7 @@ def test_an_archive_with_no_tiles_is_refused_rather_than_downscaled_from_nothing
 
 def test_the_expected_strip_stamp_is_what_published_charts_carry(archive):
     assert pipeline.recipe(YLEIS, archive / ARCHIVE_NAME)[0] == LIVE_STAMP
-    assert strip_nodata.processing_stamp(offeez=True) == LIVE_STAMP
+    assert strip_nodata.processing_stamp(offeez="pixels") == LIVE_STAMP
 
 
 # --- refusing a bad build ------------------------------------------------------
@@ -386,20 +386,20 @@ def test_a_layer_with_nothing_to_strip_is_not_stripped(archive, work, steps):
     assert pipeline.recipe(plain, src)[0] is None
 
 
-def test_a_layer_without_a_drawn_boundary_skips_the_blank_pass(archive, work, steps):
-    """The blank pass needs more than blank to work on: it needs a boundary to
-    stop at. Where a sheet simply ends, the surveyed water inside is the same
-    white as the blank outside and the flood takes both -- 5.2M px of charted
-    water across 1,340 Satamakartat tiles when this was measured. Only
-    Yleiskartat draws a limit, so only Yleiskartat gets the pass."""
+def test_a_layer_with_no_blank_to_remove_is_told_so(archive, work, steps):
+    """The blank pass needs a drawn boundary to stop at. Satamakartat's sheets
+    end without one, so the flood runs on past into surveyed water -- 5.2M px
+    across 1,340 tiles when this was measured. It also has no blank worth
+    removing: 0.20% of its tiles, against 17% of Yleiskartat's."""
     src = archive / ARCHIVE_NAME
-    coastal = Layer("Rannikkokartat public", fill=True)
+    plain = Layer("Satamakartat", fill=True)
     with pytest.raises(Failed):
-        pipeline.process(coastal, src, work, jobs=1, baseline=100)
-    assert "--skip-offeez" in only(steps, "strip-nodata")
-    assert "offeez" not in pipeline.recipe(coastal, src)[0]
-    assert "offeez" in pipeline.recipe(YLEIS, src)[0], \
-        "the layer that does draw a limit lost the pass too"
+        pipeline.process(plain, src, work, jobs=1, baseline=100)
+    cmd = only(steps, "strip-nodata")
+    assert cmd[cmd.index("--offeez") + 1] == "none"
+    assert "offeez" not in pipeline.recipe(plain, src)[0]
+    assert "offeez-pixel" in pipeline.recipe(YLEIS, src)[0], \
+        "a layer that does draw a boundary lost the pass too"
 
 
 def test_the_layer_table_matches_the_census_it_was_set_from():
@@ -413,9 +413,9 @@ def test_the_layer_table_matches_the_census_it_was_set_from():
     by_name = {l.wmts: l for l in pipeline.LAYERS}
     assert not by_name["Satamakartat"].fill, \
         "Satamakartat has nothing to strip; stripping it can only take chart"
-    assert [n for n, l in by_name.items() if l.limit] == ["Yleiskartat 250k public"], \
-        "the blank pass reached a layer whose sheets end without a drawn boundary"
-    assert all(l.fill for n, l in by_name.items() if l.limit), \
+    assert not by_name["Satamakartat"].blank, \
+        "the blank pass reached the layer whose sheets end without a boundary"
+    assert all(l.fill for l in by_name.values() if l.blank), \
         "a layer asks for the blank pass without the fill pass that precedes it"
 
 

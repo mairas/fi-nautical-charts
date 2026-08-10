@@ -45,7 +45,7 @@ REPO = Path(__file__).resolve().parent
 class Layer:
     wmts: str
     fill: bool = False    # renders off-sheet as opaque black worth removing
-    limit: bool = False   # ... and draws a boundary the removal can stop at
+    blank: bool = False   # ... and blank white past the outer limit
 
 
 # Which layer gets which pass, from a census of the deepest level of each
@@ -58,14 +58,12 @@ class Layer:
 #   Satamakartat    0.00%    0.20%
 #
 # Satamakartat has nothing to remove -- not one wholly-fill tile in 3,000 -- so
-# the strip there is all risk and no gain. The blank pass needs more than blank:
-# it needs a drawn boundary to stop at, and only Yleiskartat has one. Where a
-# sheet simply ends, the surveyed water inside is the same white as the blank
-# outside and the flood takes both; on Satamakartat that came to 5.2M pixels of
-# charted water across 1,340 tiles.
-LAYERS = [Layer("Yleiskartat 250k public", fill=True, limit=True),
-          Layer("Rannikkokartat public", fill=True),
-          Layer("Merikarttasarjat public", fill=True),
+# the strip there is all risk and no gain, and running the blank pass on it took
+# 5.2M pixels of surveyed water across 1,340 tiles, because its sheets end
+# without a drawn boundary for the flood to stop at. The other three draw one.
+LAYERS = [Layer("Yleiskartat 250k public", fill=True, blank=True),
+          Layer("Rannikkokartat public", fill=True, blank=True),
+          Layer("Merikarttasarjat public", fill=True, blank=True),
           Layer("Satamakartat")]
 
 # Least of the archive's tiles a processed set may keep, measured against the
@@ -285,7 +283,8 @@ def recipe(layer: Layer, archive: Path) -> tuple[str | None, int]:
                      f"downscale from")
     if not layer.fill:
         return None, zoom
-    return processing_stamp(RADIUS, BLEED, offeez=layer.limit), zoom
+    return processing_stamp(RADIUS, BLEED,
+                            offeez="pixels" if layer.blank else "none"), zoom
 
 
 def published(dest: Path, prefix: str) -> Path | None:
@@ -337,8 +336,7 @@ def process(layer: Layer, archive: Path, work: Path, jobs: int,
         strip = ["strip_nodata.py", str(archive), "--out", str(stripped),
                  "--radius", str(RADIUS), "--bleed", str(BLEED),
                  "--jobs", str(jobs)]
-        if not layer.limit:
-            strip.append("--skip-offeez")
+        strip += ["--offeez", "pixels" if layer.blank else "none"]
         run_step(uv(*strip), "strip-nodata")
         source = stripped
     run_step(uv("downscale.py", str(source), "--out", str(out),
