@@ -368,3 +368,48 @@ def test_a_stroke_touching_the_fill_is_not_followed_into_the_chart(tmp_path):
     before, after = read(src, 1, 0), read(out, 1, 0)
     lost = black_px(before[100:103, 95:]) - black_px(after[100:103, 95:])
     assert lost == 0, f"the flood ran {lost}px down a line abutting the fill"
+
+
+@pytest.mark.parametrize("bleed", [0, 1, 2, 3, 4, 5])
+def test_the_bleed_past_the_fill_is_adjustable(tmp_path, bleed):
+    """Each extra pixel of bleed erases one more column of the chart's edge.
+
+    `half-fill` puts the fill in columns 0-89 and paper beyond, so the erased
+    run on a row carrying no ink is the fill plus whatever the bleed reached.
+    """
+    src = build(tmp_path / f"bleed{bleed}.mbtiles", {
+        (0, 0): "fill",  (1, 0): "half-fill",  (2, 0): "content",
+        (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
+    })
+    out = tmp_path / f"bleed{bleed}-out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=False, bleed=bleed)
+    row = read(out, 1, 0)[200, :, 3]
+    assert int((row == 0).sum()) == 90 + bleed
+
+
+def test_a_bleed_of_zero_still_erases_the_fill_it_found(tmp_path):
+    """The opening shaves THIN pixels off the body before the flood, so even
+    with no bleed the mask has to grow that much back or the fill is under-cut
+    by its own detection."""
+    src = build(tmp_path / "zero.mbtiles", {
+        (0, 0): "fill",  (1, 0): "half-fill",  (2, 0): "content",
+        (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
+    })
+    out = tmp_path / "zero-out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=False, bleed=0)
+    a = read(out, 1, 0)
+    assert (a[:, :90, 3] == 0).all()
+    assert dark_px(a[:, :90]) == 0
+
+
+def test_the_bleed_is_recorded_in_the_stamp(tmp_path):
+    """It changes the output, so a published chart built with one bleed must not
+    read as current when the recipe asks for another."""
+    src = build(tmp_path / "stamp.mbtiles", LAYOUT)
+    out = tmp_path / "stamp-out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=False, bleed=4)
+    con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
+    stamp = con.execute("SELECT value FROM metadata WHERE name='nodata_stripped'").fetchone()[0]
+    con.close()
+    assert stamp == sn.processing_stamp(4, offeez=False)
+    assert stamp != sn.processing_stamp(2, offeez=False)
