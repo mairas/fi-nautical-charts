@@ -187,28 +187,32 @@ so the walk that finds the water outside the EEZ finds it too. Chart tiles wall
 that walk. Only tiles it reaches, and the chart tiles they touch, are examined at
 all — the interior is never a candidate, whatever its ink looks like.
 
-Inside an examined tile the same question is asked again in pixels, and answered
-the same way: the fill is what runs in from the borders the walk came through.
-It is found by flooding inward from them, not by seeding on shape — seeding by
-shape fails on exactly the tiles that matter, because where the sheet edge
-crosses a tile at a shallow angle the fill enters as a wedge a few pixels wide,
-thinner than any erosion that also spares a place name. That left a jagged black
-rim and stray triangles along every diagonal boundary.
+Inside an examined tile the question becomes a shape one, but at a scale no
+place name reaches: a fill pixel is dark for `--radius` (10) in every direction.
+Nothing narrower than twice that can satisfy it, and Traficom sets its capitals
+at 10–16px across, so type cannot start a removal however the tile is bounded.
+The fill is then what that test finds running in from the tile's margin, and the
+margin is real: each tile is padded with its neighbours' own pixels, so a band
+that is thin here but wide a few pixels into the next tile is still found.
 
-Two things keep the flood honest, and both are knobs. It runs through the fill's
-*body* — the mask after an opening — because a black stroke abutting the fill
-would otherwise carry it down the stroke and into the chart. That opening also
-severs the last of a taper, where the sheet edge runs out of a tile and the fill
-narrows to a few pixels, so the flood is then grown back through the dark it is
-joined to, capped at `--reach` pixels of travel (16). The cap is the whole
-discriminator: uncapped, that growth is the reconstruction that ate place names,
-and on real tiles it runs 124–190 pixels when something long is connected.
+**No-data counts as black.** Where the fetch ran past the served extent the tile
+comes back transparent, and that is the same thing the fill is — not chart. It
+matters more than it sounds: along the western edge of the data the fill is a
+band 2–13px wide for its whole length, far too thin to qualify on its own, and
+it becomes findable only once the emptiness beside it counts as part of the same
+region. A missing neighbour tile pads solid black for the same reason.
 
-Finally the result is dilated `--bleed` pixels (2) **unconditionally**, not
-gated on darkness. Gating it is what left single pixels of boundary behind, and
-the two ways of being wrong here do not cost the same: a pixel of the chart's
-own edge taken with the fill is a pixel of neatline nobody will look for, while
-a pixel of fill left behind is black on the water.
+The result is then dilated back by the radius, which puts the edge where the
+fill actually ended and bounds how far the mask can run down a stroke joined to
+it, and finally by `--bleed` (2) **unconditionally**, not gated on darkness.
+Gating that is what left single pixels of boundary behind, and the two ways of
+being wrong do not cost the same: a pixel of the chart's own edge taken with the
+fill is a pixel of neatline nobody will look for, while a pixel of fill left
+behind is black on the water.
+
+Measured on the archive: the Åland boundary tile goes from 17,858 dark pixels to
+20, a whole-tile fill from 58,843 to 15, and an inland tile carrying a place name
+across a seam keeps 6,036 of its 6,115.
 
 Fractions are measured over *opaque* pixels, since fill often arrives with a
 transparent margin where the fetch ran past the served extent.
@@ -484,7 +488,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-edge-flood-b2r16+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-09",
+      "processing": "opaque-black-disk10-b2+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]

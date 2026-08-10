@@ -51,16 +51,16 @@ from scipy import ndimage
 
 MIN_FILL = 64       # ignore specks: a real fill is far larger than this
 FILL_FRACTION = .95 # above this a tile is off-sheet rather than chart
-THIN = 2            # strokes narrower than this survive as ink, not fill
+RADIUS = 10         # a fill pixel is dark for this far in every direction;
+                    # Traficom's capitals run 10-16px across, so none can qualify
 DARK = 40           # the transition is one pixel; this catches it
 BLEED = 2           # pixels erased past the fill, over the chart's own edge
-REACH = 16          # how far fill may travel along a neck too thin to flood
 TILE = 256
 WHITE_LUM = 250     # above this an opaque pixel counts as blank paper
 BATCH = 2000        # tiles held in memory at once
 
 
-def processing_stamp(bleed: int = BLEED, reach: int = REACH, *,
+def processing_stamp(radius: int = RADIUS, bleed: int = BLEED, *,
                      offeez: bool) -> str:
     """What a run with these settings records as nodata_stripped.
 
@@ -68,7 +68,7 @@ def processing_stamp(bleed: int = BLEED, reach: int = REACH, *,
     published chart was built by the current recipe, so the two must be one
     definition rather than two strings that agree until one of them changes.
     """
-    return f"opaque-black-edge-flood-b{bleed}r{reach}" + ("+offeez-tilelevel" if offeez else "")
+    return f"opaque-black-disk{radius}-b{bleed}" + ("+offeez-tilelevel" if offeez else "")
 
 
 def tile_has_marks(blob):
@@ -193,6 +193,67 @@ def survey(con, z, pool):
     return ink, plain, black
 
 
+OPPOSITE = {(-1, 0): "r", (1, 0): "l", (0, -1): "b", (0, 1): "t"}
+
+
+def fillable(a: np.ndarray) -> np.ndarray:
+    """Pixels that are either the fill's own black or no data at all.
+
+    Where the fetch ran past the served extent the tile comes back transparent,
+    and that is the same thing the fill is: not chart. Counting it as black is
+    what lets the radius test find a fill that runs along the data's edge as a
+    band a few pixels wide -- too thin to qualify on its own, but part of one
+    wide region once the emptiness beside it counts.
+    """
+    return (((a[..., :3].max(axis=2) <= DARK) & (a[..., 3] == 255))
+            | (a[..., 3] == 0))
+
+
+def _edges(task):
+    """A tile's four border strips, `margin` deep, as fillable masks."""
+    z, x, row, blob, margin = task
+    d = fillable(np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA")))
+    return x, row, {"l": d[:, :margin].copy(), "r": d[:, -margin:].copy(),
+                    "t": d[:margin, :].copy(), "b": d[-margin:, :].copy()}
+
+
+def edge_lines(con, z, want, pool, margin=RADIUS):
+    """The border strips of every tile a candidate needs to be padded with.
+
+    A tile cannot tell fill from ink at its own edge without knowing what is on
+    the other side, and the tile grid alone cannot say: a sheet edge crossing
+    diagonally gives a chart tile whose neighbour is chart in every straight
+    direction and fill only past a corner.
+    """
+    out = {}
+    for i in range(0, len(want), BATCH):
+        chunk = want[i:i + BATCH]
+        tasks = []
+        for x, y in chunk:
+            r = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
+                            "tile_column=? AND tile_row=?",
+                            (z, x, (1 << z) - 1 - y)).fetchone()
+            if r:
+                tasks.append((z, x, (1 << z) - 1 - y, r[0], margin))
+        for x, row, e in pool.map(_edges, tasks, chunksize=32):
+            out[(x, (1 << z) - 1 - row)] = e
+    return out
+
+
+def surround(xy, edges):
+    """What lies just past each of a tile's four borders.
+
+    A side maps to the neighbour's facing strip, or to None where there is no
+    tile at all -- beyond the data is outside, and outside is fill.
+    """
+    x, y = xy
+    pad = {}
+    for (dx, dy), opp in OPPOSITE.items():
+        n = edges.get((x + dx, y + dy))
+        pad[AROUND[(dx, dy)]] = None if n is None else n[opp]
+    return pad
+
+
 # dx, dy over the eight tiles around one, and the tile borders each lies past.
 # A sheet edge crossing the grid diagonally leaves chart tiles whose only
 # contact with the fill is a corner, so the diagonals are here too.
@@ -270,45 +331,62 @@ def leaked(black, candidates, z, cap=TILE * TILE * FILL_FRACTION):
             f"{missed[:5]}{' ...' if len(missed) > 5 else ''}")
 
 
-def border(shape, sides) -> np.ndarray:
-    """The tile's own edge pixels along `sides`, where the fill comes in from."""
-    edge = np.zeros(shape, bool)
-    for s in sides:
-        edge[BORDER[s]] = True
-    return edge
+def disk(radius: int) -> np.ndarray:
+    """A round structuring element. Round matters: a square one measures its own
+    diagonal at 1.41x its side, so a stroke crossing at 45 degrees would need to
+    be that much wider to survive."""
+    r = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+    return np.hypot(*r) <= radius
 
 
-def nodata_mask(a: np.ndarray, protect: bool = True, sides=None,
-                bleed: int = BLEED, reach: int = REACH) -> np.ndarray:
+def widen(dark: np.ndarray, pad: dict, margin: int) -> np.ndarray:
+    """The tile's dark mask with a margin of what lies past each border.
+
+    Without it nothing within `margin` of a seam can satisfy the radius test,
+    because the disk hangs off the array -- and the fill always meets a seam,
+    since that is how it got here. A missing neighbour pads solid: beyond the
+    data is outside, and outside is what the fill is.
+    """
+    big = np.zeros((dark.shape[0] + 2 * margin, dark.shape[1] + 2 * margin), bool)
+    big[margin:-margin, margin:-margin] = dark
+    for side, sl in (("l", np.s_[margin:-margin, :margin]),
+                     ("r", np.s_[margin:-margin, -margin:]),
+                     ("t", np.s_[:margin, margin:-margin]),
+                     ("b", np.s_[-margin:, margin:-margin])):
+        strip = pad.get(side)
+        big[sl] = True if strip is None else strip
+    return big
+
+
+def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
+                bleed: int = BLEED) -> np.ndarray:
     """Pixels belonging to off-sheet fill rather than to chart ink.
 
-    The fill is whatever runs in from the tile borders `sides` names -- the ones
-    the grid walk found the outside past. It is not a shape: asking how solid a
-    black region is cannot separate a fill from a heavy place name, because
-    Traficom's display capitals are as solid as anything, and asking how thin it
-    is cannot either, because where the sheet edge crosses a tile at a shallow
-    angle the fill enters as a wedge a few pixels wide.
+    A fill pixel is dark for `radius` in every direction, and that is the whole
+    test for what may start a removal. Nothing narrower than twice the radius
+    can satisfy it, so a place name -- Traficom sets them at 10-16px across --
+    cannot be reached from anywhere, however the tile is bounded.
 
-    So the fill is found by flooding inward from those borders. The flood runs
-    through the fill's body, which an opening isolates from the ink that abuts
-    it -- otherwise a black stroke touching the fill would carry the flood down
-    itself and into the chart. The body is then spread back out past where the
-    fill ended, because the two ways of being wrong here do not cost the same:
-    a pixel of the chart's own edge taken with the fill is a pixel of neatline
-    nobody will look for, and a pixel of fill left behind is black on the water.
+    The fill is then whatever that test finds running in from the margin, which
+    carries the neighbouring tiles' own pixels -- their real ones, so a band
+    that is thin here but wide a few pixels into the next tile is still found.
 
-    `protect` is what all of that costs. A tile the walk placed wholly outside
-    the last sheet has no ink to protect, so there every dark pixel is fill.
+    `pad` of None means the tile is wholly outside the last sheet. Nothing there
+    is chart, so nothing needs protecting.
     """
-    dark = (a[..., :3].max(axis=2) <= DARK) & (a[..., 3] == 255)
-    if not dark.any() or not protect:
+    dark = fillable(a)
+    if not dark.any() or pad is None:
         return dark
-    k = np.ones((2 * THIN + 1,) * 2, bool)
-    body = ndimage.binary_opening(dark, structure=k)
-    flood = ndimage.binary_propagation(body & border(dark.shape, sides), mask=body)
-    if not flood.any():
+    big = widen(dark, pad, radius)
+    rim = np.ones(big.shape, bool)
+    rim[radius:-radius, radius:-radius] = False
+    k = disk(radius)
+    core = ndimage.binary_erosion(big, structure=k, border_value=1)
+    out = ndimage.binary_propagation(core & rim, mask=core)
+    if not out.any():
         return np.zeros_like(dark)
-    return spread(reconstruct(flood, dark, reach), bleed)
+    out = ndimage.binary_dilation(out, structure=k) & big
+    return spread(out, bleed)[radius:-radius, radius:-radius]
 
 
 def spread(mask: np.ndarray, n: int) -> np.ndarray:
@@ -325,35 +403,11 @@ def spread(mask: np.ndarray, n: int) -> np.ndarray:
     return ndimage.binary_dilation(mask, structure=np.ones((3, 3), bool), iterations=n)
 
 
-def reconstruct(flood: np.ndarray, dark: np.ndarray, reach: int) -> np.ndarray:
-    """Grow the flood through the dark it is connected to, capped at `reach`.
-
-    The opening that found the body severs any part of the fill narrower than
-    its kernel -- where the sheet edge runs out of a tile, the fill tapers to a
-    few pixels and is dropped, leaving a sliver the flood cannot enter. But the
-    sliver is not a separate thing: it is still joined to the fill in `dark`,
-    which is exactly why the opening had to sever it in the first place.
-
-    So grow back along that join, and cap how far. The cap is the whole
-    discriminator: fill reaches along a neck only as far as the tile edge is
-    from the body, while a stroke of chart ink abutting the fill runs the width
-    of the tile. Uncapped this is the reconstruction that ate place names.
-    """
-    out = flood
-    k = np.ones((3, 3), bool)
-    for _ in range(max(0, reach)):
-        grown = ndimage.binary_dilation(out, structure=k) & dark
-        if grown.sum() == out.sum():
-            break
-        out = grown
-    return out
-
-
 def _strip(task):
-    z, x, row, blob, sides, bleed, reach = task
+    z, x, row, blob, pad, radius, bleed = task
     img = Image.open(io.BytesIO(blob)).convert("RGBA")
     a = np.asarray(img).copy()
-    m = nodata_mask(a, protect=bool(sides), sides=sides, bleed=bleed, reach=reach)
+    m = nodata_mask(a, pad, radius, bleed)
     n = int(m.sum())
     if n < MIN_FILL:
         return None
@@ -410,8 +464,8 @@ def scan(src: Path, jobs: int) -> None:
     con.close()
 
 
-def run(src: Path, out: Path, jobs: int, offeez: bool, bleed: int = BLEED,
-        reach: int = REACH) -> None:
+def run(src: Path, out: Path, jobs: int, offeez: bool, radius: int = RADIUS,
+        bleed: int = BLEED) -> None:
     # built beside the target and moved into place at the end, so a run that
     # dies partway cannot leave a valid-looking partial chart where the good
     # one was
@@ -439,17 +493,21 @@ def run(src: Path, out: Path, jobs: int, offeez: bool, bleed: int = BLEED,
             offsheet, straddling = edge_tiles(ink, plain, black)
             candidates = offsheet | straddling.keys()
             leaked(black, candidates, z)
-            todo = sorted(((x, (1 << z) - 1 - y), straddling.get((x, y)))
+            want = sorted({(x + dx, y + dy) for (x, y) in straddling
+                           for dx, dy in OPPOSITE} | set(straddling))
+            edges = edge_lines(con, z, want, pool)
+            todo = sorted(((x, (1 << z) - 1 - y),
+                           None if (x, y) in offsheet else surround((x, y), edges))
                           for (x, y) in candidates)
             if todo:
                 print(f"  z{z:<3} {len(offsheet)} off-sheet, {len(straddling)} straddling "
                       f"of {len(ink) + len(plain)} tiles")
             for i in range(0, len(todo), BATCH):
                 tasks = []
-                for (x, row), sides in todo[i:i + BATCH]:
+                for (x, row), pad in todo[i:i + BATCH]:
                     blob = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
                                        "tile_column=? AND tile_row=?", (z, x, row)).fetchone()
-                    tasks.append((z, x, row, blob[0], sides, bleed, reach))
+                    tasks.append((z, x, row, blob[0], pad, radius, bleed))
                 for res in pool.map(_strip, tasks, chunksize=32):
                     if res is None:
                         continue
@@ -489,7 +547,7 @@ def run(src: Path, out: Path, jobs: int, offeez: bool, bleed: int = BLEED,
         print(f"  off-EEZ total: {total} tiles dropped, 0 modified")
 
     con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
-                ("nodata_stripped", processing_stamp(bleed, reach, offeez=offeez)))
+                ("nodata_stripped", processing_stamp(radius, bleed, offeez=offeez)))
     con.commit()
     con.execute("VACUUM")
     con.close()
@@ -506,10 +564,10 @@ def main():
                    help=f"pixels erased past the fill, over the chart's own edge "
                         f"(default {BLEED}); leaving fill shows, taking a little "
                         f"neatline does not")
-    p.add_argument("--reach", type=int, default=REACH,
-                   help=f"how far fill may follow a neck too thin to flood "
-                        f"(default {REACH}); past the width of a taper it starts "
-                        f"following ink instead")
+    p.add_argument("--radius", type=int, default=RADIUS,
+                   help=f"a fill pixel is dark for this far in every direction "
+                        f"(default {RADIUS}); below half the width of a place name "
+                        f"the type starts qualifying too")
     p.add_argument("--scan", action="store_true", help="report what would change, write nothing")
     p.add_argument("--skip-offeez", action="store_true",
                    help="leave the blank white beyond the chart limits in place")
@@ -520,8 +578,8 @@ def main():
         scan(args.input, args.jobs or None)
         return
     out = args.out or args.input.with_suffix(".stripped.mbtiles")
-    run(args.input, out, args.jobs or None, not args.skip_offeez, args.bleed,
-        args.reach)
+    run(args.input, out, args.jobs or None, not args.skip_offeez, args.radius,
+        args.bleed)
 
 
 if __name__ == "__main__":

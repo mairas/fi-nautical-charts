@@ -65,6 +65,15 @@ def tile(kind: str) -> bytes:
             # the fill, which is the arrangement a real sheet edge produces.
             a[:, :90] = (0, 0, 0, 255)
             a[100:103, :90] = (0, 0, 0, 255)
+        if kind == "corner-fill":
+            # a sheet edge crossing the grid diagonally: the fill takes a corner
+            # of this tile and continues into the two it shares those edges with
+            for r in range(256):
+                a[r, :max(0, 150 - r)] = (0, 0, 0, 255)
+        if kind == "fill-right":
+            a[:, 106:] = (0, 0, 0, 255)
+        if kind == "fill-bottom":
+            a[106:, :] = (0, 0, 0, 255)
         if kind == "wedge-fill":
             # The sheet edge crossing the tile at a shallow angle, so the fill
             # tapers to a few pixels. Measured on Yleiskartat z9 at the Aland
@@ -221,19 +230,37 @@ def test_heavy_type_on_a_straddling_tile_survives(tmp_path):
     assert (a[:, :90, 3] == 0).all(), "and the fill must still go"
 
 
-def test_a_chart_tile_meeting_the_fill_only_at_a_corner_is_examined(tmp_path):
-    """A sheet edge crossing the grid diagonally leaves chart tiles whose only
-    contact with the off-sheet region is a corner."""
-    layout = {(0, 0): "fill", (1, 0): "content", (2, 0): "content",
-              (0, 1): "content", (1, 1): "half-fill", (2, 1): "content",
-              (0, 2): "content", (1, 2): "content", (2, 2): "content"}
+def test_fill_crossing_the_grid_diagonally_is_removed(tmp_path):
+    """A sheet edge crossing at an angle takes a corner of a tile and continues
+    into the two it shares those edges with. What identifies it as fill is that
+    it goes on past the seam, which is a question about the neighbour's pixels
+    and not about which cells of the grid the walk reached."""
+    layout = {(0, 0): "fill",         (1, 0): "fill-bottom", (2, 0): "content",
+              (0, 1): "fill-right",   (1, 1): "corner-fill", (2, 1): "content",
+              (0, 2): "content",      (1, 2): "content",     (2, 2): "content"}
     src = build(tmp_path / "src.mbtiles", layout)
     out = tmp_path / "out.mbtiles"
     sn.run(src, out, jobs=1, offeez=False)
-
     a = read(out, 1, 1)
-    assert a is not None
-    assert (a[:, :90, 3] == 0).all(), "diagonal-only neighbour of the fill was skipped"
+    assert a is not None, "a tile carrying chart must not be dropped"
+    assert (a[0, :100, 3] == 0).all(), "the fill corner survived"
+    fresh = np.asarray(Image.open(io.BytesIO(tile("corner-fill"))).convert("RGBA"))
+    assert black_px(a[:, 200:]) == black_px(fresh[:, 200:]), "the chart half was damaged"
+
+
+def test_dark_that_does_not_continue_past_a_seam_is_left_alone(tmp_path):
+    """The other half of the same rule, and the one that protects type. A place
+    name is dark and can be thick, but it stops inside the tile; nothing about
+    which cells the walk reached can make it fill."""
+    layout = {(0, 0): "fill",    (1, 0): "content",      (2, 0): "content",
+              (0, 1): "fill",    (1, 1): "content+type", (2, 1): "content",
+              (0, 2): "fill",    (1, 2): "content",      (2, 2): "content"}
+    src = build(tmp_path / "src.mbtiles", layout)
+    out = tmp_path / "out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=False)
+    a = read(out, 1, 1)
+    fresh = np.asarray(Image.open(io.BytesIO(tile("content+type"))).convert("RGBA"))
+    assert black_px(a) == black_px(fresh), "chart ink was altered"
 
 
 def test_a_run_that_would_leave_solid_fill_behind_refuses(tmp_path, monkeypatch):
@@ -267,7 +294,7 @@ def test_the_stamp_records_that_only_edges_were_examined(stripped):
     con = sqlite3.connect(f"file:{stripped}?mode=ro", uri=True)
     stamp = dict(con.execute("SELECT name, value FROM metadata"))["nodata_stripped"]
     con.close()
-    assert "edge" in stamp, stamp
+    assert "disk" in stamp, stamp
 
 
 _SOURCE = {}
@@ -321,7 +348,7 @@ def test_a_fill_wedge_too_thin_to_erode_is_still_removed(tmp_path):
     before, after = read(src, 1, 0), read(out, 1, 0)
     assert black_px(before) > 5000
     assert black_px(after) < black_px(before) * 0.15
-    assert thickest(after) <= 2 * sn.THIN
+    assert thickest(after) <= 2 * sn.RADIUS
 
 
 def test_the_anti_aliased_edge_of_the_fill_goes_with_it(tmp_path):
@@ -354,14 +381,13 @@ def test_type_on_a_straddling_tile_survives_the_flood(tmp_path):
     assert (after[:, :90, 3] == 0).all()          # and the fill did go
 
 
-def test_a_stroke_touching_the_fill_loses_its_end_and_no_more(tmp_path):
-    """The cap is the whole discriminator, and it is not free.
+def test_a_stroke_abutting_the_fill_keeps_its_far_end(tmp_path):
+    """Line work meeting the fill is the normal arrangement at a sheet edge, so
+    it is the case that would bleed if the fill were found by connectivity.
 
-    Growing the flood back through `dark` is what recovers a taper the opening
-    severed, but a ruled line abutting the fill is joined to it the same way, so
-    the growth walks a little way down the line too. What it must not do is walk
-    the length of it: uncapped, this is the reconstruction that ate place names.
-    """
+    It is not. What is taken is what the radius test finds and the dilation puts
+    back, so a stroke loses the pixels within a radius of the fill and keeps the
+    rest of its length."""
     src = build(tmp_path / "line.mbtiles", {
         (0, 0): "fill",  (1, 0): "half-fill",  (2, 0): "content",
         (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
@@ -370,22 +396,9 @@ def test_a_stroke_touching_the_fill_loses_its_end_and_no_more(tmp_path):
     sn.run(src, out, jobs=1, offeez=False)
     after = read(out, 1, 0)
     kept = np.flatnonzero((after[101, :, :3].max(axis=1) == 0) & (after[101, :, 3] == 255))
-    # the fill ends at x=90 and the line runs to x=229
     assert kept.max() == 229, "the far end of the line was followed"
-    assert kept.min() - 90 <= sn.REACH + sn.BLEED + 2 * sn.THIN
-
-
-def test_an_uncapped_reach_would_take_the_whole_line(tmp_path):
-    """Why the cap is not just a tuning knob: the line is joined to the fill, so
-    without a bound the reconstruction has nothing to stop it."""
-    src = build(tmp_path / "uncapped.mbtiles", {
-        (0, 0): "fill",  (1, 0): "half-fill",  (2, 0): "content",
-        (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
-    })
-    out = tmp_path / "uncapped-out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False, reach=256)
-    after = read(out, 1, 0)
-    assert black_px(after[100:103, :]) == 0, "the cap was not what saved the line"
+    assert kept.min() - 90 <= 2 * sn.RADIUS + sn.BLEED
+    assert (after[:, :90, 3] == 0).all(), "and the fill did go"
 
 
 @pytest.mark.parametrize("bleed", [0, 1, 2, 3, 4, 5])
@@ -429,5 +442,5 @@ def test_the_bleed_is_recorded_in_the_stamp(tmp_path):
     con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
     stamp = con.execute("SELECT value FROM metadata WHERE name='nodata_stripped'").fetchone()[0]
     con.close()
-    assert stamp == sn.processing_stamp(4, offeez=False)
-    assert stamp != sn.processing_stamp(2, offeez=False)
+    assert stamp == sn.processing_stamp(sn.RADIUS, 4, offeez=False)
+    assert stamp != sn.processing_stamp(sn.RADIUS, 2, offeez=False)

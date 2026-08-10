@@ -375,7 +375,7 @@ def strip_fill(arr, original):
     is returned byte-for-byte as the server sent it."""
     if not wholly_offsheet(arr):
         return original
-    m = nodata_mask(arr, protect=False)
+    m = nodata_mask(arr)
     if m.sum() < NODATA_MIN_FILL:
         return original
     a = arr.copy()
