@@ -75,7 +75,8 @@ def processing_stamp(radius: int = RADIUS, bleed: int = BLEED, *,
     published chart was built by the current recipe, so the two must be one
     definition rather than two strings that agree until one of them changes.
     """
-    return f"opaque-black-disk{radius}-b{bleed}" + ("+offeez-pixel" if offeez else "")
+    return (f"opaque-black-disk{radius}-b{bleed}-directed"
+            + ("+offeez-pixel" if offeez else ""))
 
 
 def tile_has_marks(blob):
@@ -261,7 +262,29 @@ AROUND = {(1, 0): "r", (-1, 0): "l", (0, 1): "b", (0, -1): "t",
 FACING = {"l": "r", "r": "l", "t": "b", "b": "t",
           "lt": "rb", "rb": "lt", "rt": "lb", "lb": "rt"}
 
-BORDER = {"l": np.s_[:, 0], "r": np.s_[:, -1], "t": np.s_[0, :], "b": np.s_[-1, :]}
+
+def regions(margin: int) -> dict:
+    """Where each side's padding sits in the widened array."""
+    m = margin
+    return {"l": np.s_[m:-m, :m], "r": np.s_[m:-m, -m:],
+            "t": np.s_[:m, m:-m], "b": np.s_[-m:, m:-m],
+            "lt": np.s_[:m, :m], "rt": np.s_[:m, -m:],
+            "lb": np.s_[-m:, :m], "rb": np.s_[-m:, -m:]}
+
+
+def facing(tiles, reached) -> dict:
+    """For each tile, which of its sides the outside lies past.
+
+    Empty for a tile the outside does not touch, so the caller can use this to
+    pick candidates as well as to aim them.
+    """
+    out = {}
+    for x, y in tiles:
+        sides = frozenset(s for (dx, dy), s in AROUND.items()
+                          if (x + dx, y + dy) in reached)
+        if sides:
+            out[(x, y)] = sides
+    return out
 
 
 def edge_tiles(ink, plain, black):
@@ -284,13 +307,7 @@ def edge_tiles(ink, plain, black):
     """
     reached = walk_outside(ink, plain)
     offsheet = {t for t in reached & plain if black.get(t, 0) >= MIN_FILL}
-    straddling = {}
-    for x, y in ink:
-        sides = "".join(s for (dx, dy), s in AROUND.items()
-                        if (x + dx, y + dy) in reached)
-        if sides:
-            straddling[(x, y)] = frozenset(sides)
-    return offsheet, straddling
+    return offsheet, facing(ink, reached)
 
 
 def wholly_offsheet(a: np.ndarray) -> bool:
@@ -347,17 +364,15 @@ def widen(dark: np.ndarray, pad: dict, margin: int) -> np.ndarray:
     m = margin
     big = np.zeros((dark.shape[0] + 2 * m, dark.shape[1] + 2 * m), bool)
     big[m:-m, m:-m] = dark
-    for side, sl in (("l", np.s_[m:-m, :m]), ("r", np.s_[m:-m, -m:]),
-                     ("t", np.s_[:m, m:-m]), ("b", np.s_[-m:, m:-m]),
-                     ("lt", np.s_[:m, :m]), ("rt", np.s_[:m, -m:]),
-                     ("lb", np.s_[-m:, :m]), ("rb", np.s_[-m:, -m:])):
+    for side, sl in regions(m).items():
         strip = pad.get(side)
         big[sl] = True if strip is None else strip
     return big
 
 
 def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
-                bleed: int = BLEED, kind: str = "black") -> np.ndarray:
+                bleed: int = BLEED, kind: str = "black",
+                outward: frozenset | None = None) -> np.ndarray:
     """Pixels belonging to off-sheet fill rather than to chart ink.
 
     A fill pixel is dark for `radius` in every direction, and that is the whole
@@ -365,9 +380,18 @@ def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
     can satisfy it, so a place name -- Traficom sets them at 10-16px across --
     cannot be reached from anywhere, however the tile is bounded.
 
-    The fill is then whatever that test finds running in from the margin, which
-    carries the neighbouring tiles' own pixels -- their real ones, so a band
-    that is thin here but wide a few pixels into the next tile is still found.
+    The fill is then whatever that test finds running in **from the sides the
+    outside lies past**, which the tile-grid walk has already named in
+    `outward`. Direction is half the method, not a refinement of it: the other
+    sides face more chart, and a tile at the limit has open water on them --
+    white, wide, and every bit as qualified to start a flood as the blank beyond
+    the limit is. Seeded from all four, one such tile empties both sides of the
+    boundary it straddles. `outward` of None seeds from anywhere, which is only
+    right when the caller has established there is nothing to protect.
+
+    The margin carries the neighbouring tiles' own pixels -- their real ones, so
+    a band that is thin here but wide a few pixels into the next tile is still
+    found.
 
     `pad` of None means the tile is wholly outside the last sheet. Nothing there
     is chart, so nothing needs protecting.
@@ -390,8 +414,10 @@ def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
     core = ndimage.distance_transform_edt(big) > radius
     if not core.any():
         return np.zeros_like(dark)
-    rim = np.ones(big.shape, bool)
-    rim[radius:-radius, radius:-radius] = False
+    rim = np.zeros(big.shape, bool)
+    where = regions(radius)
+    for side in (where if outward is None else outward):
+        rim[where[side]] = True
     out = ndimage.binary_propagation(core & rim, mask=core)
     if not out.any():
         return np.zeros_like(dark)
@@ -414,10 +440,10 @@ def spread(mask: np.ndarray, n: int) -> np.ndarray:
 
 
 def _strip(task):
-    z, x, row, blob, pad, radius, bleed, kind = task
+    z, x, row, blob, pad, outward, radius, bleed, kind = task
     img = Image.open(io.BytesIO(blob)).convert("RGBA")
     a = np.asarray(img).copy()
-    m = nodata_mask(a, pad, radius, bleed, kind)
+    m = nodata_mask(a, pad, radius, bleed, kind, outward)
     n = int(m.sum())
     if n < MIN_FILL:
         return None
@@ -472,26 +498,27 @@ def scan(src: Path, jobs: int) -> None:
 def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool):
     """Erase one colour of no-data from one zoom. Returns (rewritten, dropped).
 
-    `whole` are tiles that are nothing but it, `straddle` the chart tiles they
-    touch -- the ones that need their neighbours' pixels before anything about
-    them can be decided.
+    `whole` are tiles that are nothing but it. `straddle` maps each chart tile
+    the outside touches to the sides it touches from -- both the pixels those
+    sides carry and the direction the flood may enter by.
     """
     if not whole and not straddle:
         return 0, 0
     rewritten = dropped = 0
     want = sorted({(x + dx, y + dy) for (x, y) in straddle
-                   for dx, dy in AROUND} | straddle)
+                   for dx, dy in AROUND} | straddle.keys())
     edges = edge_lines(con, z, want, pool, kind, radius)
-    todo = sorted(((x, (1 << z) - 1 - y),
-                   None if (x, y) in whole else surround((x, y), edges))
-                  for (x, y) in (whole | straddle))
+    todo = sorted(whole | straddle.keys())
     for i in range(0, len(todo), BATCH):
         tasks = []
-        for (x, row), pad in todo[i:i + BATCH]:
+        for x, y in todo[i:i + BATCH]:
+            row = (1 << z) - 1 - y
             blob = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
                                "tile_column=? AND tile_row=?", (z, x, row)).fetchone()
+            pad = None if (x, y) in whole else surround((x, y), edges)
             if blob:
-                tasks.append((z, x, row, blob[0], pad, radius, bleed, kind))
+                tasks.append((z, x, row, blob[0], pad, straddle.get((x, y)),
+                              radius, bleed, kind))
         for res in pool.map(_strip, tasks, chunksize=32):
             if res is None:
                 continue
@@ -538,7 +565,7 @@ def run(src: Path, out: Path, jobs: int, offeez: bool, radius: int = RADIUS,
         leaked(black, offsheet | straddling.keys(), deep)
         print(f"  z{deep} {len(offsheet)} off-sheet, {len(straddling)} straddling "
               f"of {len(ink) + len(plain)} tiles")
-        rewritten, dropped = pixel_pass(con, deep, offsheet, set(straddling),
+        rewritten, dropped = pixel_pass(con, deep, offsheet, straddling,
                                         "black", radius, bleed, pool)
         print(f"  z{deep} rewrote {rewritten}, dropped {dropped}")
 
@@ -563,8 +590,7 @@ def run(src: Path, out: Path, jobs: int, offeez: bool, radius: int = RADIUS,
             # the blank tiles, so what a boundary tile now faces is an empty
             # cell rather than a featureless neighbour
             reached = walk_outside(marked, feat)
-            straddle = {t for t in marked
-                        if any((t[0] + dx, t[1] + dy) in reached for dx, dy in AROUND)}
+            straddle = facing(marked, reached)
             wr, wd = pixel_pass(con, deep, set(), straddle, "white",
                                 radius, bleed, pool)
             print(f"  z{deep} limit: {len(straddle)} straddling, {wr} rewritten, "

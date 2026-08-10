@@ -197,6 +197,15 @@ of them, since a sheet edge crossing the grid diagonally leaves a tile whose onl
 contact with the fill is a corner — so a band that is thin here but wide a few
 pixels into the next tile is still found.
 
+**And it may only run in from the sides the outside actually lies past**, which
+the tile-grid walk has already named. Direction is half the method rather than a
+refinement of it, and the reason is the white pass: the blank beyond the limit
+and the open water inside it are the same white, so nothing local separates
+them. A tile the limit crosses has qualifying white on *both* sides of it, and
+seeded from the whole margin one such tile empties both — 566 tiles at z13, some
+of them see-through end to end, reported as a rectangle of basemap showing
+through open water south of Helsinki.
+
 **Only the deepest zoom is examined**, and every level below it is deleted for
 `downscale` to rebuild. Each of those levels is a separate rendering of the same
 coastline with its own fill, so asking the same question of all nine put the
@@ -270,29 +279,33 @@ mistune.
 Dropping whole tiles can only take one that is blank throughout, so where the
 limit crosses a tile the blank half stays: the same shape of leftover the fill
 used to leave, in the other colour. Those tiles get the same pixel treatment as
-the black fill, under the same radius — which is what the radius is set by. The
-dashes the tile fence closes are still open at pixel scale, and a disk of 10
-passes between them and empties water well inside coverage: 868 tiles at z13,
-whole coastlines and depth contours gone. At 64 no disk fits through the gaps.
+the black fill, and it is that pass — not this one — that needs both of its
+guards, because on a tile the limit crosses, tile granularity has run out:
 
-The deepest zoom decides the boundary, since it resolves it most finely. Coarser
-zooms cannot refine it: a coarse tile is marked when *any* part of its ground has
-content, so it can say "something here" but never where. Ancestors follow their
-descendants structurally, because they are rebuilt from them: a parent exists
-only where a child survived.
+- **The radius**, because the dashes the tile fence closes are still open at
+  pixel scale. A disk of 10 passes between them and empties water well inside
+  coverage — 868 tiles at z13, whole coastlines and depth contours gone. At 64
+  no disk fits through a gap.
+- **The direction**, because the tile's inward side has open water on it, and
+  open water is qualifying white. A flood seeded from the whole margin starts
+  there and empties the chart side too, with no dash to squeeze through and no
+  radius large enough to stop it. 566 tiles at z13, several of them see-through
+  end to end.
 
-Verified per chart by comparing against a `--skip-offeez` build: chart markings
-are identical at every zoom, to the pixel, while off-sheet tiles go (9,254 on
-Yleiskartat, 2,901 on Rannikkokartat). A one-tile white margin survives where a
-tile straddles the limit, since such a tile is marked and therefore untouched.
+The boundary is decided once, at the deepest zoom, and every coarser level
+inherits it by being built from those tiles: a parent exists only where a child
+survived. There is no second classification to reconcile, and a tile that
+survives at one zoom cannot vanish at the next.
 
-Verified both directions on Yleiskartat, the layer with the most fill. Tiles that
-are essentially nothing but fill go from 4,127 at z13 to 1, and every tile that
-carries a place name — the ones a shape-only test hollowed out — comes through
-byte-identical to the source. The two halves check each other: the off-EEZ pass
-that follows classifies unstripped fill as a *marking*, so black left behind
-walls its flood, and its counts moving (9,294 tiles dropped, none kept at any
-zoom) is how an under-strip shows up even when the pixels are not inspected.
+Measured on Yleiskartat at z13, the layer with the most of both: 4,256 tiles are
+off-sheet and 1,786 more straddle a sheet edge; 6,676 blank tiles are dropped
+past the limit and 1,793 straddle it. Six tiles end up keeping dark too thick to
+be type — leftover fill in wedges narrower than the radius can find.
+
+The two passes check each other. The off-EEZ pass runs on the black-stripped
+tiles and classifies any fill still there as a *marking*, so black left behind
+walls its flood; its counts moving is how an under-strip shows up even when no
+pixel is inspected.
 
 ## Downscaling the pyramid
 
@@ -521,7 +534,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-disk64-b2+offeez-pixel; box-2x-premultiplied from z15 on 2026-08-09",
+      "processing": "opaque-black-disk64-b2-directed+offeez-pixel; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]

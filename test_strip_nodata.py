@@ -80,6 +80,18 @@ def tile(kind: str) -> bytes:
             # boundary, where the surviving wedge was 8px across.
             for r in range(256):
                 a[r, :max(0, 60 - r // 3)] = (0, 0, 0, 255)
+        if kind == "open":
+            # Water well inside the limit: blank white but for one mark, which
+            # is all it takes to be chart. This is what has to survive, and what
+            # a tile below it can seed a flood on if direction is not consulted.
+            a[:, :] = (255, 255, 255, 255)
+            a[4:12, 4:12] = (150, 40, 140, 255)
+        if kind == "limit":
+            # The outer limit: chart above the line, nothing below it. Both
+            # halves are blank white, which is what makes direction the only
+            # thing that tells them apart.
+            a[:, :] = (255, 255, 255, 255)
+            a[128:131, :] = (150, 40, 140, 255)
         if kind == "soft-fill":
             # Off-sheet to the left with an anti-aliased boundary. The source
             # does soften it, whatever the hard-edge assumption said: the
@@ -314,6 +326,64 @@ def test_every_level_below_the_deepest_is_dropped(tmp_path):
     assert (a := read(out, 1, 1)) is not None and (a[:, :90, 3] == 0).all(), \
         "and the deepest level must still have been stripped"
     assert minzoom is None, "strip does not invent a minzoom the source never had"
+
+
+def _limit_pad():
+    """A tile at the outer limit: chart to the north, nothing to the south.
+
+    The ink line runs the full width of the padded array, so the only way from
+    one side of it to the other is through the line itself.
+    """
+    R = sn.RADIUS
+    side = np.ones((256, R), bool)
+    side[128:131, :] = False
+    return {"t": np.ones((R, 256), bool), "b": None, "l": side, "r": side.copy(),
+            "lt": np.ones((R, R), bool), "rt": np.ones((R, R), bool),
+            "lb": None, "rb": None}
+
+
+def test_the_flood_enters_only_from_the_sides_the_outside_lies_past():
+    """The bug this is here for: seeded from the whole rim, a tile straddling
+    the outer limit empties *both* sides of it. The blank past the limit and the
+    open water inside it are the same white, so nothing local separates them --
+    only which way the tile-grid walk came in."""
+    a = np.asarray(Image.open(io.BytesIO(tile("limit"))).convert("RGBA"))
+    m = sn.nodata_mask(a, _limit_pad(), kind="white",
+                       outward=frozenset({"b", "lb", "rb"}))
+    assert m[131 + sn.BLEED:, :].all(), "the blank past the limit stayed"
+    assert not m[:128 - sn.BLEED, :].any(), "water inside the limit was erased"
+
+
+def test_seeding_from_every_side_is_what_empties_both_halves():
+    """The counterpart, pinning why the direction is needed rather than assumed:
+    with no direction given, the same tile loses the water too."""
+    a = np.asarray(Image.open(io.BytesIO(tile("limit"))).convert("RGBA"))
+    m = sn.nodata_mask(a, _limit_pad(), kind="white", outward=None)
+    assert m[:128 - sn.BLEED, :].all()
+
+
+def test_water_inside_the_limit_survives_a_whole_run(tmp_path):
+    """End to end, through the tile drop that precedes the white pass.
+
+    The row above the limit is open water, so the tile the limit crosses has
+    blank white on both of the sides that matter -- which is the arrangement
+    that made this leak in the first place, and the reason the fixture is four
+    rows deep rather than three."""
+    layout = {(x, 0): "content" for x in range(3)}
+    layout |= {(x, 1): "open" for x in range(3)}
+    layout |= {(x, 2): "limit" for x in range(3)}
+    layout |= {(x, 3): "blank" for x in range(3)}
+    src = build(tmp_path / "limit.mbtiles", layout)
+    out = tmp_path / "limit-out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=True)
+
+    assert read(out, 1, 3) is None, "the blank past the limit was kept"
+    a = read(out, 1, 2)
+    assert a is not None, "the tile the limit crosses was dropped"
+    assert (a[131 + sn.BLEED:, :, 3] == 0).all(), "the blank past the limit stayed"
+    assert (a[:128 - sn.BLEED, :, 3] == 255).all(), "water inside the limit went"
+    assert np.array_equal(read(out, 1, 1), read_source_kind("open")), \
+        "the open water a row further in was touched at all"
 
 
 def test_a_tile_whose_whole_neighbourhood_is_fill_is_erased(tmp_path):
