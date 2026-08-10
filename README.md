@@ -188,12 +188,20 @@ that walk. Only tiles it reaches, and the chart tiles they touch, are examined a
 all — the interior is never a candidate, whatever its ink looks like.
 
 Inside an examined tile the question becomes a shape one, but at a scale no
-place name reaches: a fill pixel is dark for `--radius` (10) in every direction.
+place name reaches: a fill pixel is dark for `--radius` (64) in every direction.
 Nothing narrower than twice that can satisfy it, and Traficom sets its capitals
 at 10–16px across, so type cannot start a removal however the tile is bounded.
 The fill is then what that test finds running in from the tile's margin, and the
-margin is real: each tile is padded with its neighbours' own pixels, so a band
-that is thin here but wide a few pixels into the next tile is still found.
+margin is real: each tile is padded with its neighbours' own pixels — all eight
+of them, since a sheet edge crossing the grid diagonally leaves a tile whose only
+contact with the fill is a corner — so a band that is thin here but wide a few
+pixels into the next tile is still found.
+
+**Only the deepest zoom is examined**, and every level below it is deleted for
+`downscale` to rebuild. Each of those levels is a separate rendering of the same
+coastline with its own fill, so asking the same question of all nine put the
+boundary in a different place at every zoom; and the answers below the deepest
+were overwritten by the downscale anyway.
 
 **No-data counts as black.** Where the fetch ran past the served extent the tile
 comes back transparent, and that is the same thing the fill is — not chart. It
@@ -212,7 +220,10 @@ behind is black on the water.
 
 Measured on the archive: the Åland boundary tile goes from 17,858 dark pixels to
 20, a whole-tile fill from 58,843 to 15, and an inland tile carrying a place name
-across a seam keeps 6,036 of its 6,115.
+across a seam keeps 6,036 of its 6,115. Across the whole of Yleiskartat at z13,
+seven tiles keep dark too thick to be type (15,363px) — leftover fill in wedges
+narrower than the radius can find. Two of those seven are the radius's own cost:
+at 10 they were removed, and the same setting erased chart on 868 other tiles.
 
 Fractions are measured over *opaque* pixels, since fill often arrives with a
 transparent margin where the fetch ran past the served extent.
@@ -253,14 +264,22 @@ Tile granularity is what makes this safe rather than a limitation. The EEZ line
 is dashed, and at pixel scale a flood slips between the dashes and empties water
 that is well inside coverage; at tile scale every tile the line crosses holds
 some of it, so the fence is unbroken. And since the only action is deleting whole
-tiles that carry nothing, no chart pixel can be lost — there is no radius or
-threshold to mistune.
+tiles that carry nothing, no chart pixel can be lost — there is no threshold to
+mistune.
+
+Dropping whole tiles can only take one that is blank throughout, so where the
+limit crosses a tile the blank half stays: the same shape of leftover the fill
+used to leave, in the other colour. Those tiles get the same pixel treatment as
+the black fill, under the same radius — which is what the radius is set by. The
+dashes the tile fence closes are still open at pixel scale, and a disk of 10
+passes between them and empties water well inside coverage: 868 tiles at z13,
+whole coastlines and depth contours gone. At 64 no disk fits through the gaps.
 
 The deepest zoom decides the boundary, since it resolves it most finely. Coarser
 zooms cannot refine it: a coarse tile is marked when *any* part of its ground has
-content, so it can say "something here" but never where. Ancestors then follow
-their descendants — a tile whose deeper detail survives is kept whatever its own
-rendering shows, or the pyramid gains holes that appear and vanish as you zoom.
+content, so it can say "something here" but never where. Ancestors follow their
+descendants structurally, because they are rebuilt from them: a parent exists
+only where a child survived.
 
 Verified per chart by comparing against a `--skip-offeez` build: chart markings
 are identical at every zoom, to the pixel, while off-sheet tiles go (9,254 on
@@ -299,12 +318,23 @@ them apart — it scores how much each level adds over an upscale of its parent:
 | `Merikarttasarjat public` | z15 | default |
 | `Rannikkokartat public` | z15 | default |
 | `Satamakartat` | z15 | default |
-| `Yleiskartat 250k` | **z12** | `--source-zoom 12` |
+| `Yleiskartat 250k` | z12, but see below | default |
 
-Yleiskartat is the exception: 94% of its z13 pixels reproduce exactly by
-nearest-neighbour from z12, so z13 is Traficom's upscale and z12 is the deepest
-real cartography. Downscaling it from z13 leaves the place names at z10 broken
-into illegible fragments; from z12 they come out clean.
+Yleiskartat is where the two rules meet: 94% of its z13 pixels reproduce exactly
+by nearest-neighbour from z12, so z13 is Traficom's upscale and z12 is the
+deepest real cartography — but `strip-nodata` cleans the deepest level present
+and deletes the rest, so z12 has to be derived from z13 or it keeps its fill.
+
+It costs nothing measurable. Because z13 *is* an upscale, halving it back gives
+z12 again: over 200 sampled tiles, 1.9% of pixels differ from Traficom's own z12
+by more than 32/255, and every one of them is on the edge of a stroke. Cascading
+to z10 from z13 rather than z12 moves 1.0% of pixels by that much, again only at
+stroke edges — the place names come out identical. (An earlier note here claimed
+z13 left the z10 names in illegible fragments. It does not reproduce.)
+
+What it does cost is file size: the whole pyramid below z13 is now anti-aliased
+rather than Traficom's flat colour, which compresses worse. Yleiskartat went from
+255MB to 297MB.
 
 - Cascades one octave at a time (z15→z14→…), each level from the level above —
   a standard mip pyramid.
@@ -321,7 +351,10 @@ into illegible fragments; from z12 they come out clean.
   is kept. Per-tile image work is fanned out across all cores.
 
 `--source-zoom` overrides the level to downscale from (default: deepest present);
-`--min-zoom` limits how far down to regenerate (default: the file's lowest zoom).
+`--min-zoom` limits how far down to regenerate. Its default is the lower of the
+file's lowest level and its `minzoom` metadata — after `strip-nodata` the file
+holds one level of tiles and a `minzoom` describing the chart it is about to
+become, and the levels in between have to be rebuilt rather than assumed absent.
 
 `./run native-zoom <file>` reports whether each level is genuine detail or an
 upscale, confirming the deepest level is worth downscaling from.
@@ -488,7 +521,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-disk10-b2+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-09",
+      "processing": "opaque-black-disk64-b2+offeez-pixel; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]

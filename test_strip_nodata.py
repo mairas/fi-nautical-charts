@@ -92,16 +92,18 @@ def tile(kind: str) -> bytes:
     return buf.getvalue()
 
 
-def build(path: Path, layout: dict[tuple[int, int], str]) -> Path:
+def build(path: Path, layout: dict[tuple[int, int], str], z: int = Z) -> Path:
+    """Write one zoom's tiles. Called twice on the same path to stack levels."""
     con = sqlite3.connect(path)
-    con.execute("CREATE TABLE metadata (name TEXT PRIMARY KEY, value TEXT)")
-    con.execute("CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, "
+    con.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS tiles (zoom_level INTEGER, tile_column INTEGER, "
                 "tile_row INTEGER, tile_data BLOB)")
-    con.execute("CREATE UNIQUE INDEX ti ON tiles (zoom_level, tile_column, tile_row)")
-    con.execute("INSERT INTO metadata VALUES ('name','test')")
+    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ti ON tiles "
+                "(zoom_level, tile_column, tile_row)")
+    con.execute("INSERT OR REPLACE INTO metadata VALUES ('name','test')")
     for (x, y), kind in layout.items():
         con.execute("INSERT INTO tiles VALUES (?,?,?,?)",
-                    (Z, x, (1 << Z) - 1 - y, tile(kind)))
+                    (z, x, (1 << z) - 1 - y, tile(kind)))
     con.commit()
     con.close()
     return path
@@ -288,6 +290,66 @@ def test_solid_black_the_walk_cannot_reach_stops_the_run(tmp_path):
     with pytest.raises(sn.Leaked, match=r"\(1, 1\)"):
         sn.run(src, tmp_path / "enclosed-out.mbtiles",
                jobs=1, offeez=False)
+
+
+def test_every_level_below_the_deepest_is_dropped(tmp_path):
+    """Detection runs once, at the level that resolves the boundary most finely.
+
+    The levels below are separate renderings of the same coastline, each with
+    its own fill; asking the same question of all nine put the boundary in a
+    different place at every zoom. They go, and downscale rebuilds them from the
+    one that was cleaned -- so what is asserted here is that they are gone, not
+    that they are clean."""
+    src = tmp_path / "pyramid.mbtiles"
+    build(src, LAYOUT)
+    build(src, {(0, 0): "fill", (1, 0): "half-fill", (2, 0): "content"}, z=Z - 1)
+    out = tmp_path / "pyramid-out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=False)
+
+    con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
+    levels = [z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles")]
+    minzoom = con.execute("SELECT value FROM metadata WHERE name='minzoom'").fetchone()
+    con.close()
+    assert levels == [Z], f"levels below the deepest survived: {levels}"
+    assert (a := read(out, 1, 1)) is not None and (a[:, :90, 3] == 0).all(), \
+        "and the deepest level must still have been stripped"
+    assert minzoom is None, "strip does not invent a minzoom the source never had"
+
+
+def test_a_tile_whose_whole_neighbourhood_is_fill_is_erased(tmp_path):
+    """The degenerate case the distance transform cannot answer: an array with
+    no background in it has no distance to one, and scipy returns a small number
+    rather than an infinite one -- which reads as "no fill found" and would keep
+    a tile that is nothing but fill, in the middle of more of it."""
+    a = np.zeros((256, 256, 4), np.uint8)
+    a[:, :] = (0, 0, 0, 255)
+    pad = {s: np.ones((sn.RADIUS, 256) if s in "tb" else (256, sn.RADIUS), bool)
+           for s in ("l", "r", "t", "b")}
+    pad |= {s: np.ones((sn.RADIUS, sn.RADIUS), bool)
+            for s in ("lt", "rt", "lb", "rb")}
+    assert sn.nodata_mask(a, pad).all()
+
+
+def test_a_diagonal_neighbour_pads_the_corner(tmp_path):
+    """The fill reaches this tile only across a corner, so the only pixels that
+    can say it continues past the seam are the diagonal neighbour's."""
+    src = build(tmp_path / "diag.mbtiles", {
+        (0, 0): "fill",    (1, 0): "content", (2, 0): "content",
+        (0, 1): "content", (1, 1): "content", (2, 1): "content",
+    })
+    out = tmp_path / "diag-out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=False)
+    edges = {}
+    con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    for (x, y) in [(0, 0)]:
+        r = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
+                        "tile_column=? AND tile_row=?", (Z, x, (1 << Z) - 1 - y)).fetchone()
+        _, _, e = sn._edges((Z, x, 0, r[0], sn.RADIUS, "black"))
+        edges[(x, y)] = e
+    con.close()
+    pad = sn.surround((1, 1), edges)
+    assert pad["lt"] is not None and pad["lt"].all(), "the corner came back empty"
+    assert pad["l"] is None and pad["t"] is None, "only the diagonal is present"
 
 
 def test_the_stamp_records_that_only_edges_were_examined(stripped):
