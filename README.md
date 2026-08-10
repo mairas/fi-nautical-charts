@@ -195,19 +195,20 @@ crosses a tile at a shallow angle the fill enters as a wedge a few pixels wide,
 thinner than any erosion that also spares a place name. That left a jagged black
 rim and stray triangles along every diagonal boundary.
 
-Two details keep the flood honest. It runs through the fill's *body* — the mask
-after an opening — because a black stroke abutting the fill would otherwise
-carry it down the stroke and into the chart; the body is then dilated back a
-stroke's width into the surrounding dark pixels, which recovers the fill's own
-anti-aliased edge without following anything. And "dark" means within 40 of
-black, not black exactly: the source does soften that boundary, and a pure-black
-test leaves the softened pixels behind as a fringe tracing the whole sheet edge.
+Two things keep the flood honest, and both are knobs. It runs through the fill's
+*body* — the mask after an opening — because a black stroke abutting the fill
+would otherwise carry it down the stroke and into the chart. That opening also
+severs the last of a taper, where the sheet edge runs out of a tile and the fill
+narrows to a few pixels, so the flood is then grown back through the dark it is
+joined to, capped at `--reach` pixels of travel (16). The cap is the whole
+discriminator: uncapped, that growth is the reconstruction that ate place names,
+and on real tiles it runs 124–190 pixels when something long is connected.
 
-What this still cannot reach is the last of a taper, where the wedge is narrower
-than that opening. Measured on the Åland boundary at z9, the tile carrying the
-visible artefact went from 487 stray dark pixels to 5, and a seven-tile strip
-along the boundary keeps 10 — single pixels rather than the triangles, but not
-zero.
+Finally the result is dilated `--bleed` pixels (2) **unconditionally**, not
+gated on darkness. Gating it is what left single pixels of boundary behind, and
+the two ways of being wrong here do not cost the same: a pixel of the chart's
+own edge taken with the fill is a pixel of neatline nobody will look for, while
+a pixel of fill left behind is black on the water.
 
 Fractions are measured over *opaque* pixels, since fill often arrives with a
 transparent margin where the fetch ran past the served extent.
@@ -483,7 +484,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-edge-flood+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-09",
+      "processing": "opaque-black-edge-flood-b2r16+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]

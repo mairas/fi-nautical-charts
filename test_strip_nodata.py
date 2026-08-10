@@ -354,20 +354,38 @@ def test_type_on_a_straddling_tile_survives_the_flood(tmp_path):
     assert (after[:, :90, 3] == 0).all()          # and the fill did go
 
 
-def test_a_stroke_touching_the_fill_is_not_followed_into_the_chart(tmp_path):
-    """Connectivity is why the old code grew seeds through an opened mask: a
-    ruled line abutting the fill would otherwise carry the flood down its whole
-    length. Flooding from the border has the same exposure, so the body is
-    opened before the flood and only dilated back a stroke's width after."""
+def test_a_stroke_touching_the_fill_loses_its_end_and_no_more(tmp_path):
+    """The cap is the whole discriminator, and it is not free.
+
+    Growing the flood back through `dark` is what recovers a taper the opening
+    severed, but a ruled line abutting the fill is joined to it the same way, so
+    the growth walks a little way down the line too. What it must not do is walk
+    the length of it: uncapped, this is the reconstruction that ate place names.
+    """
     src = build(tmp_path / "line.mbtiles", {
         (0, 0): "fill",  (1, 0): "half-fill",  (2, 0): "content",
         (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
     })
     out = tmp_path / "out.mbtiles"
     sn.run(src, out, jobs=1, offeez=False)
-    before, after = read(src, 1, 0), read(out, 1, 0)
-    lost = black_px(before[100:103, 95:]) - black_px(after[100:103, 95:])
-    assert lost == 0, f"the flood ran {lost}px down a line abutting the fill"
+    after = read(out, 1, 0)
+    kept = np.flatnonzero((after[101, :, :3].max(axis=1) == 0) & (after[101, :, 3] == 255))
+    # the fill ends at x=90 and the line runs to x=229
+    assert kept.max() == 229, "the far end of the line was followed"
+    assert kept.min() - 90 <= sn.REACH + sn.BLEED + 2 * sn.THIN
+
+
+def test_an_uncapped_reach_would_take_the_whole_line(tmp_path):
+    """Why the cap is not just a tuning knob: the line is joined to the fill, so
+    without a bound the reconstruction has nothing to stop it."""
+    src = build(tmp_path / "uncapped.mbtiles", {
+        (0, 0): "fill",  (1, 0): "half-fill",  (2, 0): "content",
+        (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
+    })
+    out = tmp_path / "uncapped-out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=False, reach=256)
+    after = read(out, 1, 0)
+    assert black_px(after[100:103, :]) == 0, "the cap was not what saved the line"
 
 
 @pytest.mark.parametrize("bleed", [0, 1, 2, 3, 4, 5])

@@ -54,22 +54,21 @@ FILL_FRACTION = .95 # above this a tile is off-sheet rather than chart
 THIN = 2            # strokes narrower than this survive as ink, not fill
 DARK = 40           # the transition is one pixel; this catches it
 BLEED = 2           # pixels erased past the fill, over the chart's own edge
-CLING = 0.1         # of its own area, how much of a leftover lies against the
-                    # fill before it is fill too: a sliver runs at 0.2-0.3, a
-                    # stroke crossing the boundary at under 0.01
+REACH = 16          # how far fill may travel along a neck too thin to flood
 TILE = 256
 WHITE_LUM = 250     # above this an opaque pixel counts as blank paper
 BATCH = 2000        # tiles held in memory at once
 
 
-def processing_stamp(bleed: int = BLEED, *, offeez: bool) -> str:
+def processing_stamp(bleed: int = BLEED, reach: int = REACH, *,
+                     offeez: bool) -> str:
     """What a run with these settings records as nodata_stripped.
 
     Written into the file and read back by anything deciding whether a
     published chart was built by the current recipe, so the two must be one
     definition rather than two strings that agree until one of them changes.
     """
-    return f"opaque-black-edge-flood-b{bleed}" + ("+offeez-tilelevel" if offeez else "")
+    return f"opaque-black-edge-flood-b{bleed}r{reach}" + ("+offeez-tilelevel" if offeez else "")
 
 
 def tile_has_marks(blob):
@@ -280,7 +279,7 @@ def border(shape, sides) -> np.ndarray:
 
 
 def nodata_mask(a: np.ndarray, protect: bool = True, sides=None,
-                bleed: int = BLEED) -> np.ndarray:
+                bleed: int = BLEED, reach: int = REACH) -> np.ndarray:
     """Pixels belonging to off-sheet fill rather than to chart ink.
 
     The fill is whatever runs in from the tile borders `sides` names -- the ones
@@ -309,8 +308,7 @@ def nodata_mask(a: np.ndarray, protect: bool = True, sides=None,
     flood = ndimage.binary_propagation(body & border(dark.shape, sides), mask=body)
     if not flood.any():
         return np.zeros_like(dark)
-    fill = spread(flood, bleed)
-    return fill | clinging(dark & ~fill, fill)
+    return spread(reconstruct(flood, dark, reach), bleed)
 
 
 def spread(mask: np.ndarray, n: int) -> np.ndarray:
@@ -327,37 +325,35 @@ def spread(mask: np.ndarray, n: int) -> np.ndarray:
     return ndimage.binary_dilation(mask, structure=np.ones((3, 3), bool), iterations=n)
 
 
-def clinging(rest, fill: np.ndarray) -> np.ndarray:
-    """Leftover dark that lies along the fill's edge rather than crossing it.
+def reconstruct(flood: np.ndarray, dark: np.ndarray, reach: int) -> np.ndarray:
+    """Grow the flood through the dark it is connected to, capped at `reach`.
 
-    What the flood cannot reach is the last of a taper: where the sheet edge
-    runs out of a tile the fill narrows past the opening that keeps the flood
-    off abutting line work, and a sliver is left tracing the boundary.
+    The opening that found the body severs any part of the fill narrower than
+    its kernel -- where the sheet edge runs out of a tile, the fill tapers to a
+    few pixels and is dropped, leaving a sliver the flood cannot enter. But the
+    sliver is not a separate thing: it is still joined to the fill in `dark`,
+    which is exactly why the opening had to sever it in the first place.
 
-    It is told from ink by how it meets the fill. A sliver runs beside it, so
-    much of the sliver is against it; a stroke of chart ink crosses the boundary
-    and touches only where it ends. Measured against the region's own area, the
-    two are two orders of magnitude apart, so the threshold between them is not
-    a fine judgement.
+    So grow back along that join, and cap how far. The cap is the whole
+    discriminator: fill reaches along a neck only as far as the tile edge is
+    from the body, while a stroke of chart ink abutting the fill runs the width
+    of the tile. Uncapped this is the reconstruction that ate place names.
     """
-    labels, n = ndimage.label(rest)
-    if not n:
-        return np.zeros_like(rest)
-    against = labels[ndimage.binary_dilation(fill) & rest]
-    if not against.size:
-        return np.zeros_like(rest)
-    touch = np.bincount(against, minlength=n + 1)
-    size = np.bincount(labels.ravel(), minlength=n + 1)
-    size[0] = 1
-    keep = np.flatnonzero(touch / size >= CLING)
-    return np.isin(labels, keep[keep > 0])
+    out = flood
+    k = np.ones((3, 3), bool)
+    for _ in range(max(0, reach)):
+        grown = ndimage.binary_dilation(out, structure=k) & dark
+        if grown.sum() == out.sum():
+            break
+        out = grown
+    return out
 
 
 def _strip(task):
-    z, x, row, blob, sides, bleed = task
+    z, x, row, blob, sides, bleed, reach = task
     img = Image.open(io.BytesIO(blob)).convert("RGBA")
     a = np.asarray(img).copy()
-    m = nodata_mask(a, protect=bool(sides), sides=sides, bleed=bleed)
+    m = nodata_mask(a, protect=bool(sides), sides=sides, bleed=bleed, reach=reach)
     n = int(m.sum())
     if n < MIN_FILL:
         return None
@@ -414,7 +410,8 @@ def scan(src: Path, jobs: int) -> None:
     con.close()
 
 
-def run(src: Path, out: Path, jobs: int, offeez: bool, bleed: int = BLEED) -> None:
+def run(src: Path, out: Path, jobs: int, offeez: bool, bleed: int = BLEED,
+        reach: int = REACH) -> None:
     # built beside the target and moved into place at the end, so a run that
     # dies partway cannot leave a valid-looking partial chart where the good
     # one was
@@ -452,7 +449,7 @@ def run(src: Path, out: Path, jobs: int, offeez: bool, bleed: int = BLEED) -> No
                 for (x, row), sides in todo[i:i + BATCH]:
                     blob = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
                                        "tile_column=? AND tile_row=?", (z, x, row)).fetchone()
-                    tasks.append((z, x, row, blob[0], sides, bleed))
+                    tasks.append((z, x, row, blob[0], sides, bleed, reach))
                 for res in pool.map(_strip, tasks, chunksize=32):
                     if res is None:
                         continue
@@ -492,7 +489,7 @@ def run(src: Path, out: Path, jobs: int, offeez: bool, bleed: int = BLEED) -> No
         print(f"  off-EEZ total: {total} tiles dropped, 0 modified")
 
     con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
-                ("nodata_stripped", processing_stamp(bleed, offeez=offeez)))
+                ("nodata_stripped", processing_stamp(bleed, reach, offeez=offeez)))
     con.commit()
     con.execute("VACUUM")
     con.close()
@@ -509,6 +506,10 @@ def main():
                    help=f"pixels erased past the fill, over the chart's own edge "
                         f"(default {BLEED}); leaving fill shows, taking a little "
                         f"neatline does not")
+    p.add_argument("--reach", type=int, default=REACH,
+                   help=f"how far fill may follow a neck too thin to flood "
+                        f"(default {REACH}); past the width of a taper it starts "
+                        f"following ink instead")
     p.add_argument("--scan", action="store_true", help="report what would change, write nothing")
     p.add_argument("--skip-offeez", action="store_true",
                    help="leave the blank white beyond the chart limits in place")
@@ -519,7 +520,8 @@ def main():
         scan(args.input, args.jobs or None)
         return
     out = args.out or args.input.with_suffix(".stripped.mbtiles")
-    run(args.input, out, args.jobs or None, not args.skip_offeez, args.bleed)
+    run(args.input, out, args.jobs or None, not args.skip_offeez, args.bleed,
+        args.reach)
 
 
 if __name__ == "__main__":
