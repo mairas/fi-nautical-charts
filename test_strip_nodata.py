@@ -148,7 +148,7 @@ LAYOUT = {
 def stripped(tmp_path):
     src = build(tmp_path / "src.mbtiles", LAYOUT)
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
     return out
 
 
@@ -206,7 +206,7 @@ def test_a_chart_with_no_fill_at_all_is_left_completely_alone(tmp_path):
               for x in range(5) for y in range(5)}
     src = build(tmp_path / "nofill.mbtiles", layout)
     out = tmp_path / "nofill-out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
     for x in range(1, 4):
         for y in range(1, 4):
             a = read(out, x, y)
@@ -224,7 +224,7 @@ def test_off_sheet_tiles_that_are_not_perfectly_uniform_are_still_stripped(tmp_p
     layout[(0, 1)] = kind
     src = build(tmp_path / "src.mbtiles", layout)
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
 
     a = read(out, 0, 1)
     left = 0 if a is None else black_px(a)
@@ -241,7 +241,7 @@ def test_heavy_type_on_a_straddling_tile_survives(tmp_path):
         layout[(1, y)] = "half-fill+type"
     src = build(tmp_path / "src.mbtiles", layout)
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
 
     a = read(out, 1, 1)
     assert a is not None
@@ -261,7 +261,7 @@ def test_fill_crossing_the_grid_diagonally_is_removed(tmp_path):
               (0, 2): "content",      (1, 2): "content",     (2, 2): "content"}
     src = build(tmp_path / "src.mbtiles", layout)
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
     a = read(out, 1, 1)
     assert a is not None, "a tile carrying chart must not be dropped"
     assert (a[0, :100, 3] == 0).all(), "the fill corner survived"
@@ -278,7 +278,7 @@ def test_dark_that_does_not_continue_past_a_seam_is_left_alone(tmp_path):
               (0, 2): "fill",    (1, 2): "content",      (2, 2): "content"}
     src = build(tmp_path / "src.mbtiles", layout)
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
     a = read(out, 1, 1)
     fresh = np.asarray(Image.open(io.BytesIO(tile("content+type"))).convert("RGBA"))
     assert black_px(a) == black_px(fresh), "chart ink was altered"
@@ -293,7 +293,7 @@ def test_a_run_that_would_leave_solid_fill_behind_refuses(tmp_path, monkeypatch)
     monkeypatch.setattr(sn, "edge_tiles", lambda ink, plain, black: (set(), {}))
 
     with pytest.raises(sn.Leaked, match="would ship"):
-        sn.run(src, out, jobs=1, offeez=False)
+        sn.run(src, out, jobs=1, offeez="none")
 
 
 def test_solid_black_the_walk_cannot_reach_stops_the_run(tmp_path):
@@ -308,7 +308,7 @@ def test_solid_black_the_walk_cannot_reach_stops_the_run(tmp_path):
 
     with pytest.raises(sn.Leaked, match=r"\(1, 1\)"):
         sn.run(src, tmp_path / "enclosed-out.mbtiles",
-               jobs=1, offeez=False)
+               jobs=1, offeez="none")
 
 
 def test_every_level_below_the_deepest_is_dropped(tmp_path):
@@ -323,7 +323,7 @@ def test_every_level_below_the_deepest_is_dropped(tmp_path):
     build(src, LAYOUT)
     build(src, {(0, 0): "fill", (1, 0): "half-fill", (2, 0): "content"}, z=Z - 1)
     out = tmp_path / "pyramid-out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
 
     con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
     levels = [z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles")]
@@ -387,7 +387,7 @@ def test_water_inside_the_limit_survives_a_whole_run(tmp_path):
     layout |= {(x, 3): "blank" for x in range(3)}
     src = build(tmp_path / "limit.mbtiles", layout)
     out = tmp_path / "limit-out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=True)
+    sn.run(src, out, jobs=1, offeez="pixels")
 
     assert read(out, 1, 3) is None, "the blank past the limit was kept"
     a = read(out, 1, 2)
@@ -482,7 +482,7 @@ def test_a_diagonal_neighbour_pads_the_corner(tmp_path):
         (0, 1): "content", (1, 1): "content", (2, 1): "content",
     })
     out = tmp_path / "diag-out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
     edges = {}
     con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
     for (x, y) in [(0, 0)]:
@@ -550,7 +550,7 @@ def test_a_fill_wedge_too_thin_to_erode_is_still_removed(tmp_path):
         (0, 1): "fill",  (1, 1): "wedge-fill",  (2, 1): "content",
     })
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
     before, after = read(src, 1, 0), read(out, 1, 0)
     assert black_px(before) > 5000
     assert black_px(after) < black_px(before) * 0.15
@@ -565,7 +565,7 @@ def test_the_anti_aliased_edge_of_the_fill_goes_with_it(tmp_path):
         (0, 1): "fill",  (1, 1): "soft-fill",  (2, 1): "content",
     })
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
     # x=93 and x=94 hold the last two ramp steps, 90 and 160: paper, not fill
     boundary = read(out, 1, 0)[:, :93]
     assert dark_px(boundary) == 0
@@ -581,7 +581,7 @@ def test_type_on_a_straddling_tile_survives_the_flood(tmp_path):
         (0, 1): "fill",  (1, 1): "half-fill+type",  (2, 1): "content",
     })
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
     before, after = read(src, 1, 0), read(out, 1, 0)
     assert black_px(after[150:210, 140:200]) == black_px(before[150:210, 140:200])
     assert (after[:, :90, 3] == 0).all()          # and the fill did go
@@ -599,7 +599,7 @@ def test_a_stroke_abutting_the_fill_keeps_its_far_end(tmp_path):
         (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
     })
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez="none")
     after = read(out, 1, 0)
     kept = np.flatnonzero((after[101, :, :3].max(axis=1) == 0) & (after[101, :, 3] == 255))
     assert kept.max() == 229, "the far end of the line was followed"
@@ -619,7 +619,7 @@ def test_the_bleed_past_the_fill_is_adjustable(tmp_path, bleed):
         (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
     })
     out = tmp_path / f"bleed{bleed}-out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False, bleed=bleed)
+    sn.run(src, out, jobs=1, offeez="none", bleed=bleed)
     row = read(out, 1, 0)[200, :, 3]
     assert int((row == 0).sum()) == 90 + bleed
 
@@ -633,7 +633,7 @@ def test_a_bleed_of_zero_still_erases_the_fill_it_found(tmp_path):
         (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
     })
     out = tmp_path / "zero-out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False, bleed=0)
+    sn.run(src, out, jobs=1, offeez="none", bleed=0)
     a = read(out, 1, 0)
     assert (a[:, :90, 3] == 0).all()
     assert dark_px(a[:, :90]) == 0
@@ -644,9 +644,9 @@ def test_the_bleed_is_recorded_in_the_stamp(tmp_path):
     read as current when the recipe asks for another."""
     src = build(tmp_path / "stamp.mbtiles", LAYOUT)
     out = tmp_path / "stamp-out.mbtiles"
-    sn.run(src, out, jobs=1, offeez=False, bleed=4)
+    sn.run(src, out, jobs=1, offeez="none", bleed=4)
     con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
     stamp = con.execute("SELECT value FROM metadata WHERE name='nodata_stripped'").fetchone()[0]
     con.close()
-    assert stamp == sn.processing_stamp(sn.RADIUS, 4, offeez=False)
-    assert stamp != sn.processing_stamp(sn.RADIUS, 2, offeez=False)
+    assert stamp == sn.processing_stamp(sn.RADIUS, 4, offeez="none")
+    assert stamp != sn.processing_stamp(sn.RADIUS, 2, offeez="none")

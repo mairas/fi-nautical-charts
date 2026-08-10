@@ -70,16 +70,23 @@ WHITE_LUM = 250     # above this an opaque pixel counts as blank paper
 BATCH = 2000        # tiles held in memory at once
 
 
+# What to do about the blank past the outer limit. Two separate things, and
+# only one of them is risky: dropping a tile that is blank throughout cannot
+# touch chart, while trimming the blank on a tile the limit crosses is a pixel
+# flood that needs a drawn boundary to stop at. A layer whose sheets simply end
+# gets "tiles" and keeps its chart.
+OFFEEZ = {"none": "", "tiles": "+offeez-tiles", "pixels": "+offeez-pixel"}
+
+
 def processing_stamp(radius: int = RADIUS, bleed: int = BLEED, *,
-                     offeez: bool) -> str:
+                     offeez: str) -> str:
     """What a run with these settings records as nodata_stripped.
 
     Written into the file and read back by anything deciding whether a
     published chart was built by the current recipe, so the two must be one
     definition rather than two strings that agree until one of them changes.
     """
-    return (f"opaque-black-disk{radius}-b{bleed}-directed"
-            + ("+offeez-pixel" if offeez else ""))
+    return f"opaque-black-disk{radius}-b{bleed}-directed" + OFFEEZ[offeez]
 
 
 def tile_has_marks(blob):
@@ -557,7 +564,7 @@ def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool):
     return rewritten, dropped
 
 
-def run(src: Path, out: Path, jobs: int, offeez: bool, radius: int = RADIUS,
+def run(src: Path, out: Path, jobs: int, offeez: str, radius: int = RADIUS,
         bleed: int = BLEED) -> None:
     # built beside the target and moved into place at the end, so a run that
     # dies partway cannot leave a valid-looking partial chart where the good
@@ -590,7 +597,7 @@ def run(src: Path, out: Path, jobs: int, offeez: bool, radius: int = RADIUS,
                                         "black", radius, bleed, pool)
         print(f"  z{deep} rewrote {rewritten}, dropped {dropped}")
 
-        if offeez:
+        if offeez != "none":
             # classified from the black-stripped tiles, so removed fill cannot
             # pose as a marking and wall the flood out of its own region
             drops = flood_outside(*classify(con, deep))
@@ -601,11 +608,13 @@ def run(src: Path, out: Path, jobs: int, offeez: bool, radius: int = RADIUS,
             print(f"  z{deep} off-EEZ: {len(drops)} tiles dropped whole")
             dropped += len(drops)
 
+        if offeez == "pixels":
             # Dropping tiles can only take one that is blank throughout. Where
             # the limit crosses one, the blank half stays -- the same shape of
-            # leftover the fill used to leave, in the other colour. Those tiles
-            # are chart, so they get the same treatment: what runs in from the
-            # margin, and only that.
+            # leftover the fill used to leave, in the other colour. Trimming it
+            # is a pixel flood, and a flood needs a drawn boundary to stop at:
+            # where a sheet simply ends, the water inside is the same white as
+            # the blank outside and it takes both.
             marked, feat = classify(con, deep)
             # walk_outside, not flood_outside: the drop above has just deleted
             # the blank tiles, so what a boundary tile now faces is an empty
@@ -662,8 +671,13 @@ def main():
                         f"(default {RADIUS}); below half the width of a place name "
                         f"the type starts qualifying too")
     p.add_argument("--scan", action="store_true", help="report what would change, write nothing")
-    p.add_argument("--skip-offeez", action="store_true",
-                   help="leave the blank white beyond the chart limits in place")
+    p.add_argument("--offeez", choices=tuple(OFFEEZ), default="pixels",
+                   help="what to do about the blank beyond the chart limits: "
+                        "drop tiles that are blank throughout and trim the rest "
+                        "(pixels, the default), drop only whole blank tiles "
+                        "(tiles), or leave it alone (none). Trimming needs a "
+                        "drawn boundary to stop at; where a sheet simply ends it "
+                        "takes the water inside too")
     args = p.parse_args()
     if not args.input.exists():
         sys.exit(f"no such file: {args.input}")
@@ -671,7 +685,7 @@ def main():
         scan(args.input, args.jobs or None)
         return
     out = args.out or args.input.with_suffix(".stripped.mbtiles")
-    run(args.input, out, args.jobs or None, not args.skip_offeez, args.radius,
+    run(args.input, out, args.jobs or None, args.offeez, args.radius,
         args.bleed)
 
 
