@@ -70,14 +70,25 @@ PAGE = """<!doctype html><meta charset=utf-8><title>fi-nautical-charts</title>
  .note{color:#666;font-size:11px}
 </style><div id=map></div><script>
 const charts = __CHARTS__;
-const map = L.map('map', {center: __CENTER__, zoom: __ZOOM__, maxZoom: 20});
+// The floor is the shallowest level any of these files actually holds. Below
+// it Leaflet would keep asking for that level and scaling it down -- at z0 that
+// is the whole 32x32 grid at once, which queues six at a time and leaves the
+// map blank for minutes. There is nothing to see out there anyway.
+const floor = Math.min(...charts.map(c => c.minzoom));
+const map = L.map('map', {center: __CENTER__, zoom: __ZOOM__,
+                          minZoom: floor, maxZoom: 20});
 const overlays = {};
 charts.forEach((c, i) => {
-  const layer = L.tileLayer('/tiles/' + c.key + '/{z}/{x}/{y}', {
-    minZoom: 0, maxZoom: 20, maxNativeZoom: c.maxzoom, minNativeZoom: c.minzoom,
-    bounds: c.bounds ? [[c.bounds[1], c.bounds[0]], [c.bounds[3], c.bounds[2]]] : null,
-    tileSize: 256, opacity: 1, attribution: '&copy; Traficom. Not for navigation use.'
-  });
+  const opts = {
+    maxNativeZoom: c.maxzoom, minNativeZoom: c.minzoom, tileSize: 256,
+    keepBuffer: 2, updateWhenZooming: false,
+    attribution: '&copy; Traficom. Not for navigation use.'
+  };
+  if (c.bounds) {
+    opts.bounds = [[c.bounds[1], c.bounds[0]], [c.bounds[3], c.bounds[2]]];
+  }
+  const layer = L.tileLayer('/tiles/' + c.key + '/{z}/{x}/{y}', opts);
+  layer.on('tileerror', e => console.warn('tile failed', c.key, e.coords));
   overlays[c.label + ' <span class=note>' + c.note + '</span>'] = layer;
   if (i === 0) layer.addTo(map);
 });
