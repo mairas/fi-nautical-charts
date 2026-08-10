@@ -43,8 +43,8 @@ PUBLISHED_META = ARCHIVE_META | {
     "downscaled": "2026-08-09",
 }
 
-YLEIS = Layer("Yleiskartat 250k public")
-DEEPEST = Layer("Rannikkokartat public")
+YLEIS = Layer("Yleiskartat 250k public", fill=True, limit=True)
+DEEPEST = Layer("Rannikkokartat public", fill=True)
 ARCHIVE_NAME = "fi-yleiskartat250k-2026-06-02.mbtiles"
 
 
@@ -370,6 +370,55 @@ def test_strip_is_told_the_settings_the_recipe_predicts(archive, work, steps):
     assert cmd[cmd.index("--radius") + 1] in stamp
 
 
+def test_a_layer_with_nothing_to_strip_is_not_stripped(archive, work, steps):
+    """Satamakartat carries no off-sheet fill at all -- not one wholly-fill tile
+    in 3,000 sampled -- so the strip there can only take chart. Its archive goes
+    straight to downscale, and the result carries no strip stamp for anything
+    downstream to compare against."""
+    src = archive / ARCHIVE_NAME
+    plain = Layer("Satamakartat")
+    with pytest.raises(Failed):
+        pipeline.process(plain, src, work, jobs=1, baseline=100)
+    assert not [c for c, what in steps if what == "strip-nodata"], \
+        "a layer with nothing to remove was stripped anyway"
+    assert str(src) in only(steps, "downscale"), \
+        "downscale did not read the archive directly"
+    assert pipeline.recipe(plain, src)[0] is None
+
+
+def test_a_layer_without_a_drawn_boundary_skips_the_blank_pass(archive, work, steps):
+    """The blank pass needs more than blank to work on: it needs a boundary to
+    stop at. Where a sheet simply ends, the surveyed water inside is the same
+    white as the blank outside and the flood takes both -- 5.2M px of charted
+    water across 1,340 Satamakartat tiles when this was measured. Only
+    Yleiskartat draws a limit, so only Yleiskartat gets the pass."""
+    src = archive / ARCHIVE_NAME
+    coastal = Layer("Rannikkokartat public", fill=True)
+    with pytest.raises(Failed):
+        pipeline.process(coastal, src, work, jobs=1, baseline=100)
+    assert "--skip-offeez" in only(steps, "strip-nodata")
+    assert "offeez" not in pipeline.recipe(coastal, src)[0]
+    assert "offeez" in pipeline.recipe(YLEIS, src)[0], \
+        "the layer that does draw a limit lost the pass too"
+
+
+def test_the_layer_table_matches_the_census_it_was_set_from():
+    """The two tests above pin the mechanism; this pins the table, which is the
+    part that decides what actually happens to a chart.
+
+    From a 3,000-tile sample of each archive's deepest level, share of tiles
+    that are nothing but off-sheet fill: Yleiskartat 8.90%, Rannikkokartat
+    1.77%, Merikarttasarjat 0.27%, Satamakartat 0.00%. Only Yleiskartat draws a
+    boundary the blank pass can stop at."""
+    by_name = {l.wmts: l for l in pipeline.LAYERS}
+    assert not by_name["Satamakartat"].fill, \
+        "Satamakartat has nothing to strip; stripping it can only take chart"
+    assert [n for n, l in by_name.items() if l.limit] == ["Yleiskartat 250k public"], \
+        "the blank pass reached a layer whose sheets end without a drawn boundary"
+    assert all(l.fill for n, l in by_name.items() if l.limit), \
+        "a layer asks for the blank pass without the fill pass that precedes it"
+
+
 def test_a_step_that_exits_non_zero_stops_the_layer():
     with pytest.raises(Failed, match="exited 3"):
         pipeline.run_step([sys.executable, "-c", "raise SystemExit(3)"], "downscale")
@@ -587,11 +636,18 @@ def test_one_failing_layer_does_not_stop_the_others(cli, monkeypatch, archive, d
                 raise Failed("strip-nodata exited 1")
             make_mbtiles(Path(cmd[cmd.index("--out") + 1]), PUBLISHED_META)
         if what == "downscale":
+            # Satamakartat is not stripped, so downscale reads the archive and
+            # the result carries no strip stamp
+            stripped = ".stripped." in cmd[3]
+            if not stripped:
+                attempted.append(cmd[3])
             zoom = cmd[cmd.index("--source-zoom") + 1]
-            make_mbtiles(Path(cmd[cmd.index("--out") + 1]),
-                         PUBLISHED_META | {"wmts_layer": "Satamakartat",
-                                           "source_updated": "2026-06-29",
-                                           "downscale_source_zoom": zoom})
+            m = PUBLISHED_META | {"wmts_layer": "Satamakartat",
+                                  "source_updated": "2026-06-29",
+                                  "downscale_source_zoom": zoom}
+            if not stripped:
+                m.pop("nodata_stripped", None)
+            make_mbtiles(Path(cmd[cmd.index("--out") + 1]), m)
         if what == "publish":
             published_cmd.append(cmd)
 

@@ -44,17 +44,28 @@ REPO = Path(__file__).resolve().parent
 @dataclass(frozen=True)
 class Layer:
     wmts: str
+    fill: bool = False    # renders off-sheet as opaque black worth removing
+    limit: bool = False   # ... and draws a boundary the removal can stop at
 
 
-# Every layer downscales from the deepest level it has, and there is nothing to
-# choose: strip_nodata cleans that level and deletes the rest, so a shallower
-# source would find no tiles to build from. Yleiskartat's z13 is Traficom's own
-# 2x of z12 and would once have been worth skipping past, but halving an upscale
-# gives its parent back -- measured at 1.9% of pixels moving, all on the edges of
-# strokes -- so nothing is lost by going through it.
-LAYERS = [Layer("Yleiskartat 250k public"),
-          Layer("Rannikkokartat public"),
-          Layer("Merikarttasarjat public"),
+# Which layer gets which pass, from a census of the deepest level of each
+# archive (3,000 tiles sampled): share of tiles that are nothing but off-sheet
+# fill, and share blank white throughout.
+#
+#   Yleiskartat     8.90%   17.00%
+#   Rannikkokartat  1.77%    3.37%
+#   Merikarttasarjat 0.27%    0.87%
+#   Satamakartat    0.00%    0.20%
+#
+# Satamakartat has nothing to remove -- not one wholly-fill tile in 3,000 -- so
+# the strip there is all risk and no gain. The blank pass needs more than blank:
+# it needs a drawn boundary to stop at, and only Yleiskartat has one. Where a
+# sheet simply ends, the surveyed water inside is the same white as the blank
+# outside and the flood takes both; on Satamakartat that came to 5.2M pixels of
+# charted water across 1,340 tiles.
+LAYERS = [Layer("Yleiskartat 250k public", fill=True, limit=True),
+          Layer("Rannikkokartat public", fill=True),
+          Layer("Merikarttasarjat public", fill=True),
           Layer("Satamakartat")]
 
 # Least of the archive's tiles a processed set may keep, measured against the
@@ -258,18 +269,23 @@ def refresh(path: Path, work: Path) -> dict[str, int]:
     return counts
 
 
-def recipe(layer: Layer, archive: Path) -> tuple[str, int]:
+def recipe(layer: Layer, archive: Path) -> tuple[str | None, int]:
     """The strip stamp and downscale source zoom this build would produce.
 
     One answer used twice: `process` passes the zoom to downscale and `why_run`
     compares both against what is published. Predicting one thing and doing
     another is how a layer ends up rebuilding every month without converging.
+
+    A stamp of None means this layer is not stripped, and a published set for it
+    should carry none either.
     """
     zoom = max_zoom(archive)
     if zoom is None:
         raise Failed(f"{archive.name} holds no tiles, so there is no level to "
                      f"downscale from")
-    return processing_stamp(RADIUS, BLEED, offeez=True), zoom
+    if not layer.fill:
+        return None, zoom
+    return processing_stamp(RADIUS, BLEED, offeez=layer.limit), zoom
 
 
 def published(dest: Path, prefix: str) -> Path | None:
@@ -314,12 +330,18 @@ def process(layer: Layer, archive: Path, work: Path, jobs: int,
     to publish. Both steps read the archive read-only and write into `work`."""
     stripped = work / f"{archive.stem}.stripped.mbtiles"
     out = work / f"{archive.stem}.processed.mbtiles"
-    _, zoom = recipe(layer, archive)
+    stamp, zoom = recipe(layer, archive)
 
-    run_step(uv("strip_nodata.py", str(archive), "--out", str(stripped),
-                "--radius", str(RADIUS), "--bleed", str(BLEED),
-                "--jobs", str(jobs)), "strip-nodata")
-    run_step(uv("downscale.py", str(stripped), "--out", str(out),
+    source = archive
+    if stamp is not None:
+        strip = ["strip_nodata.py", str(archive), "--out", str(stripped),
+                 "--radius", str(RADIUS), "--bleed", str(BLEED),
+                 "--jobs", str(jobs)]
+        if not layer.limit:
+            strip.append("--skip-offeez")
+        run_step(uv(*strip), "strip-nodata")
+        source = stripped
+    run_step(uv("downscale.py", str(source), "--out", str(out),
                 "--source-zoom", str(zoom), "--jobs", str(jobs)), "downscale")
     stripped.unlink(missing_ok=True)
 
@@ -347,10 +369,13 @@ def verify(layer: Layer, archive: Path, out: Path, baseline: int) -> None:
         raise Failed(f"processing kept {after:,} of the {baseline:,} tiles this "
                      f"layer had before the run; that is too much loss to publish "
                      f"without someone looking at it")
-    for key in ("source_updated", "wmts_layer", "nodata_stripped", "downscale_filter"):
+    want_strip, want_zoom = recipe(layer, archive)
+    required = ["source_updated", "wmts_layer", "downscale_filter"]
+    if want_strip is not None:
+        required.append("nodata_stripped")
+    for key in required:
         if not m.get(key):
             raise Failed(f"processed file records no {key}")
-    want_strip, want_zoom = recipe(layer, archive)
     if m.get("nodata_stripped") != want_strip:
         raise Failed(f"built file records strip {m.get('nodata_stripped')!r} but this "
                      f"build asked for {want_strip!r}")
