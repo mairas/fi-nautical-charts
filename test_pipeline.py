@@ -25,7 +25,7 @@ from pipeline import Failed, Layer
 # from processing_stamp: the stamp is what tells a published chart apart from
 # one built by an older recipe, so a test that recomputes it would follow the
 # code and never notice the change that makes every published set look stale.
-LIVE_STAMP = "opaque-black-disk64-b2+offeez-pixel"
+LIVE_STAMP = "opaque-black-disk64-b2-directed+offeez-pixel"
 
 ARCHIVE_META = {
     "wmts_layer": "Yleiskartat 250k public",
