@@ -393,23 +393,24 @@ def test_water_inside_the_limit_survives_a_whole_run(tmp_path):
         "the open water a row further in was touched at all"
 
 
-def test_the_flood_does_not_round_a_corner_through_a_neighbour(tmp_path):
-    """The tile is split by a line running its full width, so on its own ground
-    there is no way from the outside to the chart side. The neighbours to east,
-    west and north are open water, and open water is qualifying white -- so a
-    flood allowed to cross them goes round the outside of the tile and comes
-    back in over the top. It arrives where it could not have walked, and stops
-    dead at the tile edge, because the neighbour deciding the same ground for
-    itself never crosses back."""
-    a = np.asarray(Image.open(io.BytesIO(tile("limit"))).convert("RGBA"))
-    R = sn.RADIUS
-    pad = {"b": None, "lb": None, "rb": None,
-           "l": np.ones((256, R), bool), "r": np.ones((256, R), bool),
-           "t": np.ones((R, 256), bool),
-           "lt": np.ones((R, R), bool), "rt": np.ones((R, R), bool)}
-    m = sn.nodata_mask(a, pad, kind="white", outward=frozenset({"b", "lb", "rb"}))
-    assert m[131 + sn.BLEED:, :].all(), "the blank past the limit stayed"
-    assert not m[:128 - sn.BLEED, :].any(), "the flood came back over the top"
+def test_a_blank_neighbour_is_named_outward_rather_than_left_to_the_pixels():
+    """Why the flood is free to travel through the margin.
+
+    What would let it round a corner into the chart is a neighbour that is blank
+    throughout and yet not outward: the flood would cross it, come back in over
+    the far side, and erase ground it could not have walked to. The tile grid
+    does not produce one. Blank throughout is what featureless means, the walk
+    crosses featureless cells, so the side is named outward -- and a flood
+    entering from it is entering where the outside actually is.
+
+    Barring those margins instead is what leaves peaks standing wherever the
+    boundary runs diagonally, since a tile whose only outward side is a corner
+    cannot then reach the rest of its own outside."""
+    marked = {(1, 1), (1, 2), (2, 1), (2, 2)}
+    feat = {(1, 0)}
+    reached = sn.walk_outside(marked, feat)
+    assert (1, 0) in reached, "the walk did not cross a featureless cell"
+    assert "t" in sn.facing(marked, reached)[(1, 1)]
 
 
 def test_a_band_too_thin_to_hold_a_core_is_still_reached(tmp_path):

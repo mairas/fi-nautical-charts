@@ -206,22 +206,19 @@ seeded from the whole margin one such tile empties both — 566 tiles at z13, so
 of them see-through end to end, reported as a rectangle of basemap showing
 through open water south of Helsinki.
 
-For the white pass the margin is also there to be **measured rather than
-crossed**: the flood may occupy the tile and the margins the outside lies past,
-and nothing else. The other margins are a neighbour's chart, and a flood that
-rounds a corner through them arrives somewhere it could not have walked over its
-own ground — then stops dead at the tile edge, because the neighbour deciding
-the same ground for itself never crosses back. That is what a hard straight step
-in the boundary is: two tiles disagreeing about the strip they share.
+Once seeded there, the flood travels through the margin freely. Barring it —
+letting it occupy the tile and the outward margins only — was tried, and it
+leaves a row of peaks wherever the boundary runs diagonally across the grid: a
+tile whose only outward side is a corner cannot then reach the rest of its own
+outside without crossing a neighbour. What that barring was for is handled by
+the radius and by padding an outward neighbour on the walk's word; with both in
+place it blocks nothing and costs 295k px of blank left standing. Seams: 501
+disagreeing over 1,925px with the flood free, against 642 over 12,706px with it
+barred.
 
-It is not confined to the tile, and it is not confined at all on the black pass.
-Both are measurements rather than deductions. Held to the tile alone, a fill band
-a few pixels wide loses its only seed — every core pixel of it is in the margin
-the absent neighbour fills. Confined on the black pass, 50k px of fill stay on
-the water across 176 tiles, because a sheet edge runs along many *chart* tiles
-and parts of the fill are reachable only through one; the blank past the limit
-never needs that route. Confining the white pass alone saves 31k px of chart the
-free flood was erasing and leaves 5k px of black specks.
+The case that would justify barring it is a neighbour blank throughout and yet
+not outward, which the grid does not produce: blank throughout is what
+featureless means, and the walk crosses featureless cells.
 
 **Only the deepest zoom is examined**, and every level below it is deleted for
 `downscale` to rebuild. Each of those levels is a separate rendering of the same
@@ -560,7 +557,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-disk128-b2-directed-confined+offeez-pixel; box-2x-premultiplied from z15 on 2026-08-09",
+      "processing": "opaque-black-disk128-b2-directed+offeez-pixel; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]
