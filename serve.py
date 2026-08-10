@@ -106,6 +106,9 @@ function show(e) {
     + '  z' + map.getZoom().toFixed(1);
 }
 map.on('mousemove', show);
+// reachable from the console and from a driver: the map is script-scoped,
+// so without this there is no handle to check a zoom problem against
+window.__map = map; window.__overlays = overlays;
 </script>"""
 
 
