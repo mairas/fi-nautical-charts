@@ -66,7 +66,6 @@ RADIUS = 128        # a fill pixel is dark for this far in every direction.
 DARK = 40           # the transition is one pixel; this catches it
 BLEED = 2           # pixels erased past the fill, over the chart's own edge
 TILE = 256
-WHITE_LUM = 250     # above this an opaque pixel counts as blank paper
 BATCH = 2000        # tiles held in memory at once
 
 
@@ -86,7 +85,21 @@ def processing_stamp(radius: int = RADIUS, bleed: int = BLEED, *,
     published chart was built by the current recipe, so the two must be one
     definition rather than two strings that agree until one of them changes.
     """
-    return f"opaque-black-disk{radius}-b{bleed}-directed" + OFFEEZ[offeez]
+    return (f"opaque-black-disk{radius}-b{bleed}-directed-purewhite"
+            + OFFEEZ[offeez])
+
+
+def blank(a: np.ndarray) -> np.ndarray:
+    """Pure paper, and nothing else.
+
+    Only 255,255,255 counts as no data. Every other value is something the
+    cartographer drew -- the anti-aliased skirt of a sounding, the pale tint at
+    the edge of a depth area, a hairline at less than full contrast. Judging by
+    a threshold instead put all of that on the no-data side of the line, and the
+    flood then treats a figure's own soft edge as more of the blank it is
+    standing in.
+    """
+    return ((a[..., 0] == 255) & (a[..., 1] == 255) & (a[..., 2] == 255))
 
 
 def tile_has_marks(blob):
@@ -96,7 +109,7 @@ def tile_has_marks(blob):
     op = a[..., 3] == 255
     if not op.any():
         return False
-    return bool((op & (a[..., :3].mean(axis=2) <= WHITE_LUM)).any())
+    return bool((op & ~blank(a)).any())
 
 
 def classify(con, z):
@@ -164,7 +177,7 @@ def _survey(task):
     a = np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA"))
     opaque = a[..., 3] == 255
     black = opaque & (a[..., :3].max(axis=2) == 0)
-    other = opaque & (a[..., :3].mean(axis=2) <= WHITE_LUM) & ~black
+    other = opaque & ~blank(a) & ~black
     n = int(opaque.sum())
     return x, row, int(black.sum()), int(other.sum()), n
 
@@ -208,8 +221,7 @@ def vacant(a: np.ndarray) -> np.ndarray:
     limit it draws nothing rather than black, so the same question -- what runs
     in from outside -- has a second answer in a second colour.
     """
-    return (((a[..., 3] == 255) & (a[..., :3].mean(axis=2) > WHITE_LUM))
-            | (a[..., 3] == 0))
+    return ((a[..., 3] == 255) & blank(a)) | (a[..., 3] == 0)
 
 
 PREDICATE = {"black": fillable, "white": vacant}
@@ -344,7 +356,7 @@ def wholly_offsheet(a: np.ndarray) -> bool:
     if not n:
         return False
     black = opaque & (a[..., :3].max(axis=2) == 0)
-    other = opaque & (a[..., :3].mean(axis=2) <= WHITE_LUM) & ~black
+    other = opaque & ~blank(a) & ~black
     return (int(black.sum()) >= MIN_FILL and int(other.sum()) <= MIN_FILL
             and int(black.sum()) / n >= FILL_FRACTION)
 
