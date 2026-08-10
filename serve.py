@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sqlite3
 import sys
 import threading
@@ -42,9 +43,40 @@ class Chart:
         self.bounds = [float(v) for v in m["bounds"].split(",")] if "bounds" in m else None
         levels = self.con().execute(
             "SELECT COUNT(DISTINCT zoom_level), COUNT(*) FROM tiles").fetchone()
+        self.centre = self._centre()
         self.note = (f"{levels[0]} levels, {levels[1]:,} tiles, "
                      f"z{self.minzoom}-{self.maxzoom}, "
                      f"{m.get('nodata_stripped', 'unstripped')}")
+
+    def _centre(self) -> list[float] | None:
+        """Where this chart actually has tiles, in lat/lon.
+
+        Not the declared bounds: those describe the extent that was asked for,
+        and for a coastal chart their centre is inland, where the file holds
+        nothing at any zoom. Opening there shows an empty map and a screenful of
+        404s that look like a fault.
+        """
+        levels = self.con().execute(
+            "SELECT zoom_level, COUNT(*) FROM tiles GROUP BY zoom_level "
+            "ORDER BY zoom_level").fetchall()
+        pick = next((z for z, n in levels if n >= 16), levels[-1][0] if levels else None)
+        if pick is None:
+            return None
+        tiles = self.con().execute(
+            "SELECT tile_column, tile_row FROM tiles WHERE zoom_level=?",
+            (pick,)).fetchall()
+        if not tiles:
+            return None
+        # the tile nearest the middle of them, not the middle itself: this
+        # coastline is an L around the Gulfs, and its mean is inland
+        mx = sum(t[0] for t in tiles) / len(tiles)
+        my = sum(t[1] for t in tiles) / len(tiles)
+        col, row_tms = min(tiles, key=lambda t: (t[0] - mx) ** 2 + (t[1] - my) ** 2)
+        n = 1 << pick
+        lon = (col + 0.5) / n * 360 - 180
+        y = n - row_tms - 0.5          # TMS rows count from the bottom
+        lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+        return [lat, lon]
 
     def con(self) -> sqlite3.Connection:
         # one connection per thread: sqlite objects are not shared across them,
@@ -116,12 +148,8 @@ def build_page(charts: list[Chart], backdrop: str) -> bytes:
     meta = [{"key": c.key, "label": c.label, "note": c.note,
              "minzoom": c.minzoom, "maxzoom": c.maxzoom, "bounds": c.bounds}
             for c in charts]
-    withbounds = [c for c in charts if c.bounds]
-    if withbounds:
-        b = withbounds[0].bounds
-        centre = [(b[1] + b[3]) / 2, (b[0] + b[2]) / 2]
-    else:
-        centre = [60.2, 24.9]
+    located = [c for c in charts if c.centre]
+    centre = located[0].centre if located else [60.2, 24.9]
     page = (PAGE.replace("__CHARTS__", json.dumps(meta))
                 .replace("__CENTER__", json.dumps(centre))
                 .replace("__ZOOM__", str(max(charts[0].minzoom, 8)))
@@ -160,6 +188,14 @@ def serve(paths: list[Path], port: int, backdrop: str, open_browser: bool) -> No
         print(f"  {c.label}  ({c.note})")
 
     class Handler(BaseHTTPRequestHandler):
+        # Keep-alive. The default is HTTP/1.0, which closes the socket after
+        # every response, while the browser holds six open and reuses them --
+        # so under a fast zoom it puts the next tile request on a socket the
+        # server is already closing and the tile dies with ERR_CONNECTION_RESET
+        # or ERR_SOCKET_NOT_CONNECTED. Every response here carries a
+        # Content-Length, which is what 1.1 requires to reuse the connection.
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *a):
             pass
 
@@ -175,6 +211,8 @@ def serve(paths: list[Path], port: int, backdrop: str, open_browser: bool) -> No
             parts = self.path.split("?")[0].strip("/").split("/")
             if parts == [""]:
                 return self.send(200, page, "text/html; charset=utf-8")
+            if parts == ["favicon.ico"]:
+                return self.send(204)
             if len(parts) == 5 and parts[0] == "tiles":
                 _, key, z, x, y = parts
                 chart = by_key.get(key)
@@ -193,8 +231,10 @@ def serve(paths: list[Path], port: int, backdrop: str, open_browser: bool) -> No
     print(f"\nserving {len(charts)} chart(s) at {url}   (ctrl-c to stop)")
     if open_browser:
         threading.Timer(0.5, webbrowser.open, (url,)).start()
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv.daemon_threads = True
     try:
-        ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+        srv.serve_forever()
     except KeyboardInterrupt:
         print("\nstopped")
 
