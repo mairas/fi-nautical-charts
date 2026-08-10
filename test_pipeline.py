@@ -21,11 +21,11 @@ import pipeline
 import strip_nodata
 from pipeline import Failed, Layer
 
-# The literal string published charts carry. Spelled out rather than derived
-# from processing_stamp: this is a value already written into files on disk, so
-# a test that recomputes it would follow the code and never notice the change
-# that makes every published set look stale.
-LIVE_STAMP = "opaque-black-r4-edge+offeez-tilelevel"
+# The literal string the current recipe writes. Spelled out rather than derived
+# from processing_stamp: the stamp is what tells a published chart apart from
+# one built by an older recipe, so a test that recomputes it would follow the
+# code and never notice the change that makes every published set look stale.
+LIVE_STAMP = "opaque-black-disk10-b2+offeez-tilelevel"
 
 ARCHIVE_META = {
     "wmts_layer": "Yleiskartat 250k public",
@@ -154,7 +154,7 @@ def test_a_changed_strip_recipe_triggers_a_rebuild(archive, dest):
     live = dest / ARCHIVE_NAME
     live.unlink()
     make_mbtiles(live, PUBLISHED_META | {"nodata_stripped": "opaque-black-r4"})
-    assert "opaque-black-r4-edge" in pipeline.why_run(
+    assert LIVE_STAMP in pipeline.why_run(
         YLEIS, archive / ARCHIVE_NAME, dest, force=False)
 
 
@@ -356,12 +356,18 @@ def test_an_unpinned_layer_is_told_the_deepest_level_too(archive, work, steps):
     assert cmd[cmd.index("--source-zoom") + 1] == "13"
 
 
-def test_strip_is_told_the_radius_the_recipe_predicts(archive, work, steps):
+def test_strip_is_told_the_settings_the_recipe_predicts(archive, work, steps):
+    """Both are in the stamp, so a run that used different ones from those
+    why_run compares against would rebuild this layer every month."""
     src = archive / ARCHIVE_NAME
     with pytest.raises(Failed):
         pipeline.process(YLEIS, src, work, jobs=1, baseline=100)
     cmd = only(steps, "strip-nodata")
-    assert cmd[cmd.index("--radius") + 1] == str(strip_nodata.RADIUS)
+    assert str(src) in cmd
+    assert Path(cmd[cmd.index("--out") + 1]).parent == work
+    stamp = pipeline.recipe(YLEIS, src)[0]
+    assert cmd[cmd.index("--bleed") + 1] in stamp
+    assert cmd[cmd.index("--radius") + 1] in stamp
 
 
 def test_a_step_that_exits_non_zero_stops_the_layer():

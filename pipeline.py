@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from publish import NAME, Unpublishable, layer_prefix
-from strip_nodata import RADIUS, processing_stamp
+from strip_nodata import BLEED, RADIUS, processing_stamp
 
 REPO = Path(__file__).resolve().parent
 
@@ -270,7 +270,7 @@ def recipe(layer: Layer, archive: Path) -> tuple[str, int]:
     if zoom is None:
         raise Failed(f"{archive.name} holds no tiles, so there is no level to "
                      f"downscale from")
-    return processing_stamp(RADIUS, offeez=True), zoom
+    return processing_stamp(RADIUS, BLEED, offeez=True), zoom
 
 
 def published(dest: Path, prefix: str) -> Path | None:
@@ -318,7 +318,8 @@ def process(layer: Layer, archive: Path, work: Path, jobs: int,
     _, zoom = recipe(layer, archive)
 
     run_step(uv("strip_nodata.py", str(archive), "--out", str(stripped),
-                "--radius", str(RADIUS), "--jobs", str(jobs)), "strip-nodata")
+                "--radius", str(RADIUS), "--bleed", str(BLEED),
+                "--jobs", str(jobs)), "strip-nodata")
     run_step(uv("downscale.py", str(stripped), "--out", str(out),
                 "--source-zoom", str(zoom), "--jobs", str(jobs)), "downscale")
     stripped.unlink(missing_ok=True)
