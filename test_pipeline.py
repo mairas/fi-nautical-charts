@@ -25,7 +25,7 @@ from pipeline import Failed, Layer
 # from processing_stamp: the stamp is what tells a published chart apart from
 # one built by an older recipe, so a test that recomputes it would follow the
 # code and never notice the change that makes every published set look stale.
-LIVE_STAMP = "opaque-black-disk10-b2+offeez-tilelevel"
+LIVE_STAMP = "opaque-black-disk64-b2+offeez-pixel"
 
 ARCHIVE_META = {
     "wmts_layer": "Yleiskartat 250k public",
@@ -38,13 +38,13 @@ ARCHIVE_META = {
 # what the archive above becomes once this build processes and publishes it
 PUBLISHED_META = ARCHIVE_META | {
     "nodata_stripped": LIVE_STAMP,
-    "downscale_source_zoom": "12",
+    "downscale_source_zoom": "13",
     "downscale_filter": "box-2x-premultiplied",
     "downscaled": "2026-08-09",
 }
 
-YLEIS = Layer("Yleiskartat 250k public", 12)
-DEEPEST = Layer("Rannikkokartat public", None)
+YLEIS = Layer("Yleiskartat 250k public")
+DEEPEST = Layer("Rannikkokartat public")
 ARCHIVE_NAME = "fi-yleiskartat250k-2026-06-02.mbtiles"
 
 
@@ -161,9 +161,9 @@ def test_a_changed_strip_recipe_triggers_a_rebuild(archive, dest):
 def test_a_changed_source_zoom_triggers_a_rebuild(archive, dest):
     live = dest / ARCHIVE_NAME
     live.unlink()
-    make_mbtiles(live, PUBLISHED_META | {"downscale_source_zoom": "13"})
+    make_mbtiles(live, PUBLISHED_META | {"downscale_source_zoom": "12"})
     why = pipeline.why_run(YLEIS, archive / ARCHIVE_NAME, dest, force=False)
-    assert "z13" in why and "z12" in why
+    assert "z12" in why and "z13" in why
 
 
 def test_a_set_that_was_never_downscaled_says_so(archive, dest):
@@ -241,12 +241,12 @@ def test_an_unreadable_revision_reads_as_never_built(archive, dest):
 
 # --- the recipe a layer would be built with ----------------------------------
 
-def test_a_pinned_source_zoom_wins_over_the_deepest_level(archive):
-    assert pipeline.recipe(YLEIS, archive / ARCHIVE_NAME)[1] == 12
-
-
-def test_an_unpinned_layer_downscales_from_the_deepest_level(archive):
-    assert pipeline.recipe(DEEPEST, archive / ARCHIVE_NAME)[1] == 13
+def test_every_layer_downscales_from_the_deepest_level(archive):
+    """There is no shallower source to choose: strip_nodata cleans the deepest
+    level and deletes the rest, so downscaling from anything above it would find
+    no tiles to build from."""
+    for layer in (YLEIS, DEEPEST):
+        assert pipeline.recipe(layer, archive / ARCHIVE_NAME)[1] == 13
 
 
 def test_the_deepest_level_is_read_from_the_tiles_not_the_metadata(tmp_path):
@@ -305,7 +305,7 @@ def test_a_build_that_downscaled_from_the_wrong_level_is_refused(tmp_path, archi
     """Publishing it would leave the published zoom disagreeing with the recipe,
     so the layer would rebuild every month and never converge."""
     out = make_mbtiles(tmp_path / "out.mbtiles",
-                       PUBLISHED_META | {"downscale_source_zoom": "13"}, tiles=100)
+                       PUBLISHED_META | {"downscale_source_zoom": "12"}, tiles=100)
     with pytest.raises(Failed, match="rebuild this layer again"):
         pipeline.verify(YLEIS, archive / ARCHIVE_NAME, out, baseline=100)
 

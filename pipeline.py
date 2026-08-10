@@ -44,17 +44,18 @@ REPO = Path(__file__).resolve().parent
 @dataclass(frozen=True)
 class Layer:
     wmts: str
-    source_zoom: int | None   # None: downscale from the deepest level present
 
 
-# source_zoom is where a layer's genuine detail stops, which is not always the
-# deepest level served. Yleiskartat's z13 is Traficom's own 2x of z12, and
-# downscaling from it reproduces those artefacts all the way down -- place
-# names come out broken at z10. `./run native-zoom` settles a new layer.
-LAYERS = [Layer("Yleiskartat 250k public", 12),
-          Layer("Rannikkokartat public", None),
-          Layer("Merikarttasarjat public", None),
-          Layer("Satamakartat", None)]
+# Every layer downscales from the deepest level it has, and there is nothing to
+# choose: strip_nodata cleans that level and deletes the rest, so a shallower
+# source would find no tiles to build from. Yleiskartat's z13 is Traficom's own
+# 2x of z12 and would once have been worth skipping past, but halving an upscale
+# gives its parent back -- measured at 1.9% of pixels moving, all on the edges of
+# strokes -- so nothing is lost by going through it.
+LAYERS = [Layer("Yleiskartat 250k public"),
+          Layer("Rannikkokartat public"),
+          Layer("Merikarttasarjat public"),
+          Layer("Satamakartat")]
 
 # Least of the archive's tiles a processed set may keep, measured against the
 # archive as it stood before this run touched it. Off-EEZ removal is the heavy
@@ -264,9 +265,7 @@ def recipe(layer: Layer, archive: Path) -> tuple[str, int]:
     compares both against what is published. Predicting one thing and doing
     another is how a layer ends up rebuilding every month without converging.
     """
-    zoom = layer.source_zoom
-    if zoom is None:
-        zoom = max_zoom(archive)
+    zoom = max_zoom(archive)
     if zoom is None:
         raise Failed(f"{archive.name} holds no tiles, so there is no level to "
                      f"downscale from")
