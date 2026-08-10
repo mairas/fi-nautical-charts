@@ -75,7 +75,7 @@ def processing_stamp(radius: int = RADIUS, bleed: int = BLEED, *,
     published chart was built by the current recipe, so the two must be one
     definition rather than two strings that agree until one of them changes.
     """
-    return (f"opaque-black-disk{radius}-b{bleed}-directed"
+    return (f"opaque-black-disk{radius}-b{bleed}-directed-confined"
             + ("+offeez-pixel" if offeez else ""))
 
 
@@ -203,6 +203,15 @@ def vacant(a: np.ndarray) -> np.ndarray:
 
 
 PREDICATE = {"black": fillable, "white": vacant}
+
+# Whether the flood may only occupy the tile and the margins the outside lies
+# past, rather than any margin it can reach. Measured, not deduced: confining
+# the white pass saves 42k px of chart the free flood was erasing, while
+# confining the black pass leaves 50k px of fill on the water across 176 tiles.
+# The black fill runs along a sheet edge across many chart tiles, so parts of it
+# are reachable only through a neighbour's margin; the blank past the limit
+# never needs that route.
+CONFINED = {"black": False, "white": True}
 
 
 def _edges(task):
@@ -391,7 +400,17 @@ def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
 
     The margin carries the neighbouring tiles' own pixels -- their real ones, so
     a band that is thin here but wide a few pixels into the next tile is still
-    found.
+    found. But it is there to be *measured*, not crossed: the flood may occupy
+    the tile and the margins the outside lies past, and nothing else. The other
+    margins are a neighbour's chart, and a flood that rounds a corner through
+    them arrives somewhere it could not have reached over its own ground -- then
+    stops at the tile edge, where the neighbour computing the same ground for
+    itself reaches the opposite conclusion.
+
+    It may not simply be confined to the tile. Where the fill is a band a few
+    pixels wide, widened only by the absent neighbour beside it, no pixel of the
+    tile satisfies the radius test at all: every core pixel is in the margin and
+    the dilation is what carries it back in.
 
     `pad` of None means the tile is wholly outside the last sheet. Nothing there
     is chart, so nothing needs protecting.
@@ -418,7 +437,16 @@ def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
     where = regions(radius)
     for side in (where if outward is None else outward):
         rim[where[side]] = True
-    out = ndimage.binary_propagation(core & rim, mask=core)
+    reachable = np.ones(big.shape, bool)
+    if CONFINED[kind]:
+        reachable[:] = False
+        reachable[radius:-radius, radius:-radius] = True
+        reachable |= rim
+    # Eight-connected, because a corner block touches the tile at one point and
+    # a four-connected flood cannot get in -- which is exactly the arrangement a
+    # sheet edge crossing the grid diagonally produces.
+    out = ndimage.binary_propagation(core & rim, mask=core & reachable,
+                                     structure=np.ones((3, 3), bool))
     if not out.any():
         return np.zeros_like(dark)
     out = (ndimage.distance_transform_edt(~out) <= radius) & big

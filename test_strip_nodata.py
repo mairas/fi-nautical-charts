@@ -386,6 +386,46 @@ def test_water_inside_the_limit_survives_a_whole_run(tmp_path):
         "the open water a row further in was touched at all"
 
 
+def test_the_flood_does_not_round_a_corner_through_a_neighbour(tmp_path):
+    """The tile is split by a line running its full width, so on its own ground
+    there is no way from the outside to the chart side. The neighbours to east,
+    west and north are open water, and open water is qualifying white -- so a
+    flood allowed to cross them goes round the outside of the tile and comes
+    back in over the top. It arrives where it could not have walked, and stops
+    dead at the tile edge, because the neighbour deciding the same ground for
+    itself never crosses back."""
+    a = np.asarray(Image.open(io.BytesIO(tile("limit"))).convert("RGBA"))
+    R = sn.RADIUS
+    pad = {"b": None, "lb": None, "rb": None,
+           "l": np.ones((256, R), bool), "r": np.ones((256, R), bool),
+           "t": np.ones((R, 256), bool),
+           "lt": np.ones((R, R), bool), "rt": np.ones((R, R), bool)}
+    m = sn.nodata_mask(a, pad, kind="white", outward=frozenset({"b", "lb", "rb"}))
+    assert m[131 + sn.BLEED:, :].all(), "the blank past the limit stayed"
+    assert not m[:128 - sn.BLEED, :].any(), "the flood came back over the top"
+
+
+def test_a_band_too_thin_to_hold_a_core_is_still_reached(tmp_path):
+    """The other half of the same rule, and why the confined flood is let into
+    the outward margins rather than held to the tile. This band is 8px wide on
+    the tile's own ground; no pixel of it is blank for a radius in every
+    direction. Every core pixel is in the margin the absent neighbour fills, so
+    a flood held to the tile finds no seed at all and the band ships."""
+    a = np.zeros((256, 256, 4), np.uint8)
+    a[:, :] = PAPER
+    a[:, :8] = (255, 255, 255, 255)
+    R = sn.RADIUS
+    pad = {"l": None, "lt": None, "lb": None,
+           "r": np.zeros((256, R), bool), "t": np.zeros((R, 256), bool),
+           "b": np.zeros((R, 256), bool),
+           "rt": np.zeros((R, R), bool), "rb": np.zeros((R, R), bool)}
+    m = sn.nodata_mask(a, pad, kind="white",
+                       outward=frozenset({"l", "lt", "lb"}))
+    # away from the ends, where the paper above and below closes in on it
+    assert m[sn.RADIUS:-sn.RADIUS, :8].all(), \
+        f"the band survived ({int(m[:, :8].sum())} of 2048 px)"
+
+
 def test_a_tile_whose_whole_neighbourhood_is_fill_is_erased(tmp_path):
     """The degenerate case the distance transform cannot answer: an array with
     no background in it has no distance to one, and scipy returns a small number

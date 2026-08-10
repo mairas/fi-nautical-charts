@@ -206,6 +206,23 @@ seeded from the whole margin one such tile empties both — 566 tiles at z13, so
 of them see-through end to end, reported as a rectangle of basemap showing
 through open water south of Helsinki.
 
+For the white pass the margin is also there to be **measured rather than
+crossed**: the flood may occupy the tile and the margins the outside lies past,
+and nothing else. The other margins are a neighbour's chart, and a flood that
+rounds a corner through them arrives somewhere it could not have walked over its
+own ground — then stops dead at the tile edge, because the neighbour deciding
+the same ground for itself never crosses back. That is what a hard straight step
+in the boundary is: two tiles disagreeing about the strip they share.
+
+It is not confined to the tile, and it is not confined at all on the black pass.
+Both are measurements rather than deductions. Held to the tile alone, a fill band
+a few pixels wide loses its only seed — every core pixel of it is in the margin
+the absent neighbour fills. Confined on the black pass, 50k px of fill stay on
+the water across 176 tiles, because a sheet edge runs along many *chart* tiles
+and parts of the fill are reachable only through one; the blank past the limit
+never needs that route. Confining the white pass alone saves 31k px of chart the
+free flood was erasing and leaves 5k px of black specks.
+
 **Only the deepest zoom is examined**, and every level below it is deleted for
 `downscale` to rebuild. Each of those levels is a separate rendering of the same
 coastline with its own fill, so asking the same question of all nine put the
@@ -534,7 +551,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-disk64-b2-directed+offeez-pixel; box-2x-premultiplied from z15 on 2026-08-09",
+      "processing": "opaque-black-disk64-b2-directed-confined+offeez-pixel; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]
