@@ -195,16 +195,23 @@ def test_line_work_abutting_the_fill_survives_on_a_straddling_tile(stripped):
 
 def test_a_chart_with_no_fill_at_all_is_left_completely_alone(tmp_path):
     """Four of the five layers are mostly interior. A run over one should not
-    rewrite a single tile."""
+    rewrite an interior tile.
+
+    Interior, not every tile: beyond the last one there is no data, and no data
+    is off-sheet by definition, so the outermost ring is at a real edge of the
+    chart and the run is right to look at it. What the ring loses is dark within
+    a radius of that edge -- which on these layers is open water, and on this
+    fixture is the end of a ruled line."""
     layout = {(x, y): ("content+type" if (x + y) % 2 else "content")
-              for x in range(3) for y in range(3)}
+              for x in range(5) for y in range(5)}
     src = build(tmp_path / "nofill.mbtiles", layout)
     out = tmp_path / "nofill-out.mbtiles"
     sn.run(src, out, jobs=1, offeez=False)
-    for (x, y) in layout:
-        a = read(out, x, y)
-        b = np.asarray(Image.open(io.BytesIO(tile(layout[(x, y)]))).convert("RGBA"))
-        assert a is not None and np.array_equal(a, b), f"tile {x},{y} was rewritten"
+    for x in range(1, 4):
+        for y in range(1, 4):
+            a = read(out, x, y)
+            b = np.asarray(Image.open(io.BytesIO(tile(layout[(x, y)]))).convert("RGBA"))
+            assert a is not None and np.array_equal(a, b), f"tile {x},{y} was rewritten"
 
 
 @pytest.mark.parametrize("kind", ["fill+margin", "fill+speck", "fill+paper"])
@@ -424,6 +431,27 @@ def test_a_band_too_thin_to_hold_a_core_is_still_reached(tmp_path):
     # away from the ends, where the paper above and below closes in on it
     assert m[sn.RADIUS:-sn.RADIUS, :8].all(), \
         f"the band survived ({int(m[:, :8].sum())} of 2048 px)"
+
+
+def test_the_outside_counts_whichever_colour_it_is_drawn_in(tmp_path):
+    """Traficom renders no-chart two ways: black past a sheet edge, white past
+    the outer limit. Each pass knows one of them, so where the two meet, the
+    black pass reads the white side as chart and walls itself out of its own
+    fill -- the flood has no seed at all, because every pixel of the margin the
+    walk called outward reads as solid.
+
+    The walk has already settled it: a tile it reached carries no chart. Padding
+    those sides solid is the same statement an absent neighbour makes."""
+    a = np.zeros((256, 256, 4), np.uint8)
+    a[:, :] = (0, 0, 0, 255)                     # nothing but off-sheet fill
+    R = sn.RADIUS
+    white = np.zeros((256, 256, 4), np.uint8)
+    white[:, :] = (255, 255, 255, 255)           # the outer limit's blank
+    edges = {(1, 0): sn._edges((Z, 1, 0, tile("blank"), R, "black"))[2]}
+    pad = sn.surround((1, 1), edges, frozenset({"t", "lt", "rt"}))
+    assert pad["t"] is None, "the walk said outward and the padding argued"
+    m = sn.nodata_mask(a, pad, outward=frozenset({"t", "lt", "rt"}))
+    assert m.all(), f"the fill survived ({65536 - int(m.sum())} px kept)"
 
 
 def test_a_tile_whose_whole_neighbourhood_is_fill_is_erased(tmp_path):

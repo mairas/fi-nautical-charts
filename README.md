@@ -236,6 +236,15 @@ band 2–13px wide for its whole length, far too thin to qualify on its own, and
 it becomes findable only once the emptiness beside it counts as part of the same
 region. A missing neighbour tile pads solid black for the same reason.
 
+**So does a neighbour the walk reached**, whatever it draws there. Reading its
+pixels instead puts the question to a predicate that knows only one of the two
+ways Traficom renders "no chart" — black past a sheet edge, white past the outer
+limit — so where the two meet, the black pass reads the white side as chart and
+walls itself out of its own fill. On the tile where they meet west of Tallinn
+that cost 704px of fill left at radius 64 and 13,104 at 128; taking the walk's
+word costs 188 and 227, and the radius stops mattering, which is the sign that
+the boundary is now being found rather than approached.
+
 The result is then dilated back by the radius, which puts the edge where the
 fill actually ended and bounds how far the mask can run down a stroke joined to
 it, and finally by `--bleed` (2) **unconditionally**, not gated on darkness.
@@ -551,7 +560,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-disk64-b2-directed-confined+offeez-pixel; box-2x-premultiplied from z15 on 2026-08-09",
+      "processing": "opaque-black-disk128-b2-directed-confined+offeez-pixel; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]

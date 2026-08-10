@@ -56,10 +56,13 @@ from scipy import ndimage
 
 MIN_FILL = 64       # ignore specks: a real fill is far larger than this
 FILL_FRACTION = .95 # above this a tile is off-sheet rather than chart
-RADIUS = 64         # a fill pixel is dark for this far in every direction.
+RADIUS = 128        # a fill pixel is dark for this far in every direction.
                     # Wide enough that no disk fits through a gap in the dashed
                     # limit line, which is how the blank got into land at 10;
-                    # Traficom's capitals run 10-16px across, so none can qualify
+                    # Traficom's capitals run 10-16px across, so none can
+                    # qualify. At 128 the disk is wider than a tile, so no
+                    # passage inside one can admit it -- the fill has to be wide
+                    # across the seam as well, which is what smooths the edge
 DARK = 40           # the transition is one pixel; this catches it
 BLEED = 2           # pixels erased past the fill, over the chart's own edge
 TILE = 256
@@ -248,16 +251,26 @@ def edge_lines(con, z, want, pool, kind="black", margin=RADIUS):
     return out
 
 
-def surround(xy, edges):
+def surround(xy, edges, outward=frozenset()):
     """What lies just past each of a tile's eight sides and corners.
 
-    A side maps to the neighbour's facing piece, or to None where there is no
-    tile at all -- beyond the data is outside, and outside is fill.
+    A side maps to the neighbour's facing piece, or to None -- meaning solid
+    no-data -- where there is no tile at all.
+
+    It also maps to None on the sides the walk called outward, whatever the
+    neighbour draws there. Those are tiles the walk reached, which is to say
+    tiles carrying no chart; that is the same fact an absent neighbour states,
+    and it deserves the same padding. Reading their pixels instead asks a
+    predicate that knows only one of the two ways Traficom renders "no chart" --
+    black past a sheet edge, white past the outer limit -- so where the two meet,
+    the black pass reads the white side as chart and walls itself out of its own
+    fill. Measured on the tile where they meet at 59 31'N: 704px of fill left at
+    radius 64 and 13,104 at 128, against 188 and 227 once the walk is believed.
     """
     x, y = xy
     pad = {}
     for (dx, dy), side in AROUND.items():
-        n = edges.get((x + dx, y + dy))
+        n = None if side in outward else edges.get((x + dx, y + dy))
         pad[side] = None if n is None else n[FACING[side]]
     return pad
 
@@ -533,8 +546,12 @@ def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool):
     if not whole and not straddle:
         return 0, 0
     rewritten = dropped = 0
-    want = sorted({(x + dx, y + dy) for (x, y) in straddle
-                   for dx, dy in AROUND} | straddle.keys())
+    # only the neighbours whose pixels are actually read: an outward one is
+    # padded solid on the walk's word, so its tile never needs decoding for that
+    # candidate
+    want = sorted({(x + dx, y + dy) for (x, y), sides in straddle.items()
+                   for (dx, dy), side in AROUND.items() if side not in sides}
+                  | straddle.keys())
     edges = edge_lines(con, z, want, pool, kind, radius)
     todo = sorted(whole | straddle.keys())
     for i in range(0, len(todo), BATCH):
@@ -543,7 +560,8 @@ def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool):
             row = (1 << z) - 1 - y
             blob = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
                                "tile_column=? AND tile_row=?", (z, x, row)).fetchone()
-            pad = None if (x, y) in whole else surround((x, y), edges)
+            pad = (None if (x, y) in whole
+                   else surround((x, y), edges, straddle[(x, y)]))
             if blob:
                 tasks.append((z, x, row, blob[0], pad, straddle.get((x, y)),
                               radius, bleed, kind))
