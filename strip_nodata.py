@@ -17,15 +17,18 @@ capitals, and at native zoom their strokes survive the same erosion -- so the
 local test called HELSINKI a no-data fill and deleted it, leaving the hollow
 anti-aliased outline behind. It cost 6-12% of the ink on interior tiles.
 
-Position separates them. The fill is not a shape inside a tile but a region of
-the tile grid: it lies beyond the last sheet and runs to the edge of the data,
-so the same walk that finds the water outside the EEZ finds it. Only tiles that
-walk reaches, and the chart tiles they touch, are examined at all; the interior
-is never a candidate, whatever its ink looks like. Within those tiles, eroding
-seeds the fill and growing them back recovers it exactly to its own hard edge --
-which is genuinely hard, the source anti-aliases the boundary not at all -- but
-the growth runs through the solid black only, since at a sheet edge the chart's
-own ink abuts the fill and connectivity would otherwise follow it out.
+Position separates them, at both scales. The fill is not a shape inside a tile
+but a region of the tile grid: it lies beyond the last sheet and runs to the
+edge of the data, so the same walk that finds the water outside the EEZ finds
+it. Only tiles that walk reaches, and the chart tiles they touch, are examined
+at all; the interior is never a candidate, whatever its ink looks like.
+
+Within one of those tiles the same question is asked again in pixels: the fill
+is what runs in from the borders the walk came through. Seeding it by shape
+instead -- eroding the black and growing the seeds back -- fails on the tiles
+that matter, because where the sheet edge crosses a tile at a shallow angle the
+fill enters as a wedge only a few pixels wide, thinner than any erosion that
+also spares a place name. Flooding in from the border has no width to lose.
 
 Run this on the raw download, before downscaling. Averaging black into a parent
 turns it grey, and grey is indistinguishable from chart content.
@@ -46,13 +49,23 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-RADIUS = 4          # erosion radius; ink vanishes by 2, fills survive past 8
 MIN_FILL = 64       # ignore specks: a real fill is far larger than this
 FILL_FRACTION = .95 # above this a tile is off-sheet rather than chart
 THIN = 2            # strokes narrower than this survive as ink, not fill
+DARK = 40           # the fill's own edge is anti-aliased; pure black misses it
 TILE = 256
 WHITE_LUM = 250     # above this an opaque pixel counts as blank paper
 BATCH = 2000        # tiles held in memory at once
+
+
+def processing_stamp(*, offeez: bool) -> str:
+    """What a run with these settings records as nodata_stripped.
+
+    Written into the file and read back by anything deciding whether a
+    published chart was built by the current recipe, so the two must be one
+    definition rather than two strings that agree until one of them changes.
+    """
+    return "opaque-black-edge-flood" + ("+offeez-tilelevel" if offeez else "")
 
 
 def tile_has_marks(blob):
@@ -254,62 +267,50 @@ def leaked(black, candidates, z, cap=TILE * TILE * FILL_FRACTION):
             f"{missed[:5]}{' ...' if len(missed) > 5 else ''}")
 
 
-def reaching(mask: np.ndarray, sides) -> np.ndarray:
-    """The parts of the mask that run off the tile past one of `sides`.
-
-    Off-sheet fill continues into the tile the walk came from, so on a chart
-    tile it always meets the border facing that tile. A place name set near the
-    sheet edge does not, and that is the whole difference between them once the
-    grid has narrowed the question to one tile.
-    """
-    labels, n = ndimage.label(mask)
-    if not n:
-        return mask
-    keep = set()
+def border(shape, sides) -> np.ndarray:
+    """The tile's own edge pixels along `sides`, where the fill comes in from."""
+    edge = np.zeros(shape, bool)
     for s in sides:
-        keep.update(np.unique(labels[BORDER[s]]).tolist())
-    keep.discard(0)
-    return np.isin(labels, list(keep))
+        edge[BORDER[s]] = True
+    return edge
 
 
-def nodata_mask(a: np.ndarray, radius: int, protect: bool = True, sides=None) -> np.ndarray:
-    """Pixels belonging to a solid opaque-black region rather than to chart ink.
+def nodata_mask(a: np.ndarray, protect: bool = True, sides=None) -> np.ndarray:
+    """Pixels belonging to off-sheet fill rather than to chart ink.
 
-    `protect` buys ink safety with a little unremoved fill, so it is for tiles
-    that carry chart. On a tile the walk placed wholly outside the last sheet
-    there is no ink to protect, and the opening would only strand the fill in
-    corners too narrow to survive it.
+    The fill is whatever runs in from the tile borders `sides` names -- the ones
+    the grid walk found the outside past. It is not a shape: asking how solid a
+    black region is cannot separate a fill from a heavy place name, because
+    Traficom's display capitals are as solid as anything, and asking how thin it
+    is cannot either, because where the sheet edge crosses a tile at a shallow
+    angle the fill enters as a wedge a few pixels wide.
 
-    `sides` names the tile borders the off-sheet region lies past, and confines
-    the result to black that reaches one of them. Without it the local shape
-    test is all that stands between a heavy place name and deletion, which is
-    not enough: Traficom's capitals seed the erosion exactly as a fill does.
+    So the fill is found by flooding inward from those borders. The flood runs
+    through the fill's body, which an opening isolates from the ink that abuts
+    it -- otherwise a black stroke touching the fill would carry the flood down
+    itself and into the chart. The body is then dilated back into the dark
+    pixels around it, which recovers the anti-aliased edge without following
+    anything: a stroke can lose the couple of pixels nearest the fill, no more.
+
+    `protect` is what all of that costs. A tile the walk placed wholly outside
+    the last sheet has no ink to protect, so there every dark pixel is fill.
     """
-    black = (a[..., :3].max(axis=2) == 0) & (a[..., 3] == 255)
-    if not black.any():
-        return black
-    if not protect:
-        return black
-    k = np.ones((2 * radius + 1, 2 * radius + 1), bool)
-    seeds = ndimage.binary_erosion(black, structure=k)
-    if not seeds.any():
-        return np.zeros_like(black)
-    # Grown back through the solid part of the black, not through all of it.
-    # Reconstruction follows connectivity, and at a sheet edge the chart's own
-    # ink abuts the fill, so propagating through every black pixel runs down
-    # those strokes and takes them too. An opening drops anything thinner than
-    # ink while leaving a straight boundary exactly where it was, which is what
-    # the fill has -- the source anti-aliases it not at all.
-    solid = ndimage.binary_opening(black, structure=np.ones((2 * THIN + 1,) * 2, bool))
-    grown = ndimage.binary_propagation(seeds, mask=solid)
-    return reaching(grown, sides) if sides else grown
+    dark = (a[..., :3].max(axis=2) <= DARK) & (a[..., 3] == 255)
+    if not dark.any() or not protect:
+        return dark
+    k = np.ones((2 * THIN + 1,) * 2, bool)
+    body = ndimage.binary_opening(dark, structure=k)
+    flood = ndimage.binary_propagation(body & border(dark.shape, sides), mask=body)
+    if not flood.any():
+        return np.zeros_like(dark)
+    return ndimage.binary_dilation(flood, structure=k) & dark
 
 
 def _strip(task):
-    z, x, row, blob, radius, sides = task
+    z, x, row, blob, sides = task
     img = Image.open(io.BytesIO(blob)).convert("RGBA")
     a = np.asarray(img).copy()
-    m = nodata_mask(a, radius, protect=bool(sides), sides=sides)
+    m = nodata_mask(a, protect=bool(sides), sides=sides)
     n = int(m.sum())
     if n < MIN_FILL:
         return None
@@ -339,7 +340,7 @@ def batches(con, z, size):
         last = (rows[-1][0], rows[-1][1])
 
 
-def scan(src: Path, radius: int, jobs: int) -> None:
+def scan(src: Path, jobs: int) -> None:
     """What a run would examine, by the same reckoning the run uses.
 
     Answering this with the local shape test alone -- as a dry run naturally
@@ -366,7 +367,7 @@ def scan(src: Path, radius: int, jobs: int) -> None:
     con.close()
 
 
-def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
+def run(src: Path, out: Path, jobs: int, offeez: bool) -> None:
     # built beside the target and moved into place at the end, so a run that
     # dies partway cannot leave a valid-looking partial chart where the good
     # one was
@@ -404,7 +405,7 @@ def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
                 for (x, row), sides in todo[i:i + BATCH]:
                     blob = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
                                        "tile_column=? AND tile_row=?", (z, x, row)).fetchone()
-                    tasks.append((z, x, row, blob[0], radius, sides))
+                    tasks.append((z, x, row, blob[0], sides))
                 for res in pool.map(_strip, tasks, chunksize=32):
                     if res is None:
                         continue
@@ -424,7 +425,6 @@ def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
             if zr or zd:
                 print(f"  z{z:<3} rewrote {zr:>6}, dropped {zd:>5}")
 
-    stamp = f"opaque-black-r{radius}-edge"
     if offeez:
         # classified from the black-stripped tiles, so removed fill cannot pose
         # as a marking and wall the flood out of its own region
@@ -443,9 +443,9 @@ def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
                 total += 1
             con.commit()
         print(f"  off-EEZ total: {total} tiles dropped, 0 modified")
-        stamp += "+offeez-tilelevel"
 
-    con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", ("nodata_stripped", stamp))
+    con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
+                ("nodata_stripped", processing_stamp(offeez=offeez)))
     con.commit()
     con.execute("VACUUM")
     con.close()
@@ -457,8 +457,6 @@ def main():
     p = argparse.ArgumentParser(description="Strip opaque-black no-data fill from MBTiles")
     p.add_argument("input", type=Path)
     p.add_argument("--out", type=Path, help="default: <input>.stripped.mbtiles")
-    p.add_argument("--radius", type=int, default=RADIUS,
-                   help=f"erosion radius separating fill from ink (default {RADIUS})")
     p.add_argument("--jobs", type=int, default=0, help="worker processes (default: all cores)")
     p.add_argument("--scan", action="store_true", help="report what would change, write nothing")
     p.add_argument("--skip-offeez", action="store_true",
@@ -467,10 +465,10 @@ def main():
     if not args.input.exists():
         sys.exit(f"no such file: {args.input}")
     if args.scan:
-        scan(args.input, args.radius, args.jobs or None)
+        scan(args.input, args.jobs or None)
         return
     out = args.out or args.input.with_suffix(".stripped.mbtiles")
-    run(args.input, out, args.radius, args.jobs or None, not args.skip_offeez)
+    run(args.input, out, args.jobs or None, not args.skip_offeez)
 
 
 if __name__ == "__main__":

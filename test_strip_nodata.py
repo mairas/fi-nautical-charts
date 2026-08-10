@@ -65,6 +65,19 @@ def tile(kind: str) -> bytes:
             # the fill, which is the arrangement a real sheet edge produces.
             a[:, :90] = (0, 0, 0, 255)
             a[100:103, :90] = (0, 0, 0, 255)
+        if kind == "wedge-fill":
+            # The sheet edge crossing the tile at a shallow angle, so the fill
+            # tapers to a few pixels. Measured on Yleiskartat z9 at the Aland
+            # boundary, where the surviving wedge was 8px across.
+            for r in range(256):
+                a[r, :max(0, 60 - r // 3)] = (0, 0, 0, 255)
+        if kind == "soft-fill":
+            # Off-sheet to the left with an anti-aliased boundary. The source
+            # does soften it, whatever the hard-edge assumption said: the
+            # measured residue ran to a mean RGB of 2 over 300-odd pixels.
+            a[:, :90] = (0, 0, 0, 255)
+            for i, v in enumerate((6, 18, 40, 90, 160)):
+                a[:, 90 + i] = (v, v, v, 255)
     buf = io.BytesIO()
     Image.fromarray(a, "RGBA").save(buf, format="PNG")
     return buf.getvalue()
@@ -112,7 +125,7 @@ LAYOUT = {
 def stripped(tmp_path):
     src = build(tmp_path / "src.mbtiles", LAYOUT)
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, radius=sn.RADIUS, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez=False)
     return out
 
 
@@ -164,7 +177,7 @@ def test_a_chart_with_no_fill_at_all_is_left_completely_alone(tmp_path):
               for x in range(3) for y in range(3)}
     src = build(tmp_path / "nofill.mbtiles", layout)
     out = tmp_path / "nofill-out.mbtiles"
-    sn.run(src, out, radius=sn.RADIUS, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez=False)
     for (x, y) in layout:
         a = read(out, x, y)
         b = np.asarray(Image.open(io.BytesIO(tile(layout[(x, y)]))).convert("RGBA"))
@@ -181,7 +194,7 @@ def test_off_sheet_tiles_that_are_not_perfectly_uniform_are_still_stripped(tmp_p
     layout[(0, 1)] = kind
     src = build(tmp_path / "src.mbtiles", layout)
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, radius=sn.RADIUS, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez=False)
 
     a = read(out, 0, 1)
     left = 0 if a is None else black_px(a)
@@ -198,7 +211,7 @@ def test_heavy_type_on_a_straddling_tile_survives(tmp_path):
         layout[(1, y)] = "half-fill+type"
     src = build(tmp_path / "src.mbtiles", layout)
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, radius=sn.RADIUS, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez=False)
 
     a = read(out, 1, 1)
     assert a is not None
@@ -216,7 +229,7 @@ def test_a_chart_tile_meeting_the_fill_only_at_a_corner_is_examined(tmp_path):
               (0, 2): "content", (1, 2): "content", (2, 2): "content"}
     src = build(tmp_path / "src.mbtiles", layout)
     out = tmp_path / "out.mbtiles"
-    sn.run(src, out, radius=sn.RADIUS, jobs=1, offeez=False)
+    sn.run(src, out, jobs=1, offeez=False)
 
     a = read(out, 1, 1)
     assert a is not None
@@ -232,7 +245,7 @@ def test_a_run_that_would_leave_solid_fill_behind_refuses(tmp_path, monkeypatch)
     monkeypatch.setattr(sn, "edge_tiles", lambda ink, plain, black: (set(), {}))
 
     with pytest.raises(sn.Leaked, match="would ship"):
-        sn.run(src, out, radius=sn.RADIUS, jobs=1, offeez=False)
+        sn.run(src, out, jobs=1, offeez=False)
 
 
 def test_solid_black_the_walk_cannot_reach_stops_the_run(tmp_path):
@@ -247,7 +260,7 @@ def test_solid_black_the_walk_cannot_reach_stops_the_run(tmp_path):
 
     with pytest.raises(sn.Leaked, match=r"\(1, 1\)"):
         sn.run(src, tmp_path / "enclosed-out.mbtiles",
-               radius=sn.RADIUS, jobs=1, offeez=False)
+               jobs=1, offeez=False)
 
 
 def test_the_stamp_records_that_only_edges_were_examined(stripped):
@@ -270,3 +283,88 @@ def read_source(x: int, y: int):
 
 def read_source_kind(kind: str):
     return np.asarray(Image.open(io.BytesIO(tile(kind))).convert("RGBA"))
+
+
+def dark_px(a) -> int:
+    return int(((a[..., :3].max(axis=2) <= sn.DARK) & (a[..., 3] == 255)).sum())
+
+
+def thickest(a) -> int:
+    """Width of the fattest dark region left, in pixels across."""
+    from scipy import ndimage
+    m = (a[..., :3].max(axis=2) <= sn.DARK) & (a[..., 3] == 255)
+    n = 0
+    while m.any():
+        n += 2
+        m = ndimage.binary_erosion(m)
+    return n
+
+
+def test_a_fill_wedge_too_thin_to_erode_is_still_removed(tmp_path):
+    """What shipped and was wrong. Where the sheet edge crosses a tile at a
+    shallow angle the fill tapers below any erosion kernel that also spares a
+    place name, so seeding by shape left the whole wedge on the chart -- a
+    jagged black edge and stray triangles along every diagonal boundary.
+
+    Flooding from the border has no width to lose on the way in. What survives
+    is the last of the taper, where the wedge is narrower than the opening that
+    keeps the flood off abutting line work -- a stroke's width, and no more.
+    This fixture tapers across a whole tile, which is the worst case; on the
+    Aland boundary at z9 the same tile went from 487 stray dark pixels to 5.
+    """
+    src = build(tmp_path / "wedge.mbtiles", {
+        (0, 0): "fill",  (1, 0): "wedge-fill",  (2, 0): "content",
+        (0, 1): "fill",  (1, 1): "wedge-fill",  (2, 1): "content",
+    })
+    out = tmp_path / "out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=False)
+    before, after = read(src, 1, 0), read(out, 1, 0)
+    assert black_px(before) > 5000
+    assert black_px(after) < black_px(before) * 0.15
+    assert thickest(after) <= 2 * sn.THIN
+
+
+def test_the_anti_aliased_edge_of_the_fill_goes_with_it(tmp_path):
+    """A pure-black test leaves the fill's own soft edge behind: a dark fringe
+    tracing the boundary, which is what a viewer draws as a jagged black line."""
+    src = build(tmp_path / "soft.mbtiles", {
+        (0, 0): "fill",  (1, 0): "soft-fill",  (2, 0): "content",
+        (0, 1): "fill",  (1, 1): "soft-fill",  (2, 1): "content",
+    })
+    out = tmp_path / "out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=False)
+    # x=93 and x=94 hold the last two ramp steps, 90 and 160: paper, not fill
+    boundary = read(out, 1, 0)[:, :93]
+    assert dark_px(boundary) == 0
+    assert (boundary[..., 3] == 0).all()
+
+
+def test_type_on_a_straddling_tile_survives_the_flood(tmp_path):
+    """The flood enters from the border the outside lies past, reaches the fill
+    and stops. A place name set clear of that border is not connected to it and
+    keeps every stroke."""
+    src = build(tmp_path / "type.mbtiles", {
+        (0, 0): "fill",  (1, 0): "half-fill+type",  (2, 0): "content",
+        (0, 1): "fill",  (1, 1): "half-fill+type",  (2, 1): "content",
+    })
+    out = tmp_path / "out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=False)
+    before, after = read(src, 1, 0), read(out, 1, 0)
+    assert black_px(after[150:210, 140:200]) == black_px(before[150:210, 140:200])
+    assert (after[:, :90, 3] == 0).all()          # and the fill did go
+
+
+def test_a_stroke_touching_the_fill_is_not_followed_into_the_chart(tmp_path):
+    """Connectivity is why the old code grew seeds through an opened mask: a
+    ruled line abutting the fill would otherwise carry the flood down its whole
+    length. Flooding from the border has the same exposure, so the body is
+    opened before the flood and only dilated back a stroke's width after."""
+    src = build(tmp_path / "line.mbtiles", {
+        (0, 0): "fill",  (1, 0): "half-fill",  (2, 0): "content",
+        (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
+    })
+    out = tmp_path / "out.mbtiles"
+    sn.run(src, out, jobs=1, offeez=False)
+    before, after = read(src, 1, 0), read(out, 1, 0)
+    lost = black_px(before[100:103, 95:]) - black_px(after[100:103, 95:])
+    assert lost == 0, f"the flood ran {lost}px down a line abutting the fill"

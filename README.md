@@ -187,13 +187,30 @@ so the walk that finds the water outside the EEZ finds it too. Chart tiles wall
 that walk. Only tiles it reaches, and the chart tiles they touch, are examined at
 all — the interior is never a candidate, whatever its ink looks like.
 
-Inside an examined tile three things narrow it further. Fractions are measured
-over *opaque* pixels, since fill often arrives with a transparent margin where
-the fetch ran past the served extent. The seeds grow back through the solid black
-only, because at a sheet edge the chart's own ink abuts the fill and connectivity
-would otherwise run down it. And on a chart tile the result keeps only black that
-reaches the border facing the off-sheet region: fill continues into the tile the
-walk came from, a place name set clear of the edge does not.
+Inside an examined tile the same question is asked again in pixels, and answered
+the same way: the fill is what runs in from the borders the walk came through.
+It is found by flooding inward from them, not by seeding on shape — seeding by
+shape fails on exactly the tiles that matter, because where the sheet edge
+crosses a tile at a shallow angle the fill enters as a wedge a few pixels wide,
+thinner than any erosion that also spares a place name. That left a jagged black
+rim and stray triangles along every diagonal boundary.
+
+Two details keep the flood honest. It runs through the fill's *body* — the mask
+after an opening — because a black stroke abutting the fill would otherwise
+carry it down the stroke and into the chart; the body is then dilated back a
+stroke's width into the surrounding dark pixels, which recovers the fill's own
+anti-aliased edge without following anything. And "dark" means within 40 of
+black, not black exactly: the source does soften that boundary, and a pure-black
+test leaves the softened pixels behind as a fringe tracing the whole sheet edge.
+
+What this still cannot reach is the last of a taper, where the wedge is narrower
+than that opening. Measured on the Åland boundary at z9, the tile carrying the
+visible artefact went from 487 stray dark pixels to 5, and a seven-tile strip
+along the boundary keeps 10 — single pixels rather than the triangles, but not
+zero.
+
+Fractions are measured over *opaque* pixels, since fill often arrives with a
+transparent margin where the fetch ran past the served extent.
 
 A tile that is 95% solid black and was *not* examined stops the run and is named.
 Selecting by position is only as good as the walk, and a walk that stops short
@@ -466,7 +483,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-r4-edge+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-09",
+      "processing": "opaque-black-edge-flood+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]
