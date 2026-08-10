@@ -1,0 +1,201 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""Browse local MBTiles in a browser, several at once.
+
+The charts are mostly judged by what they *removed*, and a removed pixel is
+transparent -- which on a white page looks like nothing at all. So the map sits
+on a coloured backdrop by default, the same one the boat's basemap shows
+through: anything the strip took reads as that colour rather than as paper.
+
+Every file given becomes a switchable layer, so a processed set and the archive
+it came from can be flipped between at the same place and zoom.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import sys
+import threading
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+         "webp": "image/webp", "pbf": "application/x-protobuf"}
+
+
+class Chart:
+    def __init__(self, path: Path):
+        self.path = path
+        self.key = path.stem
+        self.local = threading.local()
+        m = dict(self.con().execute("SELECT name, value FROM metadata"))
+        self.fmt = m.get("format", "png")
+        self.label = m.get("name") or path.stem
+        self.minzoom = int(m.get("minzoom", 0))
+        self.maxzoom = int(m.get("maxzoom", 20))
+        self.bounds = [float(v) for v in m["bounds"].split(",")] if "bounds" in m else None
+        levels = self.con().execute(
+            "SELECT COUNT(DISTINCT zoom_level), COUNT(*) FROM tiles").fetchone()
+        self.note = (f"{levels[0]} levels, {levels[1]:,} tiles, "
+                     f"z{self.minzoom}-{self.maxzoom}, "
+                     f"{m.get('nodata_stripped', 'unstripped')}")
+
+    def con(self) -> sqlite3.Connection:
+        # one connection per thread: sqlite objects are not shared across them,
+        # and the server is threaded so a slow tile does not block the page
+        if not hasattr(self.local, "con"):
+            self.local.con = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        return self.local.con
+
+    def tile(self, z: int, x: int, y: int) -> bytes | None:
+        row = self.con().execute(
+            "SELECT tile_data FROM tiles WHERE zoom_level=? AND tile_column=? "
+            "AND tile_row=?", (z, x, (1 << z) - 1 - y)).fetchone()
+        return row[0] if row else None
+
+
+PAGE = """<!doctype html><meta charset=utf-8><title>fi-nautical-charts</title>
+<link rel=stylesheet href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+ html,body,#map{height:100%;margin:0}
+ #map{background:__BACKDROP__}
+ .leaflet-control-layers-list{font:13px/1.5 system-ui,sans-serif}
+ .note{color:#666;font-size:11px}
+</style><div id=map></div><script>
+const charts = __CHARTS__;
+const map = L.map('map', {center: __CENTER__, zoom: __ZOOM__, maxZoom: 20});
+const overlays = {};
+charts.forEach((c, i) => {
+  const layer = L.tileLayer('/tiles/' + c.key + '/{z}/{x}/{y}', {
+    minZoom: 0, maxZoom: 20, maxNativeZoom: c.maxzoom, minNativeZoom: c.minzoom,
+    bounds: c.bounds ? [[c.bounds[1], c.bounds[0]], [c.bounds[3], c.bounds[2]]] : null,
+    tileSize: 256, opacity: 1, attribution: '&copy; Traficom. Not for navigation use.'
+  });
+  overlays[c.label + ' <span class=note>' + c.note + '</span>'] = layer;
+  if (i === 0) layer.addTo(map);
+});
+L.control.layers(null, overlays, {collapsed: false, sortLayers: false}).addTo(map);
+L.control.scale({imperial: false}).addTo(map);
+const readout = L.control({position: 'bottomleft'});
+readout.onAdd = function () {
+  this._d = L.DomUtil.create('div', 'leaflet-bar');
+  this._d.style.cssText = 'background:#fff;padding:2px 6px;font:12px system-ui';
+  return this._d;
+};
+readout.addTo(map);
+function show(e) {
+  readout._d.textContent = e.latlng.lat.toFixed(5) + ', ' + e.latlng.lng.toFixed(5)
+    + '  z' + map.getZoom().toFixed(1);
+}
+map.on('mousemove', show);
+</script>"""
+
+
+def build_page(charts: list[Chart], backdrop: str) -> bytes:
+    meta = [{"key": c.key, "label": c.label, "note": c.note,
+             "minzoom": c.minzoom, "maxzoom": c.maxzoom, "bounds": c.bounds}
+            for c in charts]
+    withbounds = [c for c in charts if c.bounds]
+    if withbounds:
+        b = withbounds[0].bounds
+        centre = [(b[1] + b[3]) / 2, (b[0] + b[2]) / 2]
+    else:
+        centre = [60.2, 24.9]
+    page = (PAGE.replace("__CHARTS__", json.dumps(meta))
+                .replace("__CENTER__", json.dumps(centre))
+                .replace("__ZOOM__", str(max(charts[0].minzoom, 8)))
+                .replace("__BACKDROP__", backdrop))
+    return page.encode()
+
+
+def serve(paths: list[Path], port: int, backdrop: str, open_browser: bool) -> None:
+    charts = []
+    for p in paths:
+        try:
+            charts.append(Chart(p))
+        except sqlite3.Error as exc:
+            print(f"  skipping {p.name}: {exc}", file=sys.stderr)
+    if not charts:
+        sys.exit("no readable MBTiles given")
+    # The whole point is comparing a processed set with the archive it came
+    # from, and those are the same filename in two directories -- so the stem
+    # alone collides, and the second would silently answer for both.
+    stems = [c.key for c in charts]
+    for c in charts:
+        if stems.count(c.key) > 1:
+            c.label = f"{c.label} [{c.path.parent.name}]"
+            c.key = f"{c.path.parent.name}-{c.key}"
+    seen: dict[str, int] = {}
+    for c in charts:
+        if c.key in seen:
+            seen[c.key] += 1
+            c.key = f"{c.key}-{seen[c.key]}"
+            c.label = f"{c.label} ({seen[c.key]})"
+        else:
+            seen[c.key] = 1
+    by_key = {c.key: c for c in charts}
+    page = build_page(charts, backdrop)
+    for c in charts:
+        print(f"  {c.label}  ({c.note})")
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def send(self, code, body=b"", ctype="text/plain"):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+
+        def do_GET(self):
+            parts = self.path.split("?")[0].strip("/").split("/")
+            if parts == [""]:
+                return self.send(200, page, "text/html; charset=utf-8")
+            if len(parts) == 5 and parts[0] == "tiles":
+                _, key, z, x, y = parts
+                chart = by_key.get(key)
+                if chart is None:
+                    return self.send(404)
+                try:
+                    blob = chart.tile(int(z), int(x), int(y.split(".")[0]))
+                except (ValueError, sqlite3.Error):
+                    return self.send(404)
+                if blob is None:
+                    return self.send(404)
+                return self.send(200, blob, TYPES.get(chart.fmt, "image/png"))
+            self.send(404)
+
+    url = f"http://localhost:{port}/"
+    print(f"\nserving {len(charts)} chart(s) at {url}   (ctrl-c to stop)")
+    if open_browser:
+        threading.Timer(0.5, webbrowser.open, (url,)).start()
+    try:
+        ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+
+
+def main():
+    p = argparse.ArgumentParser(description="Browse local MBTiles in a browser")
+    p.add_argument("files", nargs="+", type=Path)
+    p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--backdrop", default="#a7d0da",
+                   help="what shows through where a chart is transparent "
+                        "(default: the basemap blue the boat draws under it)")
+    p.add_argument("--no-open", action="store_true", help="do not open a browser")
+    args = p.parse_args()
+    serve(args.files, args.port, args.backdrop, not args.no_open)
+
+
+if __name__ == "__main__":
+    main()
