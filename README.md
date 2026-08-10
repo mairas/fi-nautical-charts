@@ -131,6 +131,12 @@ The `public` suffix marks the openly-licensed subset of each product.
 ./run ab                   # A/B render (default: Helsinki front, Rannikkokartat vs Merikarttasarjat)
 ./run ab --sources "traficom:Satamakartat,traficom:Veneilykartat public" --bbox 26.7,60.3,27.0,60.45
 
+# Browse local sets in a browser, several at once. Every file becomes a
+# switchable layer, on a backdrop the colour of the basemap the boat draws
+# under the chart -- so anything the strip removed reads as that colour
+# rather than as paper.
+./run serve mbtiles/fi-yleiskartat250k-2026-06-02.mbtiles out/fi-yleiskartat250k-2026-06-02.mbtiles
+
 # Download a layer to MBTiles. Descent (default) prunes empty subtrees; sparse
 # overlays seed with --full-until so no isolated feature is pruned.
 ./run dl --layer "Merikarttasarjat public" --out mbtiles/merikarttasarjat.mbtiles

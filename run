@@ -24,6 +24,12 @@ function ab {
   uv run charts_ab.py "$@"
 }
 
+function serve {
+  #@ Browse local MBTiles in a browser, several at once, on a basemap backdrop
+  #@ Category: Compare
+  uv run serve.py "$@"
+}
+
 ################################################################################
 # Download
 
