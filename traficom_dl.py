@@ -39,11 +39,13 @@ import argparse
 import datetime
 import email.utils
 import io
+import json
 import math
 import sqlite3
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from urllib.parse import urlencode
 
 import numpy as np
@@ -670,7 +672,7 @@ def refresh(con, args, src, limits, bbox, zooms):
         datetime.datetime(base.year, base.month, base.day, tzinfo=datetime.timezone.utc))
     print(f"refresh: checking for editions newer than {since} ...")
     frontier = None
-    updated = removed = checked = 0
+    updated = removed = checked = errors = 0
     for z in zooms:
         cands, _ = gen_candidates(z, limits, bbox, frontier, args.mode, args.full_until)
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
@@ -688,20 +690,34 @@ def refresh(con, args, src, limits, bbox, zooms):
                 cur = con.execute("DELETE FROM tiles WHERE zoom_level=? AND "
                                   "tile_column=? AND tile_row=?", (z, x, row))
                 removed += cur.rowcount
+            else:
+                # a tile whose new edition failed to transfer: recorded so
+                # --repair can replay it, and counted so the watermark below
+                # does not step over it
+                con.execute("INSERT OR IGNORE INTO _errors (z, x, y) VALUES (?,?,?)",
+                            (z, x, y))
+                errors += 1
         flush_editions(con)
         con.commit()
         frontier = data_tiles_at(con, z)
-        print(f"\r  z{z:<2} checked {checked:,}  updated {updated:,}  removed {removed:,}",
-              end="", flush=True)
+        print(f"\r  z{z:<2} checked {checked:,}  updated {updated:,}  "
+              f"removed {removed:,}  errors {errors:,}", end="", flush=True)
     print()
-    # only now: refresh reads this as its If-Modified-Since baseline, so advancing
-    # it before every zoom is checked would make the next run skip what this one
-    # never reached
-    set_meta(con, "downloaded", datetime.date.today().isoformat())
+    # only now, and only if nothing failed: refresh reads this as its
+    # If-Modified-Since baseline, so advancing it past a tile whose new edition
+    # never transferred would leave that tile stale in the archive forever
+    if errors:
+        print(f"refresh: {errors:,} tiles failed after retries and are recorded in "
+              f"_errors; leaving the download date at {since} so the next run "
+              f"re-checks them")
+    else:
+        set_meta(con, "downloaded", datetime.date.today().isoformat())
     con.commit()
     con.close()
-    print(f"refresh done: {updated:,} tiles updated, {removed:,} removed. "
-          f"Re-run currency.py to update the stamped dates.")
+    print(f"refresh done: {updated:,} tiles updated, {removed:,} removed, "
+          f"{errors:,} failed. Re-run currency.py to update the stamped dates.")
+    return {"checked": checked, "updated": updated, "removed": removed,
+            "errors": errors}
 
 
 def alpha_mask(img, res=32):
@@ -1036,6 +1052,10 @@ def run(args):
     if args.refresh and not src["conditional"]:
         sys.exit(f"--refresh needs If-Modified-Since, which the {src['kind']} source "
                  f"does not support; re-download instead")
+    if args.report and not args.refresh:
+        sys.exit("--report writes the refresh tile counts; pass --refresh. A caller "
+                 "that treats a missing report as failure would otherwise be told "
+                 "nothing about why it never appeared")
 
     con = sqlite3.connect(args.out)
     init_db(con, src, args.mode)
@@ -1049,7 +1069,9 @@ def run(args):
         return
 
     if args.refresh:
-        refresh(con, args, src, limits, bbox, zooms)
+        counts = refresh(con, args, src, limits, bbox, zooms)
+        if args.report:
+            args.report.write_text(json.dumps(counts) + "\n")
         return
 
     if args.mode == "mask":
@@ -1182,6 +1204,9 @@ def build_parser():
     p.add_argument("--refresh", action="store_true",
                    help="If-Modified-Since delta: re-fetch only tiles reseded "
                         "since the stamped download date (existing coverage only)")
+    p.add_argument("--report", type=Path,
+                   help="write the refresh tile counts to this file as JSON, so a "
+                        "caller can decide whether anything needs reprocessing")
     return p
 
 
