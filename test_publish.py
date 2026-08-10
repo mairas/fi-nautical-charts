@@ -359,6 +359,24 @@ def test_one_bad_file_does_not_publish_the_good_ones_either(tmp_path, dest):
     assert not (dest / publish.MANIFEST).exists()
 
 
+def test_a_stripped_intermediate_is_refused_and_retires_nothing(tmp_path, dest):
+    """strip_nodata deletes every level below the one it cleans and leaves
+    `pyramid_pending` for downscale to build back. Such a file is a valid
+    SQLite database with the right name, the right layer and the right edition,
+    so every other check passes it -- and publishing it would serve one zoom
+    level and retire the last edition that had the rest."""
+    live = make_mbtiles(dest / "fi-veneilykartat-2026-05-30.mbtiles",
+                        dict(META, source_updated="2026-05-30"))
+    half = make_mbtiles(tmp_path / "half.processed.mbtiles",
+                        dict(META, pyramid_pending="5"))
+
+    with pytest.raises(publish.Unpublishable, match="waiting for its lower"):
+        publish.publish([half], dest)
+
+    assert live.exists(), "the last good edition was retired for a half-built one"
+    assert charts_in(dest) == ["fi-veneilykartat-2026-05-30.mbtiles"]
+
+
 def test_a_failure_while_staging_the_second_set_publishes_neither(tmp_path, dest, monkeypatch):
     """The multi-file rollback: the first set stages fine, the second dies."""
     a = make_mbtiles(tmp_path / "a.mbtiles")

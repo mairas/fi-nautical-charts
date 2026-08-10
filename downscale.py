@@ -163,12 +163,16 @@ def floor_zoom(zooms: list[int], meta: dict[str, str]) -> int:
     Not simply the lowest level present: strip_nodata cleans the deepest level
     and deletes the rest, since each of the others is a separate rendering of
     the same coastline carrying its own fill. What it leaves behind is one level
-    of tiles and a metadata minzoom describing the chart it is going to become.
+    of tiles and `pyramid_pending`, the floor it wants rebuilt. Its `minzoom` by
+    then describes what it actually holds, so reading that would rebuild
+    nothing.
     """
-    try:
-        return min(min(zooms), int(meta["minzoom"]))
-    except (KeyError, ValueError):
-        return min(zooms)
+    for key in ("pyramid_pending", "minzoom"):
+        try:
+            return min(min(zooms), int(meta[key]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return min(zooms)
 
 
 def build(inp: Path, out: Path, source_zoom: int | None, min_zoom: int | None, jobs: int):
@@ -216,6 +220,9 @@ def build(inp: Path, out: Path, source_zoom: int | None, min_zoom: int | None, j
     con.execute("DETACH DATABASE src")
     if filled:
         print(f"  kept {filled} original tiles where no source existed to downscale")
+
+    # the pyramid this file was waiting for is now built
+    con.execute("DELETE FROM metadata WHERE name='pyramid_pending'")
 
     present = sorted(z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles"))
     meta = {"minzoom": str(min(present)), "maxzoom": str(max(present)),

@@ -328,11 +328,16 @@ def test_every_level_below_the_deepest_is_dropped(tmp_path):
     con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
     levels = [z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles")]
     minzoom = con.execute("SELECT value FROM metadata WHERE name='minzoom'").fetchone()
+    pending = con.execute(
+        "SELECT value FROM metadata WHERE name='pyramid_pending'").fetchone()
     con.close()
     assert levels == [Z], f"levels below the deepest survived: {levels}"
     assert (a := read(out, 1, 1)) is not None and (a[:, :90, 3] == 0).all(), \
         "and the deepest level must still have been stripped"
-    assert minzoom is None, "strip does not invent a minzoom the source never had"
+    assert minzoom == (str(Z),), \
+        "the file claims a pyramid it does not have"
+    assert pending == (str(Z - 1),), \
+        "nothing records the floor downscale is meant to rebuild to"
 
 
 def _limit_pad():

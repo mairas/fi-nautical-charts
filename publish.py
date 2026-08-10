@@ -362,6 +362,15 @@ def _publish(sources: list[Path], dest: Path, verbose: bool) -> dict:
             meta = read_meta(src)
         except sqlite3.DatabaseError as exc:
             raise Unpublishable(f"{src.name}: not readable as MBTiles ({exc})") from exc
+        if meta.get("pyramid_pending"):
+            # strip_nodata deletes every level below the one it cleans and
+            # leaves this behind for downscale to build back and clear.
+            # Publishing here would serve one zoom level and retire the last
+            # edition that had the rest.
+            raise Unpublishable(
+                f"{src.name} is a stripped intermediate waiting for its lower "
+                f"zoom levels (pyramid_pending=z{meta['pyramid_pending']}); "
+                f"run downscale on it before publishing")
         plan.append((src, published_name(meta), layer_prefix(meta), meta))
 
     by_layer = {}

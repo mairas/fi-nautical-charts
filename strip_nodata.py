@@ -622,10 +622,20 @@ def run(src: Path, out: Path, jobs: int, offeez: bool, radius: int = RADIUS,
     # Every level below the one just cleaned is a separate rendering of the same
     # coastline and still carries its fill. Downscale rebuilds them all from
     # here, so leaving them would ship whichever the rebuild happened not to
-    # overwrite; metadata keeps minzoom, which is what says how far down to go.
+    # overwrite.
+    #
+    # What is left is not a chart, and it says so. `minzoom` becomes the one
+    # level it holds, because a file that claims a pyramid it does not have will
+    # pass every check that reads the header and none that looks at the tiles;
+    # `pyramid_pending` carries the floor downscale is to rebuild to, and
+    # downscale clears it. Publish refuses anything still carrying it.
     stale = [z for z in zs if z < deep]
     if stale:
         con.execute("DELETE FROM tiles WHERE zoom_level<?", (deep,))
+        con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
+                    ("pyramid_pending", str(min(stale))))
+        con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
+                    ("minzoom", str(deep)))
         con.commit()
         print(f"  dropped z{min(stale)}..z{deep - 1} for downscale to rebuild from z{deep}")
 

@@ -64,6 +64,30 @@ def test_metadata_that_says_nothing_usable_falls_back_to_the_tiles(meta):
     assert ds.floor_zoom([9, 10], meta) == 9
 
 
+def test_the_pending_floor_wins_over_a_truthful_minzoom():
+    """A stripped file's minzoom describes what it holds -- one level -- so
+    reading that would rebuild nothing. The floor it wants is recorded
+    separately."""
+    assert ds.floor_zoom([13], {"pyramid_pending": "5", "minzoom": "13"}) == 5
+
+
+def test_the_rebuilt_file_no_longer_says_it_is_waiting(tmp_path):
+    """publish refuses anything carrying the marker, so downscale has to clear
+    it or nothing built this way could ever be published."""
+    src = build(tmp_path / "pending.mbtiles",
+                {12: [(x, y) for x in range(2048, 2052) for y in range(1200, 1204)]},
+                {"minzoom": "12", "maxzoom": "12", "pyramid_pending": "9"})
+    out = tmp_path / "rebuilt.mbtiles"
+    ds.build(src, out, source_zoom=None, min_zoom=None, jobs=1)
+
+    con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
+    meta = dict(con.execute("SELECT name, value FROM metadata"))
+    levels = sorted(z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles"))
+    con.close()
+    assert "pyramid_pending" not in meta, "the rebuilt file still reads as unfinished"
+    assert levels == [9, 10, 11, 12] and meta["minzoom"] == "9"
+
+
 def test_a_stripped_file_is_rebuilt_all_the_way_down(tmp_path):
     """End to end: one level in, the whole pyramid out."""
     src = build(tmp_path / "one-level.mbtiles",
