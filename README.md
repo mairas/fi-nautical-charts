@@ -194,7 +194,7 @@ that walk. Only tiles it reaches, and the chart tiles they touch, are examined a
 all — the interior is never a candidate, whatever its ink looks like.
 
 Inside an examined tile the question becomes a shape one, but at a scale no
-place name reaches: a fill pixel is dark for `--radius` (64) in every direction.
+place name reaches: a fill pixel is dark for `--radius` (128) in every direction.
 Nothing narrower than twice that can satisfy it, and Traficom sets its capitals
 at 10–16px across, so type cannot start a removal however the tile is bounded.
 The fill is then what that test finds running in from the tile's margin, and the
@@ -285,14 +285,23 @@ grey is indistinguishable from chart content — no later pass can find it.
 
 ### The white beyond the chart limits
 
-The same layers also render the area beyond the Finnish EEZ as **opaque white**,
-which occludes whatever basemap sits under the chart. This half of the problem
-needs a different method, because white is not a colour the chart reserves for
-off-sheet: open sea is white too, and locally the two are identical — same
-colour, same solidity. Only what encloses them differs.
+The same layers also render the area beyond the chart's outer limits as **opaque
+white**, which occludes whatever basemap sits under the chart. `--remove-white`
+says how far to go after it: `none`, `tiles` for whole blank tiles only, or
+`pixels` (the default) to trim the tiles the limit crosses as well. This half of
+the problem needs a different method, because white is not a colour the chart
+reserves for off-sheet: open sea is white too, and locally the two are identical
+— same colour, same solidity. Only what encloses them differs.
+
+Blank means every channel at `--white-level` or above, 255 by default. Not mean
+luminance: that puts a sounding's anti-aliased skirt and the pale tint at the
+edge of a depth area on the no-data side of the line, and the flood then reads a
+figure's own soft edge as more of the blank it stands in. The level is a setting
+because Traficom does not render blank the same everywhere — the south-eastern
+sheets draw it `fefefe`, corner fill included, and at 255 none of it is found.
 
 So the second pass works on the **tile grid**, not on pixels. A tile is *marked*
-if any opaque pixel of it is non-white, *featureless* otherwise. Flood the grid
+if any opaque pixel of it is non-blank, *featureless* otherwise. Flood the grid
 inward from beyond the data, crossing only featureless tiles; a marked tile is a
 wall. Featureless tiles the flood reaches are outside and get deleted; those it
 cannot reach are enclosed by chart content — open water between soundings — and
@@ -313,7 +322,7 @@ guards, because on a tile the limit crosses, tile granularity has run out:
 
 - **The radius**, because the dashes the tile fence closes are still open at
   pixel scale. A disk of 10 passes between them and empties water well inside
-  coverage — 868 tiles at z13, whole coastlines and depth contours gone. At 64
+  coverage — 868 tiles at z13, whole coastlines and depth contours gone. At 128
   no disk fits through a gap.
 - **The direction**, because the tile's inward side has open water on it, and
   open water is qualifying white. A flood seeded from the whole margin starts
@@ -331,7 +340,7 @@ off-sheet and 1,786 more straddle a sheet edge; 6,676 blank tiles are dropped
 past the limit and 1,793 straddle it. Six tiles end up keeping dark too thick to
 be type — leftover fill in wedges narrower than the radius can find.
 
-The two passes check each other. The off-EEZ pass runs on the black-stripped
+The two passes check each other. The white pass runs on the black-stripped
 tiles and classifies any fill still there as a *marking*, so black left behind
 walls its flood; its counts moving is how an under-strip shows up even when no
 pixel is inspected.
@@ -534,7 +543,7 @@ same layer and an older edition — matching on the filename would also hit buil
 variants, hand-placed files, and a newer edition being republished over.
 
 The manifest closes a gap the filenames cannot. A name records the *source*
-edition, so the fill-strip and off-EEZ work changed the tiles without changing
+edition, so the fill-strip and white-removal work changed the tiles without changing
 any name, and anything caching by URL kept serving the old content.
 
 | Field | Meaning |
@@ -563,7 +572,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-disk128-b2-directed+offeez-pixel; box-2x-premultiplied from z15 on 2026-08-09",
+      "processing": "opaque-black-disk128-b2-directed-w255+white-pixels; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]

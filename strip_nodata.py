@@ -66,58 +66,67 @@ RADIUS = 128        # a fill pixel is dark for this far in every direction.
 DARK = 40           # the transition is one pixel; this catches it
 BLEED = 2           # pixels erased past the fill, over the chart's own edge
 TILE = 256
+WHITE = 255         # an opaque pixel is blank paper if every channel is at
+                    # least this. Most sheets render blank as ffffff, but the
+                    # south-eastern ones render it fefefe, corner fill included,
+                    # so at 255 nothing there is blank and none of it is found
 BATCH = 2000        # tiles held in memory at once
 
 
-# What to do about the blank past the outer limit. Two separate things, and
-# only one of them is risky: dropping a tile that is blank throughout cannot
-# touch chart, while trimming the blank on a tile the limit crosses is a pixel
-# flood that needs a drawn boundary to stop at. A layer whose sheets simply end
-# gets "tiles" and keeps its chart.
-OFFEEZ = {"none": "", "tiles": "+offeez-tiles", "pixels": "+offeez-pixel"}
+# How far to go removing the blank white Traficom draws past a chart's outer
+# limits. Two separate things, and only one of them is risky: dropping a tile
+# that is blank throughout cannot touch chart, while trimming the blank on a
+# tile the limit crosses is a pixel flood that needs a drawn boundary to stop
+# at. A layer whose sheets simply end gets "tiles" and keeps its chart.
+REMOVE_WHITE = {"none": "", "tiles": "+white-tiles", "pixels": "+white-pixels"}
 
 
 def processing_stamp(radius: int = RADIUS, bleed: int = BLEED, *,
-                     offeez: str) -> str:
+                     remove_white: str, white: int = WHITE) -> str:
     """What a run with these settings records as nodata_stripped.
 
     Written into the file and read back by anything deciding whether a
     published chart was built by the current recipe, so the two must be one
     definition rather than two strings that agree until one of them changes.
     """
-    return (f"opaque-black-disk{radius}-b{bleed}-directed-purewhite"
-            + OFFEEZ[offeez])
+    return (f"opaque-black-disk{radius}-b{bleed}-directed-w{white}"
+            + REMOVE_WHITE[remove_white])
 
 
-def blank(a: np.ndarray) -> np.ndarray:
-    """Pure paper, and nothing else.
+def blank(a: np.ndarray, white: int = WHITE) -> np.ndarray:
+    """Blank paper, and nothing else.
 
-    Only 255,255,255 counts as no data. Every other value is something the
+    Every channel has to reach `white`. Anything below it is something the
     cartographer drew -- the anti-aliased skirt of a sounding, the pale tint at
     the edge of a depth area, a hairline at less than full contrast. Judging by
-    a threshold instead put all of that on the no-data side of the line, and the
-    flood then treats a figure's own soft edge as more of the blank it is
+    mean luminance instead put all of that on the no-data side of the line, and
+    the flood then treats a figure's own soft edge as more of the blank it is
     standing in.
+
+    The level is a setting rather than 255 because Traficom does not render
+    blank the same everywhere: the south-eastern sheets draw it fefefe, and one
+    step of slack there is the difference between finding all of it and finding
+    none of it.
     """
-    return ((a[..., 0] == 255) & (a[..., 1] == 255) & (a[..., 2] == 255))
+    return a[..., :3].min(axis=2) >= white
 
 
-def tile_has_marks(blob):
+def tile_has_marks(blob, white: int = WHITE):
     """True if the tile carries anything but blank paper. Deliberately generous:
     one non-white opaque pixel is enough, so any doubt makes a tile untouchable."""
     a = np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA"))
     op = a[..., 3] == 255
     if not op.any():
         return False
-    return bool((op & ~blank(a)).any())
+    return bool((op & ~blank(a, white)).any())
 
 
-def classify(con, z):
+def classify(con, z, white: int = WHITE):
     """(marked, featureless) tile sets at one zoom, in XYZ coordinates."""
     marked, feat = set(), set()
     for x, row, blob in con.execute("SELECT tile_column, tile_row, tile_data FROM tiles "
                                     "WHERE zoom_level=?", (z,)):
-        (marked if tile_has_marks(blob) else feat).add((x, (1 << z) - 1 - row))
+        (marked if tile_has_marks(blob, white) else feat).add((x, (1 << z) - 1 - row))
     return marked, feat
 
 
@@ -173,16 +182,16 @@ def _survey(task):
     extent, and measuring against the whole 256x256 would read those tiles as
     only nine-tenths black and let them pass for chart.
     """
-    z, x, row, blob = task
+    z, x, row, blob, white = task
     a = np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA"))
     opaque = a[..., 3] == 255
     black = opaque & (a[..., :3].max(axis=2) == 0)
-    other = opaque & ~blank(a) & ~black
+    other = opaque & ~blank(a, white) & ~black
     n = int(opaque.sum())
     return x, row, int(black.sum()), int(other.sum()), n
 
 
-def survey(con, z, pool):
+def survey(con, z, pool, white: int = WHITE):
     """One zoom's tiles as (ink, plain, black), in XYZ coordinates.
 
     `ink` is everything that draws in a colour other than black -- chart, and
@@ -193,7 +202,7 @@ def survey(con, z, pool):
     """
     ink, plain, black = set(), set(), {}
     for rows in batches(con, z, BATCH):
-        tasks = [(z, x, row, blob) for x, row, blob in rows]
+        tasks = [(z, x, row, blob, white) for x, row, blob in rows]
         for x, row, blk, other, opaque in pool.map(_survey, tasks, chunksize=32):
             xy = (x, (1 << z) - 1 - row)
             black[xy] = blk
@@ -214,23 +223,31 @@ def fillable(a: np.ndarray) -> np.ndarray:
             | (a[..., 3] == 0))
 
 
-def vacant(a: np.ndarray) -> np.ndarray:
+def vacant(a: np.ndarray, white: int = WHITE) -> np.ndarray:
     """Blank paper, or no data at all.
 
     The other thing Traficom renders where there is no chart: past the outer
     limit it draws nothing rather than black, so the same question -- what runs
     in from outside -- has a second answer in a second colour.
     """
-    return ((a[..., 3] == 255) & blank(a)) | (a[..., 3] == 0)
+    return ((a[..., 3] == 255) & blank(a, white)) | (a[..., 3] == 0)
 
 
-PREDICATE = {"black": fillable, "white": vacant}
+def nodata_test(kind: str, white: int = WHITE):
+    """The test for one of the two colours Traficom renders no chart in.
+
+    Bound to its level rather than looked up bare, because the white one has a
+    setting and the black one does not, and a worker is handed the kind as a
+    string.
+    """
+    return fillable if kind == "black" else lambda a: vacant(a, white)
 
 
 def _edges(task):
     """A tile's borders and corners, `margin` deep, under one predicate."""
-    z, x, row, blob, margin, kind = task
-    d = PREDICATE[kind](np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA")))
+    z, x, row, blob, margin, kind, white = task
+    d = nodata_test(kind, white)(
+        np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA")))
     m = margin
     return x, row, {"l": d[:, :m].copy(), "r": d[:, -m:].copy(),
                     "t": d[:m, :].copy(), "b": d[-m:, :].copy(),
@@ -238,7 +255,7 @@ def _edges(task):
                     "lb": d[-m:, :m].copy(), "rb": d[-m:, -m:].copy()}
 
 
-def edge_lines(con, z, want, pool, kind="black", margin=RADIUS):
+def edge_lines(con, z, want, pool, kind="black", margin=RADIUS, white=WHITE):
     """The border strips of every tile a candidate needs to be padded with.
 
     A tile cannot tell fill from ink at its own edge without knowing what is on
@@ -255,7 +272,7 @@ def edge_lines(con, z, want, pool, kind="black", margin=RADIUS):
                             "tile_column=? AND tile_row=?",
                             (z, x, (1 << z) - 1 - y)).fetchone()
             if r:
-                tasks.append((z, x, (1 << z) - 1 - y, r[0], margin, kind))
+                tasks.append((z, x, (1 << z) - 1 - y, r[0], margin, kind, white))
         for x, row, e in pool.map(_edges, tasks, chunksize=32):
             out[(x, (1 << z) - 1 - row)] = e
     return out
@@ -342,7 +359,7 @@ def edge_tiles(ink, plain, black):
     return offsheet, facing(ink, reached)
 
 
-def wholly_offsheet(a: np.ndarray) -> bool:
+def wholly_offsheet(a: np.ndarray, white: int = WHITE) -> bool:
     """True if the only thing on this tile is off-sheet fill.
 
     The one question about fill a single tile can answer. Whether a black
@@ -356,7 +373,7 @@ def wholly_offsheet(a: np.ndarray) -> bool:
     if not n:
         return False
     black = opaque & (a[..., :3].max(axis=2) == 0)
-    other = opaque & ~blank(a) & ~black
+    other = opaque & ~blank(a, white) & ~black
     return (int(black.sum()) >= MIN_FILL and int(other.sum()) <= MIN_FILL
             and int(black.sum()) / n >= FILL_FRACTION)
 
@@ -404,7 +421,8 @@ def widen(dark: np.ndarray, pad: dict, margin: int) -> np.ndarray:
 
 def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
                 bleed: int = BLEED, kind: str = "black",
-                outward: frozenset | None = None) -> np.ndarray:
+                outward: frozenset | None = None,
+                white: int = WHITE) -> np.ndarray:
     """Pixels belonging to off-sheet fill rather than to chart ink.
 
     A fill pixel is dark for `radius` in every direction, and that is the whole
@@ -431,7 +449,7 @@ def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
     `pad` of None means the tile is wholly outside the last sheet. Nothing there
     is chart, so nothing needs protecting.
     """
-    dark = PREDICATE[kind](a)
+    dark = nodata_test(kind, white)(a)
     if not dark.any() or pad is None:
         return dark
     big = widen(dark, pad, radius)
@@ -475,10 +493,10 @@ def spread(mask: np.ndarray, n: int) -> np.ndarray:
 
 
 def _strip(task):
-    z, x, row, blob, pad, outward, radius, bleed, kind = task
+    z, x, row, blob, pad, outward, radius, bleed, kind, white = task
     img = Image.open(io.BytesIO(blob)).convert("RGBA")
     a = np.asarray(img).copy()
-    m = nodata_mask(a, pad, radius, bleed, kind, outward)
+    m = nodata_mask(a, pad, radius, bleed, kind, outward, white)
     n = int(m.sum())
     if n < MIN_FILL:
         return None
@@ -508,7 +526,7 @@ def batches(con, z, size):
         last = (rows[-1][0], rows[-1][1])
 
 
-def scan(src: Path, jobs: int) -> None:
+def scan(src: Path, jobs: int, white: int = WHITE) -> None:
     """What a run would examine, by the same reckoning the run uses.
 
     Answering this with the local shape test alone -- as a dry run naturally
@@ -520,7 +538,7 @@ def scan(src: Path, jobs: int) -> None:
     deep = max(z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles"))
     print(f"=== {src.name} ===")
     with ProcessPoolExecutor(max_workers=jobs) as pool:
-        ink, plain, black = survey(con, deep, pool)
+        ink, plain, black = survey(con, deep, pool, white)
     offsheet, straddling = edge_tiles(ink, plain, black)
     px = sum(black.get(t, 0) for t in offsheet)
     print(f"  z{deep:<3} {len(offsheet):>6} off-sheet and {len(straddling):>5} "
@@ -530,7 +548,7 @@ def scan(src: Path, jobs: int) -> None:
     con.close()
 
 
-def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool):
+def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool, white=WHITE):
     """Erase one colour of no-data from one zoom. Returns (rewritten, dropped).
 
     `whole` are tiles that are nothing but it. `straddle` maps each chart tile
@@ -546,7 +564,7 @@ def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool):
     want = sorted({(x + dx, y + dy) for (x, y), sides in straddle.items()
                    for (dx, dy), side in AROUND.items() if side not in sides}
                   | straddle.keys())
-    edges = edge_lines(con, z, want, pool, kind, radius)
+    edges = edge_lines(con, z, want, pool, kind, radius, white)
     todo = sorted(whole | straddle.keys())
     for i in range(0, len(todo), BATCH):
         tasks = []
@@ -558,7 +576,7 @@ def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool):
                    else surround((x, y), edges, straddle[(x, y)]))
             if blob:
                 tasks.append((z, x, row, blob[0], pad, straddle.get((x, y)),
-                              radius, bleed, kind))
+                              radius, bleed, kind, white))
         for res in pool.map(_strip, tasks, chunksize=32):
             if res is None:
                 continue
@@ -576,8 +594,8 @@ def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool):
     return rewritten, dropped
 
 
-def run(src: Path, out: Path, jobs: int, offeez: str, radius: int = RADIUS,
-        bleed: int = BLEED) -> None:
+def run(src: Path, out: Path, jobs: int, remove_white: str,
+        radius: int = RADIUS, bleed: int = BLEED, white: int = WHITE) -> None:
     # built beside the target and moved into place at the end, so a run that
     # dies partway cannot leave a valid-looking partial chart where the good
     # one was
@@ -600,41 +618,41 @@ def run(src: Path, out: Path, jobs: int, offeez: str, radius: int = RADIUS,
     deep = max(zs)
     rewritten = dropped = 0
     with ProcessPoolExecutor(max_workers=jobs) as pool:
-        ink, plain, black = survey(con, deep, pool)
+        ink, plain, black = survey(con, deep, pool, white)
         offsheet, straddling = edge_tiles(ink, plain, black)
         leaked(black, offsheet | straddling.keys(), deep)
         print(f"  z{deep} {len(offsheet)} off-sheet, {len(straddling)} straddling "
               f"of {len(ink) + len(plain)} tiles")
         rewritten, dropped = pixel_pass(con, deep, offsheet, straddling,
-                                        "black", radius, bleed, pool)
+                                        "black", radius, bleed, pool, white)
         print(f"  z{deep} rewrote {rewritten}, dropped {dropped}")
 
-        if offeez != "none":
+        if remove_white != "none":
             # classified from the black-stripped tiles, so removed fill cannot
             # pose as a marking and wall the flood out of its own region
-            drops = flood_outside(*classify(con, deep))
+            drops = flood_outside(*classify(con, deep, white))
             for x, y in drops:
                 con.execute("DELETE FROM tiles WHERE zoom_level=? AND tile_column=? "
                             "AND tile_row=?", (deep, x, (1 << deep) - 1 - y))
             con.commit()
-            print(f"  z{deep} off-EEZ: {len(drops)} tiles dropped whole")
+            print(f"  z{deep} blank: {len(drops)} tiles dropped whole")
             dropped += len(drops)
 
-        if offeez == "pixels":
+        if remove_white == "pixels":
             # Dropping tiles can only take one that is blank throughout. Where
             # the limit crosses one, the blank half stays -- the same shape of
             # leftover the fill used to leave, in the other colour. Trimming it
             # is a pixel flood, and a flood needs a drawn boundary to stop at:
             # where a sheet simply ends, the water inside is the same white as
             # the blank outside and it takes both.
-            marked, feat = classify(con, deep)
+            marked, feat = classify(con, deep, white)
             # walk_outside, not flood_outside: the drop above has just deleted
             # the blank tiles, so what a boundary tile now faces is an empty
             # cell rather than a featureless neighbour
             reached = walk_outside(marked, feat)
             straddle = facing(marked, reached)
             wr, wd = pixel_pass(con, deep, set(), straddle, "white",
-                                radius, bleed, pool)
+                                radius, bleed, pool, white)
             print(f"  z{deep} limit: {len(straddle)} straddling, {wr} rewritten, "
                   f"{wd} dropped")
             rewritten += wr
@@ -661,7 +679,9 @@ def run(src: Path, out: Path, jobs: int, offeez: str, radius: int = RADIUS,
         print(f"  dropped z{min(stale)}..z{deep - 1} for downscale to rebuild from z{deep}")
 
     con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
-                ("nodata_stripped", processing_stamp(radius, bleed, offeez=offeez)))
+                ("nodata_stripped",
+                 processing_stamp(radius, bleed, remove_white=remove_white,
+                                  white=white)))
     con.commit()
     con.execute("VACUUM")
     con.close()
@@ -683,22 +703,27 @@ def main():
                         f"(default {RADIUS}); below half the width of a place name "
                         f"the type starts qualifying too")
     p.add_argument("--scan", action="store_true", help="report what would change, write nothing")
-    p.add_argument("--offeez", choices=tuple(OFFEEZ), default="pixels",
-                   help="what to do about the blank beyond the chart limits: "
-                        "drop tiles that are blank throughout and trim the rest "
-                        "(pixels, the default), drop only whole blank tiles "
-                        "(tiles), or leave it alone (none). Trimming needs a "
-                        "drawn boundary to stop at; where a sheet simply ends it "
-                        "takes the water inside too")
+    p.add_argument("--remove-white", choices=tuple(REMOVE_WHITE), default="pixels",
+                   help="how far to go removing the blank white Traficom draws "
+                        "past a chart's outer limits: drop tiles that are blank "
+                        "throughout and trim the rest (pixels, the default), "
+                        "drop only whole blank tiles (tiles), or leave it alone "
+                        "(none). Trimming needs a drawn boundary to stop at; "
+                        "where a sheet simply ends it takes the water inside too")
+    p.add_argument("--white-level", type=int, default=WHITE,
+                   help=f"an opaque pixel is blank paper when every channel is "
+                        f"at least this (default {WHITE}). The south-eastern "
+                        f"sheets render blank as fefefe, corner fill included, "
+                        f"and need {WHITE - 1}")
     args = p.parse_args()
     if not args.input.exists():
         sys.exit(f"no such file: {args.input}")
     if args.scan:
-        scan(args.input, args.jobs or None)
+        scan(args.input, args.jobs or None, args.white_level)
         return
     out = args.out or args.input.with_suffix(".stripped.mbtiles")
-    run(args.input, out, args.jobs or None, args.offeez, args.radius,
-        args.bleed)
+    run(args.input, out, args.jobs or None, args.remove_white, args.radius,
+        args.bleed, args.white_level)
 
 
 if __name__ == "__main__":
