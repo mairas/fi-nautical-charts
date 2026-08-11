@@ -287,8 +287,8 @@ grey is indistinguishable from chart content — no later pass can find it.
 
 The same layers also render the area beyond the chart's outer limits as **opaque
 white**, which occludes whatever basemap sits under the chart. `--remove-white`
-says how far to go after it: `none`, `tiles` for whole blank tiles only, or
-`pixels` (the default) to trim the tiles the limit crosses as well. This half of
+says how far to go after it: `tiles` (the default) for whole blank tiles only,
+`pixels` to trim the tiles the limit crosses as well, or `none`. This half of
 the problem needs a different method, because white is not a colour the chart
 reserves for off-sheet: open sea is white too, and locally the two are identical
 — same colour, same solidity. Only what encloses them differs.
@@ -316,9 +316,10 @@ mistune.
 
 Dropping whole tiles can only take one that is blank throughout, so where the
 limit crosses a tile the blank half stays: the same shape of leftover the fill
-used to leave, in the other colour. Those tiles get the same pixel treatment as
-the black fill, and it is that pass — not this one — that needs both of its
-guards, because on a tile the limit crosses, tile granularity has run out:
+used to leave, in the other colour. `--remove-white pixels` gives those tiles
+the same treatment as the black fill, and it is that pass — not this one — that
+needs both of its guards, because on a tile the limit crosses, tile granularity
+has run out:
 
 - **The radius**, because the dashes the tile fence closes are still open at
   pixel scale. A disk of 10 passes between them and empties water well inside
@@ -329,6 +330,14 @@ guards, because on a tile the limit crosses, tile granularity has run out:
   there and empties the chart side too, with no dash to squeeze through and no
   radius large enough to stop it. 566 tiles at z13, several of them see-through
   end to end.
+
+Both guards hold only where the limit is *drawn*. Where a sheet simply ends —
+Rannikkokartat's seaward edges, most of Merikarttasarjat — there is no line at
+all: the water inside is the same white as the blank outside, the flood enters
+wherever a 128-radius disk fits between the soundings, and it takes surveyed
+water with the soundings left standing on transparency. Measured on
+Rannikkokartat z15: 2,365 tiles lost more than 20,000 pixels each. That is why
+`tiles` is the default and `pixels` is opt-in.
 
 The boundary is decided once, at the deepest zoom, and every coarser level
 inherits it by being built from those tiles: a parent exists only where a child

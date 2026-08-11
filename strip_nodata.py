@@ -77,7 +77,9 @@ BATCH = 2000        # tiles held in memory at once
 # limits. Two separate things, and only one of them is risky: dropping a tile
 # that is blank throughout cannot touch chart, while trimming the blank on a
 # tile the limit crosses is a pixel flood that needs a drawn boundary to stop
-# at. A layer whose sheets simply end gets "tiles" and keeps its chart.
+# at. Most sheets simply end, with the water inside the same white as the blank
+# outside and no line between them, so "tiles" is the default and "pixels" is
+# for a layer whose limit is actually drawn.
 REMOVE_WHITE = {"none": "", "tiles": "+white-tiles", "pixels": "+white-pixels"}
 
 
@@ -703,13 +705,14 @@ def main():
                         f"(default {RADIUS}); below half the width of a place name "
                         f"the type starts qualifying too")
     p.add_argument("--scan", action="store_true", help="report what would change, write nothing")
-    p.add_argument("--remove-white", choices=tuple(REMOVE_WHITE), default="pixels",
+    p.add_argument("--remove-white", choices=tuple(REMOVE_WHITE), default="tiles",
                    help="how far to go removing the blank white Traficom draws "
-                        "past a chart's outer limits: drop tiles that are blank "
-                        "throughout and trim the rest (pixels, the default), "
-                        "drop only whole blank tiles (tiles), or leave it alone "
-                        "(none). Trimming needs a drawn boundary to stop at; "
-                        "where a sheet simply ends it takes the water inside too")
+                        "past a chart's outer limits: drop whole blank tiles "
+                        "(tiles, the default), also trim the tiles the limit "
+                        "crosses (pixels), or leave it alone (none). Trimming "
+                        "needs a drawn boundary to stop at, and where a sheet "
+                        "simply ends there is none: the water inside is the "
+                        "same white as the blank outside and it takes both")
     p.add_argument("--white-level", type=int, default=WHITE,
                    help=f"an opaque pixel is blank paper when every channel is "
                         f"at least this (default {WHITE}). The south-eastern "
