@@ -242,6 +242,23 @@ def test_off_sheet_tiles_that_are_not_perfectly_uniform_are_still_stripped(tmp_p
     assert left == 0, f"{left} px of off-sheet fill survived on a {kind} tile"
 
 
+def test_a_label_crossing_the_sheet_cut_keeps_its_tile(tmp_path):
+    """A whole tile goes only when it is fill and nothing else. Eight pixels
+    square of a label that crossed the cut is content, so the tile stays and the
+    fill comes off around it -- the pixel flood's job, not the tile drop's."""
+    layout = dict(LAYOUT)
+    layout[(0, 1)] = "fill+speck"
+    src = build(tmp_path / "speck.mbtiles", layout)
+    out = tmp_path / "speck-out.mbtiles"
+    sn.run(src, out, jobs=1, remove_white="none")
+
+    a = read(out, 0, 1)
+    assert a is not None, "the tile was dropped although it carried a label"
+    kept = int(((a[..., 3] == 255) & (a[..., :3].max(axis=2) > sn.DARK)).sum())
+    assert kept, "the label was erased with the fill around it"
+    assert black_px(a) == 0, "the fill did not come off"
+
+
 def test_heavy_type_on_a_straddling_tile_survives(tmp_path):
     """Being examined is not being stripped. A place name near the sheet edge
     is thick enough to seed the erosion exactly as fill does, so on the one ring
@@ -405,6 +422,38 @@ def test_a_dimmer_blank_is_found_only_once_the_level_is_lowered(tmp_path):
     assert read(gone, 1, 1) is None, "still not blank at 254"
     assert stamp_of(kept) != stamp_of(gone), \
         "two recipes, one stamp: nothing can tell the files apart"
+
+
+def test_water_between_soundings_is_held_by_its_neighbours(tmp_path):
+    """A tile with no sounding on it is blank by every local test, so the walk
+    crosses it and the drop takes it -- and where a sheet simply ends there is
+    nothing to stop that running inward. What separates such a tile from one
+    past the last sheet is how much chart is against it."""
+    layout = {(1, 1): "blank"}          # water between soundings draws nothing
+    layout |= {(0, 1): "content", (2, 1): "content", (1, 0): "content"}
+    layout |= {(1, 2): "blank", (0, 0): "blank", (2, 0): "blank",
+               (0, 2): "blank", (2, 2): "blank"}
+    src = build(tmp_path / "held.mbtiles", layout)
+    out = tmp_path / "held-out.mbtiles"
+    sn.run(src, out, jobs=1, remove_white="tiles")
+
+    assert read(out, 1, 2) is None, "blank past the sheet was kept"
+    assert read(out, 1, 1) is not None, \
+        "water with three chart tiles against it was dropped"
+
+
+def test_the_neighbour_count_still_lets_a_straight_edge_go(tmp_path):
+    """The counterpart: below a straight run of chart a blank tile has one
+    chart tile on it, and must stay removable. Counted over eight neighbours it
+    would have three, and nothing at any straight edge could ever go."""
+    layout = {(x, 0): "content" for x in range(3)}
+    layout |= {(x, 1): "blank" for x in range(3)}
+    src = build(tmp_path / "edge.mbtiles", layout)
+    out = tmp_path / "edge-out.mbtiles"
+    sn.run(src, out, jobs=1, remove_white="tiles")
+
+    assert all(read(out, x, 1) is None for x in range(3)), \
+        "blank below a straight sheet edge was held"
 
 
 def test_water_inside_the_limit_survives_a_whole_run(tmp_path):
