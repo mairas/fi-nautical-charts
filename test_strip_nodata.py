@@ -443,6 +443,26 @@ def test_water_between_soundings_is_held_by_its_neighbours(tmp_path):
         "water with three chart tiles against it was dropped"
 
 
+def test_a_blind_corridor_of_water_seals_from_its_closed_end(tmp_path):
+    """Why the count is over what survives rather than over the original chart.
+
+    A one-tile channel of open water with chart above and below has two chart
+    tiles against every one of its tiles, so counted once each passes on its own
+    and the whole channel is taken, right up to its closed end. Counted against
+    the survivors, the closed end is held first, that holding makes it a
+    survivor, and the seal walks back out along the channel."""
+    layout = {(x, 0): "content" for x in range(4)}
+    layout |= {(x, 2): "content" for x in range(4)}
+    layout |= {(0, 1): "content"}                    # the closed end
+    layout |= {(x, 1): "blank" for x in range(1, 4)}  # open to the east
+    src = build(tmp_path / "corridor.mbtiles", layout)
+    out = tmp_path / "corridor-out.mbtiles"
+    sn.run(src, out, jobs=1, stages=("white-tiles",))
+
+    kept = [x for x in (1, 2, 3) if read(out, x, 1) is not None]
+    assert kept == [1, 2, 3], f"the channel was taken back to {kept}"
+
+
 def test_the_neighbour_count_still_lets_a_straight_edge_go(tmp_path):
     """The counterpart: below a straight run of chart a blank tile has one
     chart tile on it, and must stay removable. Counted over eight neighbours it

@@ -124,38 +124,63 @@ def tile_has_marks(blob, white: int = WHITE):
     return bool((op & ~blank(a, white)).any())
 
 
-def enclosed(marked, feat, limit: int = MAX_CHART_NEIGHBOURS):
-    """Blank tiles with more than `limit` chart tiles against them.
+SIDES = ((1, 0), (-1, 0), (0, 1), (0, -1))
 
-    Open water carries soundings, but not on every tile: a tile between two of
-    them draws nothing at all and is blank by every local test, so the grid walk
-    crosses it and the drop takes it. Where a sheet simply ends there is no line
-    to stop either, and the loss runs inward tile by tile.
 
-    What separates such a tile from one past the last sheet is how much chart is
-    against it. Counted over the four sides only, the same connectivity the walk
-    uses: a blank tile below a straight sheet edge has one chart tile on it and
-    must stay removable, and over eight it would have three and nothing at any
-    straight edge could ever go.
+def removable(marked, feat, limit: int = MAX_CHART_NEIGHBOURS):
+    """Which blank tiles may go, and which are held. Returns (drops, held).
+
+    A peel, starting from nothing removed. A blank tile goes when at most
+    `limit` tiles are still standing against it, counted over the four sides
+    only; removing it lowers the count for its own neighbours, which is what
+    lets the removal travel. Nothing is ever put back, so the order tiles are
+    tested in does not change the result.
+
+    Beginning with everything standing is what makes this safe. Open water
+    carries soundings, but not on every tile: a tile between two of them draws
+    nothing at all and is blank by every local test. Such a tile begins with
+    four neighbours against it and can only lose them to removals, so a field of
+    open water enclosed by chart never starts peeling at all -- there is no tile
+    in it, or on its rim, with fewer than three standing against it. The peel
+    can only begin where tiles are absent, which is the edge of the data, and
+    that is where the blank past the outer limit is.
+
+    So the walk is not needed here: what it used to establish -- that a blank
+    region reaches the outside -- is what having an absent neighbour says, and
+    the count says it tile by tile instead of in one sweep.
+
+    A corridor of water with chart above and below never goes either: two chart
+    tiles are against every tile of it, and chart is never removed, so the count
+    cannot fall below three until both blank neighbours have gone, and they are
+    held by the same argument.
     """
-    return {t for t in feat
-            if sum((t[0] + dx, t[1] + dy) in marked
-                   for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))) > limit}
+    present = set(marked) | set(feat)
+
+    def standing(t):
+        return sum((t[0] + dx, t[1] + dy) in present for dx, dy in SIDES)
+
+    removed = set()
+    q = deque(t for t in feat if standing(t) <= limit)
+    while q:
+        t = q.popleft()
+        if t not in present:
+            continue
+        removed.add(t)
+        present.discard(t)
+        for dx, dy in SIDES:
+            nb = (t[0] + dx, t[1] + dy)
+            if nb in feat and nb in present and standing(nb) <= limit:
+                q.append(nb)
+    return removed, feat - removed
 
 
-def classify(con, z, white: int = WHITE, limit: int = MAX_CHART_NEIGHBOURS):
-    """(marked, featureless) tile sets at one zoom, in XYZ coordinates.
-
-    Tiles the neighbour count holds are returned as marked, so they are walls to
-    the walk as well as safe from the drop -- otherwise the walk crosses them
-    and takes the next tile in instead.
-    """
+def classify(con, z, white: int = WHITE):
+    """(marked, featureless) tile sets at one zoom, in XYZ coordinates."""
     marked, feat = set(), set()
     for x, row, blob in con.execute("SELECT tile_column, tile_row, tile_data FROM tiles "
                                     "WHERE zoom_level=?", (z,)):
         (marked if tile_has_marks(blob, white) else feat).add((x, (1 << z) - 1 - row))
-    held = enclosed(marked, feat, limit)
-    return marked | held, feat - held
+    return marked, feat
 
 
 def walk_outside(marked, feat):
@@ -192,14 +217,6 @@ def walk_outside(marked, feat):
                 continue
             seen.add(n); q.append(n)
     return seen
-
-
-def flood_outside(marked, feat):
-    """Featureless tiles reachable from beyond the data.
-
-    Those the walk cannot reach are enclosed by chart content -- open water
-    between soundings -- and are kept."""
-    return feat & walk_outside(marked, feat)
 
 
 def _survey(task):
@@ -728,9 +745,11 @@ def run(src: Path, out: Path, jobs: int, stages=DEFAULT_STAGES,
             dropped += d
 
         if "white-tiles" in stages:
-            gone = drop(con, deep, flood_outside(*classify(con, deep, white, limit)))
+            drops, held = removable(*classify(con, deep, white), limit)
+            gone = drop(con, deep, drops)
             dropped += gone
-            print(f"  z{deep} blank: {gone} tiles dropped whole")
+            print(f"  z{deep} blank: {gone} tiles dropped whole, "
+                  f"{len(held)} held by their neighbours")
 
         if "white-pixels" in stages:
             # Dropping tiles can only take one that is blank throughout. Where
@@ -739,10 +758,14 @@ def run(src: Path, out: Path, jobs: int, stages=DEFAULT_STAGES,
             # is a pixel flood, and a flood needs a drawn boundary to stop at:
             # where a sheet simply ends, the water inside is the same white as
             # the blank outside and it takes both.
-            marked, feat = classify(con, deep, white, limit)
-            # walk_outside, not flood_outside: the drop above has just deleted
-            # the blank tiles, so what a boundary tile now faces is an empty
-            # cell rather than a featureless neighbour
+            marked, feat = classify(con, deep, white)
+            # A tile the neighbour count holds is a wall here too, or the walk
+            # crosses it and the flood trims the next tile in instead.
+            _, held = removable(marked, feat, limit)
+            marked, feat = marked | held, feat - held
+            # walk_outside, not the drop set: white-tiles has just deleted the
+            # blank tiles, so what a boundary tile now faces is an empty cell
+            # rather than a featureless neighbour
             reached = walk_outside(marked, feat)
             straddle = facing(marked, reached)
             wr, wd = pixel_pass(con, deep, set(), straddle, "white",
