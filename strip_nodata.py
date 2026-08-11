@@ -372,26 +372,23 @@ def facing(tiles, reached) -> dict:
 
 
 def edge_tiles(chart, plain, fill):
-    """Tiles where off-sheet fill can be, and only those.
+    """Every tile that carries fill and that the outside touches, and the sides
+    it touches each from.
 
     The fill is not a shape to recognise inside a tile. It is a region of the
     tile grid: it lies beyond the last sheet and runs to the edge of the data,
-    so the same walk that finds the water outside the EEZ finds it. A tile the
-    walk cannot reach is enclosed by chart, and whatever black it holds is ink
-    -- however thick, and Traficom sets place names heavy enough that no local
-    shape test can tell them from fill.
+    so the same walk that finds the water outside the limits finds it. A tile
+    the walk cannot reach is enclosed by chart, and whatever black it holds is
+    ink -- however thick, and Traficom sets place names heavy enough that no
+    local shape test can tell them from fill.
 
-    The walk is a protective mask, not a classifier: everything it reaches that
-    carries black is examined, and so is every chart tile it touches. Deciding
-    candidacy by class instead would exempt whole classes of tile that plainly
-    hold fill -- a sheet corner that is half fill and half blank paper draws no
-    colour at all, and is neither chart nor wholly off-sheet.
-
-    Returns the off-sheet tiles and the chart tiles that abut them.
+    Candidacy is not decided by class. A sheet corner that is half fill and half
+    blank paper draws no colour at all, so it is neither chart nor a tile the
+    walk can cross; deciding by class would exempt it and leave its fill. What
+    qualifies a tile is having fill on it and having the outside against it.
     """
     reached = walk_outside(chart, plain)
-    offsheet = {t for t in reached & plain if fill.get(t, 0)}
-    return offsheet, facing(chart, reached)
+    return facing({t for t, n in fill.items() if n}, reached)
 
 
 def wholly_offsheet(a: np.ndarray) -> bool:
@@ -574,13 +571,12 @@ def scan(src: Path, jobs: int, white: int = WHITE) -> None:
     deep = max(z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles"))
     print(f"=== {src.name} ===")
     with ProcessPoolExecutor(max_workers=jobs) as pool:
-        chart, plain, fill, _ = survey(con, deep, pool, white)
-    offsheet, straddling = edge_tiles(chart, plain, fill)
-    px = sum(fill.get(t, 0) for t in offsheet)
-    print(f"  z{deep:<3} {len(offsheet):>6} off-sheet and {len(straddling):>5} "
-          f"straddling of {len(chart) + len(plain):>7} tiles, {px / 65536:.0f} "
-          f"tiles' worth of fill beyond the sheets")
-    print(f"  {len(offsheet) + len(straddling)} tiles would be examined")
+        chart, plain, fill, solid = survey(con, deep, pool, white)
+    straddling = edge_tiles(chart, plain, fill)
+    px = sum(fill.get(t, 0) for t in straddling)
+    print(f"  z{deep:<3} {len(solid):>6} tiles are fill throughout and "
+          f"{len(straddling):>5} carry fill the outside touches, of "
+          f"{len(chart) + len(plain):>7}; {px / 65536:.0f} tiles' worth of fill")
     con.close()
 
 
@@ -679,12 +675,12 @@ def run(src: Path, out: Path, jobs: int, stages=DEFAULT_STAGES,
             # faces, and a tile whose fill neighbour is now an empty cell is
             # padded from the walk's word rather than from the neighbour.
             chart, plain, fill, solid = survey(con, deep, pool, white)
-            offsheet, straddling = edge_tiles(chart, plain, fill)
-            leaked(solid, offsheet | straddling.keys(), deep)
-            r, d = pixel_pass(con, deep, offsheet, straddling,
+            straddling = edge_tiles(chart, plain, fill)
+            leaked(solid, straddling.keys(), deep)
+            r, d = pixel_pass(con, deep, set(), straddling,
                               "black", radius, bleed, pool, white)
-            print(f"  z{deep} fill: {len(offsheet)} off-sheet, "
-                  f"{len(straddling)} straddling, {r} rewritten, {d} dropped")
+            print(f"  z{deep} fill: {len(straddling)} tiles the outside touches, "
+                  f"{r} rewritten, {d} dropped")
             rewritten += r
             dropped += d
 

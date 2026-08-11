@@ -318,7 +318,7 @@ def test_a_run_that_would_leave_solid_fill_behind_refuses(tmp_path, monkeypatch)
     nothing but fill and was not examined is a fact, not an inference."""
     src = build(tmp_path / "src.mbtiles", LAYOUT)
     out = tmp_path / "out.mbtiles"
-    monkeypatch.setattr(sn, "edge_tiles", lambda ink, plain, black: (set(), {}))
+    monkeypatch.setattr(sn, "edge_tiles", lambda chart, plain, fill: {})
 
     # black-pixels alone: the tile stage before it drops solid fill outright, so
     # with both running there would be none left for the guard to find
