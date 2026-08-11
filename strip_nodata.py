@@ -74,18 +74,17 @@ MAX_CHART_NEIGHBOURS = 2
                     # held to be inside the chart, whatever it draws
 
 
-# How far to go removing the blank white Traficom draws past a chart's outer
-# limits. Two separate things, and only one of them is risky: dropping a tile
-# that is blank throughout cannot touch chart, while trimming the blank on a
-# tile the limit crosses is a pixel flood that needs a drawn boundary to stop
-# at. Most sheets simply end, with the water inside the same white as the blank
-# outside and no line between them, so "tiles" is the default and "pixels" is
-# for a layer whose limit is actually drawn.
-REMOVE_WHITE = {"none": "", "tiles": "+white-tiles", "pixels": "+white-pixels"}
+# The four removals, in the order they run. Each is a separate question, and
+# only two of them are risky: dropping a tile that is fill or blank throughout
+# cannot touch chart, while the pixel floods need a drawn boundary to stop at.
+# Most sheets simply end, with the water inside the same white as the blank
+# outside and no line between them, so white-pixels is off by default.
+STAGES = ("black-tiles", "black-pixels", "white-tiles", "white-pixels")
+DEFAULT_STAGES = ("black-tiles", "black-pixels", "white-tiles")
 
 
 def processing_stamp(radius: int = RADIUS, bleed: int = BLEED, *,
-                     remove_white: str, white: int = WHITE,
+                     stages=DEFAULT_STAGES, white: int = WHITE,
                      limit: int = MAX_CHART_NEIGHBOURS) -> str:
     """What a run with these settings records as nodata_stripped.
 
@@ -93,9 +92,8 @@ def processing_stamp(radius: int = RADIUS, bleed: int = BLEED, *,
     published chart was built by the current recipe, so the two must be one
     definition rather than two strings that agree until one of them changes.
     """
-    suffix = REMOVE_WHITE[remove_white]
-    return (f"opaque-black-disk{radius}-b{bleed}-directed-w{white}"
-            + (f"{suffix}-n{limit}" if suffix else ""))
+    return (f"nodata-r{radius}-b{bleed}-w{white}-n{limit}:"
+            + "+".join(s for s in STAGES if s in stages))
 
 
 def blank(a: np.ndarray, white: int = WHITE) -> np.ndarray:
@@ -632,7 +630,16 @@ def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool, white=WHITE):
     return rewritten, dropped
 
 
-def run(src: Path, out: Path, jobs: int, remove_white: str,
+def drop(con, z, tiles) -> int:
+    """Delete whole tiles at one zoom. Returns how many."""
+    for x, y in tiles:
+        con.execute("DELETE FROM tiles WHERE zoom_level=? AND tile_column=? "
+                    "AND tile_row=?", (z, x, (1 << z) - 1 - y))
+    con.commit()
+    return len(tiles)
+
+
+def run(src: Path, out: Path, jobs: int, stages=DEFAULT_STAGES,
         radius: int = RADIUS, bleed: int = BLEED, white: int = WHITE,
         limit: int = MAX_CHART_NEIGHBOURS) -> None:
     # built beside the target and moved into place at the end, so a run that
@@ -657,27 +664,36 @@ def run(src: Path, out: Path, jobs: int, remove_white: str,
     deep = max(zs)
     rewritten = dropped = 0
     with ProcessPoolExecutor(max_workers=jobs) as pool:
-        chart, plain, fill, solid = survey(con, deep, pool, white)
-        offsheet, straddling = edge_tiles(chart, plain, fill)
-        leaked(solid, offsheet | straddling.keys(), deep)
-        print(f"  z{deep} {len(offsheet)} off-sheet, {len(straddling)} straddling "
-              f"of {len(chart) + len(plain)} tiles")
-        rewritten, dropped = pixel_pass(con, deep, offsheet, straddling,
-                                        "black", radius, bleed, pool, white)
-        print(f"  z{deep} rewrote {rewritten}, dropped {dropped}")
+        if "black-tiles" in stages:
+            # Tiles that are fill and nothing else, and that the walk reaches
+            # from beyond the data. Nothing is drawn on them, so this cannot
+            # take chart however solid the fill is.
+            chart, plain, fill, solid = survey(con, deep, pool, white)
+            gone = drop(con, deep, solid & walk_outside(chart, plain))
+            dropped += gone
+            print(f"  z{deep} fill: {gone} tiles dropped whole "
+                  f"of {len(chart) + len(plain)}")
 
-        if remove_white != "none":
-            # classified from the black-stripped tiles, so removed fill cannot
-            # pose as a marking and wall the flood out of its own region
-            drops = flood_outside(*classify(con, deep, white, limit))
-            for x, y in drops:
-                con.execute("DELETE FROM tiles WHERE zoom_level=? AND tile_column=? "
-                            "AND tile_row=?", (deep, x, (1 << deep) - 1 - y))
-            con.commit()
-            print(f"  z{deep} blank: {len(drops)} tiles dropped whole")
-            dropped += len(drops)
+        if "black-pixels" in stages:
+            # Re-surveyed: the drop above has changed what each remaining tile
+            # faces, and a tile whose fill neighbour is now an empty cell is
+            # padded from the walk's word rather than from the neighbour.
+            chart, plain, fill, solid = survey(con, deep, pool, white)
+            offsheet, straddling = edge_tiles(chart, plain, fill)
+            leaked(solid, offsheet | straddling.keys(), deep)
+            r, d = pixel_pass(con, deep, offsheet, straddling,
+                              "black", radius, bleed, pool, white)
+            print(f"  z{deep} fill: {len(offsheet)} off-sheet, "
+                  f"{len(straddling)} straddling, {r} rewritten, {d} dropped")
+            rewritten += r
+            dropped += d
 
-        if remove_white == "pixels":
+        if "white-tiles" in stages:
+            gone = drop(con, deep, flood_outside(*classify(con, deep, white, limit)))
+            dropped += gone
+            print(f"  z{deep} blank: {gone} tiles dropped whole")
+
+        if "white-pixels" in stages:
             # Dropping tiles can only take one that is blank throughout. Where
             # the limit crosses one, the blank half stays -- the same shape of
             # leftover the fill used to leave, in the other colour. Trimming it
@@ -719,7 +735,7 @@ def run(src: Path, out: Path, jobs: int, remove_white: str,
 
     con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
                 ("nodata_stripped",
-                 processing_stamp(radius, bleed, remove_white=remove_white,
+                 processing_stamp(radius, bleed, stages=stages,
                                   white=white, limit=limit)))
     con.commit()
     con.execute("VACUUM")
@@ -742,14 +758,14 @@ def main():
                         f"(default {RADIUS}); below half the width of a place name "
                         f"the type starts qualifying too")
     p.add_argument("--scan", action="store_true", help="report what would change, write nothing")
-    p.add_argument("--remove-white", choices=tuple(REMOVE_WHITE), default="tiles",
-                   help="how far to go removing the blank white Traficom draws "
-                        "past a chart's outer limits: drop whole blank tiles "
-                        "(tiles, the default), also trim the tiles the limit "
-                        "crosses (pixels), or leave it alone (none). Trimming "
-                        "needs a drawn boundary to stop at, and where a sheet "
-                        "simply ends there is none: the water inside is the "
-                        "same white as the blank outside and it takes both")
+    p.add_argument("--stages", default=",".join(DEFAULT_STAGES),
+                   help=f"which removals to run, comma separated, in any order "
+                        f"(they always run in the order listed here): "
+                        f"{', '.join(STAGES)}. Default {','.join(DEFAULT_STAGES)}. "
+                        f"The two tile stages drop only tiles that are fill or "
+                        f"blank throughout and so cannot take chart; the two "
+                        f"pixel stages are floods and need a drawn boundary to "
+                        f"stop at")
     p.add_argument("--white-level", type=int, default=WHITE,
                    help=f"an opaque pixel is blank paper when every channel is "
                         f"at least this (default {WHITE}). The south-eastern "
@@ -764,11 +780,16 @@ def main():
     args = p.parse_args()
     if not args.input.exists():
         sys.exit(f"no such file: {args.input}")
+    stages = tuple(s.strip() for s in args.stages.split(",") if s.strip())
+    unknown = [s for s in stages if s not in STAGES]
+    if unknown:
+        sys.exit(f"unknown stage(s): {', '.join(unknown)}; "
+                 f"choose from {', '.join(STAGES)}")
     if args.scan:
         scan(args.input, args.jobs or None, args.white_level)
         return
     out = args.out or args.input.with_suffix(".stripped.mbtiles")
-    run(args.input, out, args.jobs or None, args.remove_white, args.radius,
+    run(args.input, out, args.jobs or None, stages, args.radius,
         args.bleed, args.white_level, args.max_chart_neighbours)
 
 
