@@ -36,7 +36,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from publish import NAME, Unpublishable, layer_prefix
-from strip_nodata import BLEED, RADIUS, processing_stamp
+from strip_nodata import RADIUS, WHITE, processing_stamp
 
 REPO = Path(__file__).resolve().parent
 
@@ -44,8 +44,7 @@ REPO = Path(__file__).resolve().parent
 @dataclass(frozen=True)
 class Layer:
     wmts: str
-    fill: bool = False    # renders off-sheet as opaque black worth removing
-    blank: bool = False   # ... and blank white past the outer limit
+    stages: tuple[str, ...] = ()   # empty: this layer is not stripped at all
 
 
 # Which layer gets which pass, from a census of the deepest level of each
@@ -59,11 +58,19 @@ class Layer:
 #
 # Satamakartat has nothing to remove -- not one wholly-fill tile in 3,000 -- so
 # the strip there is all risk and no gain, and running the blank pass on it took
-# 5.2M pixels of surveyed water across 1,340 tiles, because its sheets end
-# without a drawn boundary for the flood to stop at. The other three draw one.
-LAYERS = [Layer("Yleiskartat 250k public", fill=True, blank=True),
-          Layer("Rannikkokartat public", fill=True, blank=True),
-          Layer("Merikarttasarjat public", fill=True, blank=True),
+# 5.2M pixels of surveyed water across 1,340 tiles.
+#
+# white-pixels trims the blank on the tiles the outer limit crosses, and needs
+# that limit to be drawn to stop at. Only Yleiskartat draws one, as a dashed
+# line the radius closes. Where a sheet simply ends the water inside is the same
+# white as the blank outside and the trim takes both, so the coastal layers stop
+# at white-tiles.
+DRAWN_LIMIT = ("black-tiles", "black-pixels", "white-tiles", "white-pixels")
+SHEETS_END = ("black-tiles", "black-pixels", "white-tiles")
+
+LAYERS = [Layer("Yleiskartat 250k public", DRAWN_LIMIT),
+          Layer("Rannikkokartat public", SHEETS_END),
+          Layer("Merikarttasarjat public", SHEETS_END),
           Layer("Satamakartat")]
 
 # Least of the archive's tiles a processed set may keep, measured against the
@@ -73,6 +80,11 @@ LAYERS = [Layer("Yleiskartat 250k public", fill=True, blank=True),
 # thorough one -- including a refresh that deleted tiles wholesale because the
 # server answered 404 for a while.
 MIN_KEPT = 0.5
+
+# Traficom does not render blank the same everywhere: the south-eastern sheets
+# draw it fefefe, corner fill included, so at the default 255 none of it is
+# found. One step of slack is the difference between finding all of it and none.
+WHITE_LEVEL = WHITE - 1
 
 NICE = 19           # every step yields the CPU; the neighbours are production
 IONICE_IDLE = "3"   # ionice class: disk only when nobody else wants it
@@ -281,10 +293,9 @@ def recipe(layer: Layer, archive: Path) -> tuple[str | None, int]:
     if zoom is None:
         raise Failed(f"{archive.name} holds no tiles, so there is no level to "
                      f"downscale from")
-    if not layer.fill:
+    if not layer.stages:
         return None, zoom
-    return processing_stamp(RADIUS, BLEED,
-                            offeez="pixels" if layer.blank else "none"), zoom
+    return processing_stamp(RADIUS, stages=layer.stages, white=WHITE_LEVEL), zoom
 
 
 def published(dest: Path, prefix: str) -> Path | None:
@@ -334,9 +345,8 @@ def process(layer: Layer, archive: Path, work: Path, jobs: int,
     source = archive
     if stamp is not None:
         strip = ["strip_nodata.py", str(archive), "--out", str(stripped),
-                 "--radius", str(RADIUS), "--bleed", str(BLEED),
-                 "--jobs", str(jobs)]
-        strip += ["--offeez", "pixels" if layer.blank else "none"]
+                 "--radius", str(RADIUS), "--white-level", str(WHITE_LEVEL),
+                 "--stages", ",".join(layer.stages), "--jobs", str(jobs)]
         run_step(uv(*strip), "strip-nodata")
         source = stripped
     run_step(uv("downscale.py", str(source), "--out", str(out),

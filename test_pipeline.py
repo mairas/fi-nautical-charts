@@ -25,7 +25,8 @@ from pipeline import Failed, Layer
 # from processing_stamp: the stamp is what tells a published chart apart from
 # one built by an older recipe, so a test that recomputes it would follow the
 # code and never notice the change that makes every published set look stale.
-LIVE_STAMP = "opaque-black-disk128-b2-directed+offeez-pixel"
+LIVE_STAMP = ("nodata-r128-w254-n2:"
+              "black-tiles+black-pixels+white-tiles+white-pixels")
 
 ARCHIVE_META = {
     "wmts_layer": "Yleiskartat 250k public",
@@ -43,8 +44,8 @@ PUBLISHED_META = ARCHIVE_META | {
     "downscaled": "2026-08-09",
 }
 
-YLEIS = Layer("Yleiskartat 250k public", fill=True, blank=True)
-DEEPEST = Layer("Rannikkokartat public", fill=True, blank=True)
+YLEIS = Layer("Yleiskartat 250k public", pipeline.DRAWN_LIMIT)
+DEEPEST = Layer("Rannikkokartat public", pipeline.SHEETS_END)
 ARCHIVE_NAME = "fi-yleiskartat250k-2026-06-02.mbtiles"
 
 
@@ -265,7 +266,9 @@ def test_an_archive_with_no_tiles_is_refused_rather_than_downscaled_from_nothing
 
 def test_the_expected_strip_stamp_is_what_published_charts_carry(archive):
     assert pipeline.recipe(YLEIS, archive / ARCHIVE_NAME)[0] == LIVE_STAMP
-    assert strip_nodata.processing_stamp(offeez="pixels") == LIVE_STAMP
+    assert strip_nodata.processing_stamp(
+        stages=pipeline.DRAWN_LIMIT,
+        white=pipeline.WHITE_LEVEL) == LIVE_STAMP
 
 
 # --- refusing a bad build ------------------------------------------------------
@@ -366,8 +369,9 @@ def test_strip_is_told_the_settings_the_recipe_predicts(archive, work, steps):
     assert str(src) in cmd
     assert Path(cmd[cmd.index("--out") + 1]).parent == work
     stamp = pipeline.recipe(YLEIS, src)[0]
-    assert cmd[cmd.index("--bleed") + 1] in stamp
+    assert cmd[cmd.index("--white-level") + 1] in stamp
     assert cmd[cmd.index("--radius") + 1] in stamp
+    assert cmd[cmd.index("--stages") + 1].replace(",", "+") in stamp
 
 
 def test_a_layer_with_nothing_to_strip_is_not_stripped(archive, work, steps):
@@ -386,20 +390,19 @@ def test_a_layer_with_nothing_to_strip_is_not_stripped(archive, work, steps):
     assert pipeline.recipe(plain, src)[0] is None
 
 
-def test_a_layer_with_no_blank_to_remove_is_told_so(archive, work, steps):
-    """The blank pass needs a drawn boundary to stop at. Satamakartat's sheets
-    end without one, so the flood runs on past into surveyed water -- 5.2M px
-    across 1,340 tiles when this was measured. It also has no blank worth
-    removing: 0.20% of its tiles, against 17% of Yleiskartat's."""
+def test_only_a_layer_that_draws_its_limit_gets_the_blank_trimmed(archive, work, steps):
+    """white-pixels needs a drawn limit to stop at. Where a sheet simply ends
+    the water inside is the same white as the blank outside and the trim takes
+    both -- 2,365 tiles lost more than 20,000 px each on Rannikkokartat when
+    this was measured. Only Yleiskartat draws one."""
     src = archive / ARCHIVE_NAME
-    plain = Layer("Satamakartat", fill=True)
     with pytest.raises(Failed):
-        pipeline.process(plain, src, work, jobs=1, baseline=100)
+        pipeline.process(DEEPEST, src, work, jobs=1, baseline=100)
     cmd = only(steps, "strip-nodata")
-    assert cmd[cmd.index("--offeez") + 1] == "none"
-    assert "offeez" not in pipeline.recipe(plain, src)[0]
-    assert "offeez-pixel" in pipeline.recipe(YLEIS, src)[0], \
-        "a layer that does draw a boundary lost the pass too"
+    assert "white-pixels" not in cmd[cmd.index("--stages") + 1]
+    assert "white-pixels" not in pipeline.recipe(DEEPEST, src)[0]
+    assert "white-pixels" in pipeline.recipe(YLEIS, src)[0], \
+        "the one layer that does draw a limit lost the trim too"
 
 
 def test_the_layer_table_matches_the_census_it_was_set_from():
@@ -409,14 +412,17 @@ def test_the_layer_table_matches_the_census_it_was_set_from():
     From a 3,000-tile sample of each archive's deepest level, share of tiles
     that are nothing but off-sheet fill: Yleiskartat 8.90%, Rannikkokartat
     1.77%, Merikarttasarjat 0.27%, Satamakartat 0.00%. Only Yleiskartat draws a
-    boundary the blank pass can stop at."""
+    limit the trim can stop at."""
     by_name = {l.wmts: l for l in pipeline.LAYERS}
-    assert not by_name["Satamakartat"].fill, \
+    assert not by_name["Satamakartat"].stages, \
         "Satamakartat has nothing to strip; stripping it can only take chart"
-    assert not by_name["Satamakartat"].blank, \
-        "the blank pass reached the layer whose sheets end without a boundary"
-    assert all(l.fill for l in by_name.values() if l.blank), \
-        "a layer asks for the blank pass without the fill pass that precedes it"
+    trims = {n for n, l in by_name.items() if "white-pixels" in l.stages}
+    assert trims == {"Yleiskartat 250k public"}, \
+        f"the trim needs a drawn limit, and only Yleiskartat has one: {trims}"
+    for name, l in by_name.items():
+        assert set(l.stages) <= set(strip_nodata.STAGES), f"{name} names no such stage"
+        assert list(l.stages) == [s for s in strip_nodata.STAGES if s in l.stages], \
+            f"{name} lists its stages out of the order they run in"
 
 
 def test_a_step_that_exits_non_zero_stops_the_layer():
