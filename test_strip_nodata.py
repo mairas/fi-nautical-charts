@@ -391,8 +391,8 @@ def test_the_flood_enters_only_from_the_sides_the_outside_lies_past():
     a = np.asarray(Image.open(io.BytesIO(tile("limit"))).convert("RGBA"))
     m = sn.nodata_mask(a, _limit_pad(), kind="white",
                        outward=frozenset({"b", "lb", "rb"}))
-    assert m[131 + sn.BLEED:, :].all(), "the blank past the limit stayed"
-    assert not m[:128 - sn.BLEED, :].any(), "water inside the limit was erased"
+    assert m[131:, :].all(), "the blank past the limit stayed"
+    assert not m[:128, :].any(), "water inside the limit was erased"
 
 
 def test_seeding_from_every_side_is_what_empties_both_halves():
@@ -400,7 +400,7 @@ def test_seeding_from_every_side_is_what_empties_both_halves():
     with no direction given, the same tile loses the water too."""
     a = np.asarray(Image.open(io.BytesIO(tile("limit"))).convert("RGBA"))
     m = sn.nodata_mask(a, _limit_pad(), kind="white", outward=None)
-    assert m[:128 - sn.BLEED, :].all()
+    assert m[:128, :].all()
 
 
 def test_a_dimmer_blank_is_found_only_once_the_level_is_lowered(tmp_path):
@@ -495,8 +495,8 @@ def test_water_inside_the_limit_survives_a_whole_run(tmp_path):
     assert read(out, 1, 3) is None, "the blank past the limit was kept"
     a = read(out, 1, 2)
     assert a is not None, "the tile the limit crosses was dropped"
-    assert (a[131 + sn.BLEED:, :, 3] == 0).all(), "the blank past the limit stayed"
-    assert (a[:128 - sn.BLEED, :, 3] == 255).all(), "water inside the limit went"
+    assert (a[131:, :, 3] == 0).all(), "the blank past the limit stayed"
+    assert (a[:128, :, 3] == 255).all(), "water inside the limit went"
     assert np.array_equal(read(out, 1, 1), read_source_kind("open")), \
         "the open water a row further in was touched at all"
 
@@ -598,7 +598,7 @@ def test_the_stamp_records_the_settings_and_the_stages_that_ran(stripped):
     so every setting that changes the outcome is in the stamp, and so is the
     list of stages -- a file stripped of fill only is not the same file."""
     stamp = stamp_of(stripped)
-    assert f"r{sn.RADIUS}" in stamp and f"b{sn.BLEED}" in stamp, stamp
+    assert f"r{sn.RADIUS}" in stamp, stamp
     assert f"w{sn.WHITE}" in stamp and f"n{sn.MAX_CHART_NEIGHBOURS}" in stamp, stamp
     assert stamp.endswith("black-tiles+black-pixels"), stamp
     assert "white" not in stamp.split(":")[1], "a stage that did not run is named"
@@ -704,50 +704,11 @@ def test_a_stroke_abutting_the_fill_keeps_its_far_end(tmp_path):
     after = read(out, 1, 0)
     kept = np.flatnonzero((after[101, :, :3].max(axis=1) == 0) & (after[101, :, 3] == 255))
     assert kept.max() == 229, "the far end of the line was followed"
-    assert kept.min() - 90 <= 2 * sn.RADIUS + sn.BLEED
+    assert kept.min() - 90 <= 2 * sn.RADIUS
     assert (after[:, :90, 3] == 0).all(), "and the fill did go"
 
 
-@pytest.mark.parametrize("bleed", [0, 1, 2, 3, 4, 5])
-def test_the_bleed_past_the_fill_is_adjustable(tmp_path, bleed):
-    """Each extra pixel of bleed erases one more column of the chart's edge.
-
-    `half-fill` puts the fill in columns 0-89 and paper beyond, so the erased
-    run on a row carrying no ink is the fill plus whatever the bleed reached.
-    """
-    src = build(tmp_path / f"bleed{bleed}.mbtiles", {
-        (0, 0): "fill",  (1, 0): "half-fill",  (2, 0): "content",
-        (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
-    })
-    out = tmp_path / f"bleed{bleed}-out.mbtiles"
-    sn.run(src, out, jobs=1, stages=("black-tiles", "black-pixels"), bleed=bleed)
-    row = read(out, 1, 0)[200, :, 3]
-    assert int((row == 0).sum()) == 90 + bleed
 
 
-def test_a_bleed_of_zero_still_erases_the_fill_it_found(tmp_path):
-    """The opening shaves THIN pixels off the body before the flood, so even
-    with no bleed the mask has to grow that much back or the fill is under-cut
-    by its own detection."""
-    src = build(tmp_path / "zero.mbtiles", {
-        (0, 0): "fill",  (1, 0): "half-fill",  (2, 0): "content",
-        (0, 1): "fill",  (1, 1): "half-fill",  (2, 1): "content",
-    })
-    out = tmp_path / "zero-out.mbtiles"
-    sn.run(src, out, jobs=1, stages=("black-tiles", "black-pixels"), bleed=0)
-    a = read(out, 1, 0)
-    assert (a[:, :90, 3] == 0).all()
-    assert dark_px(a[:, :90]) == 0
 
 
-def test_the_bleed_is_recorded_in_the_stamp(tmp_path):
-    """It changes the output, so a published chart built with one bleed must not
-    read as current when the recipe asks for another."""
-    src = build(tmp_path / "stamp.mbtiles", LAYOUT)
-    out = tmp_path / "stamp-out.mbtiles"
-    sn.run(src, out, jobs=1, stages=("black-tiles", "black-pixels"), bleed=4)
-    con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
-    stamp = con.execute("SELECT value FROM metadata WHERE name='nodata_stripped'").fetchone()[0]
-    con.close()
-    assert stamp == sn.processing_stamp(sn.RADIUS, 4, stages=("black-tiles", "black-pixels"))
-    assert stamp != sn.processing_stamp(sn.RADIUS, 2, stages=("black-tiles", "black-pixels"))

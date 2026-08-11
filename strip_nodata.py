@@ -62,7 +62,6 @@ RADIUS = 128        # a fill pixel is dark for this far in every direction.
                     # passage inside one can admit it -- the fill has to be wide
                     # across the seam as well, which is what smooths the edge
 DARK = 40           # the transition is one pixel; this catches it
-BLEED = 2           # pixels erased past the fill, over the chart's own edge
 TILE = 256
 WHITE = 255         # an opaque pixel is blank paper if every channel is at
                     # least this. Most sheets render blank as ffffff, but the
@@ -83,7 +82,7 @@ STAGES = ("black-tiles", "black-pixels", "white-tiles", "white-pixels")
 DEFAULT_STAGES = ("black-tiles", "black-pixels", "white-tiles")
 
 
-def processing_stamp(radius: int = RADIUS, bleed: int = BLEED, *,
+def processing_stamp(radius: int = RADIUS, *,
                      stages=DEFAULT_STAGES, white: int = WHITE,
                      limit: int = MAX_CHART_NEIGHBOURS) -> str:
     """What a run with these settings records as nodata_stripped.
@@ -92,7 +91,7 @@ def processing_stamp(radius: int = RADIUS, bleed: int = BLEED, *,
     published chart was built by the current recipe, so the two must be one
     definition rather than two strings that agree until one of them changes.
     """
-    return (f"nodata-r{radius}-b{bleed}-w{white}-n{limit}:"
+    return (f"nodata-r{radius}-w{white}-n{limit}:"
             + "+".join(s for s in STAGES if s in stages))
 
 
@@ -491,7 +490,7 @@ def widen(dark: np.ndarray, pad: dict, margin: int) -> np.ndarray:
 
 
 def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
-                bleed: int = BLEED, kind: str = "black",
+                kind: str = "black",
                 outward: frozenset | None = None,
                 white: int = WHITE) -> np.ndarray:
     """Pixels belonging to off-sheet fill rather than to chart ink.
@@ -568,28 +567,15 @@ def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
     if not out.any():
         return np.zeros_like(dark)
     out = (ndimage.distance_transform_edt(~out) <= radius) & big
-    return spread(out, bleed)[margin:-margin, margin:-margin]
+    return out[margin:-margin, margin:-margin]
 
-
-def spread(mask: np.ndarray, n: int) -> np.ndarray:
-    """Grow a mask by n pixels in every direction, through whatever is there.
-
-    The opening that found the body already returns it to its own boundary
-    wherever the fill is thicker than the kernel, so all of this is deliberate
-    over-reach. It is unconditional on purpose: gating the growth on darkness is
-    what left single pixels of the boundary behind, since neither the flood nor
-    a dark-gated dilation can reach a protrusion the opening removed.
-    """
-    if n <= 0:
-        return mask
-    return ndimage.binary_dilation(mask, structure=np.ones((3, 3), bool), iterations=n)
 
 
 def _strip(task):
-    z, x, row, blob, pad, outward, radius, bleed, kind, white = task
+    z, x, row, blob, pad, outward, radius, kind, white = task
     img = Image.open(io.BytesIO(blob)).convert("RGBA")
     a = np.asarray(img).copy()
-    m = nodata_mask(a, pad, radius, bleed, kind, outward, white)
+    m = nodata_mask(a, pad, radius, kind, outward, white)
     n = int(m.sum())
     if not n:
         return None
@@ -640,7 +626,7 @@ def scan(src: Path, jobs: int, white: int = WHITE) -> None:
     con.close()
 
 
-def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool, white=WHITE):
+def pixel_pass(con, z, whole, straddle, kind, radius, pool, white=WHITE):
     """Erase one colour of no-data from one zoom. Returns (rewritten, dropped).
 
     `whole` are tiles that are nothing but it. `straddle` maps each chart tile
@@ -668,7 +654,7 @@ def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool, white=WHITE):
                    else surround((x, y), edges, straddle[(x, y)]))
             if blob:
                 tasks.append((z, x, row, blob[0], pad, straddle.get((x, y)),
-                              radius, bleed, kind, white))
+                              radius, kind, white))
         for res in pool.map(_strip, tasks, chunksize=32):
             if res is None:
                 continue
@@ -696,7 +682,7 @@ def drop(con, z, tiles) -> int:
 
 
 def run(src: Path, out: Path, jobs: int, stages=DEFAULT_STAGES,
-        radius: int = RADIUS, bleed: int = BLEED, white: int = WHITE,
+        radius: int = RADIUS, white: int = WHITE,
         limit: int = MAX_CHART_NEIGHBOURS) -> None:
     # built beside the target and moved into place at the end, so a run that
     # dies partway cannot leave a valid-looking partial chart where the good
@@ -738,7 +724,7 @@ def run(src: Path, out: Path, jobs: int, stages=DEFAULT_STAGES,
             straddling = edge_tiles(chart, plain, fill)
             leaked(solid, straddling.keys(), deep)
             r, d = pixel_pass(con, deep, set(), straddling,
-                              "black", radius, bleed, pool, white)
+                              "black", radius, pool, white)
             print(f"  z{deep} fill: {len(straddling)} tiles the outside touches, "
                   f"{r} rewritten, {d} dropped")
             rewritten += r
@@ -769,7 +755,7 @@ def run(src: Path, out: Path, jobs: int, stages=DEFAULT_STAGES,
             reached = walk_outside(marked, feat)
             straddle = facing(marked, reached)
             wr, wd = pixel_pass(con, deep, set(), straddle, "white",
-                                radius, bleed, pool, white)
+                                radius, pool, white)
             print(f"  z{deep} limit: {len(straddle)} straddling, {wr} rewritten, "
                   f"{wd} dropped")
             rewritten += wr
@@ -797,7 +783,7 @@ def run(src: Path, out: Path, jobs: int, stages=DEFAULT_STAGES,
 
     con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
                 ("nodata_stripped",
-                 processing_stamp(radius, bleed, stages=stages,
+                 processing_stamp(radius, stages=stages,
                                   white=white, limit=limit)))
     con.commit()
     con.execute("VACUUM")
@@ -811,10 +797,6 @@ def main():
     p.add_argument("input", type=Path)
     p.add_argument("--out", type=Path, help="default: <input>.stripped.mbtiles")
     p.add_argument("--jobs", type=int, default=0, help="worker processes (default: all cores)")
-    p.add_argument("--bleed", type=int, default=BLEED,
-                   help=f"pixels erased past the fill, over the chart's own edge "
-                        f"(default {BLEED}); leaving fill shows, taking a little "
-                        f"neatline does not")
     p.add_argument("--radius", type=int, default=RADIUS,
                    help=f"a fill pixel is dark for this far in every direction "
                         f"(default {RADIUS}); below half the width of a place name "
@@ -852,7 +834,7 @@ def main():
         return
     out = args.out or args.input.with_suffix(".stripped.mbtiles")
     run(args.input, out, args.jobs or None, stages, args.radius,
-        args.bleed, args.white_level, args.max_chart_neighbours)
+        args.white_level, args.max_chart_neighbours)
 
 
 if __name__ == "__main__":

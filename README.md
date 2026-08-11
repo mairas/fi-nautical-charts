@@ -248,13 +248,20 @@ that cost 704px of fill left at radius 64 and 13,104 at 128; taking the walk's
 word costs 188 and 227, and the radius stops mattering, which is the sign that
 the boundary is now being found rather than approached.
 
-The result is then dilated back by the radius, which puts the edge where the
-fill actually ended and bounds how far the mask can run down a stroke joined to
-it, and finally by `--bleed` (2) **unconditionally**, not gated on darkness.
-Gating that is what left single pixels of boundary behind, and the two ways of
-being wrong do not cost the same: a pixel of the chart's own edge taken with the
-fill is a pixel of neatline nobody will look for, while a pixel of fill left
-behind is black on the water.
+The result is then dilated back by the radius and intersected with the fill
+mask, which puts the edge where the fill actually ended and bounds how far the
+mask can run down a stroke joined to it.
+
+There used to be a further two pixels of unconditional growth past that, to take
+the chart's own neatline along with the fill's anti-aliased skirt. It is gone.
+Being unconditional, it was the one step that could erase a pixel that is
+neither fill nor blank, and it grew outward from the padding across a tile seam
+into the neighbour's own ground — so every tile drew a two-pixel transparent
+line along its edges and a cross where four of them met. Measured on
+Merikarttasarjat: it accounted for 47,436 of the 65,781 pixels erased on those
+tiles, and for 12,416 of the 13,251 that lay within two pixels of a seam. The
+skirt does not need it, because `DARK` (40) already covers it — the softest real
+edge measured ran to a mean RGB of 2 over 300-odd pixels.
 
 Measured on the archive: the Åland boundary tile goes from 17,858 dark pixels to
 20, a whole-tile fill from 58,843 to 15, and an inland tile carrying a place name
@@ -607,7 +614,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-disk128-b2-directed-w255+white-pixels; box-2x-premultiplied from z15 on 2026-08-09",
+      "processing": "nodata-r128-w254-n2:black-tiles+black-pixels+white-tiles+white-pixels; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]

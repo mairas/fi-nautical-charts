@@ -21,7 +21,7 @@ META = {
     "source_updated": "2026-06-21",
     "source_updated_oldest": "2025-05-30",
     "downloaded": "2026-06-21",
-    "nodata_stripped": "opaque-black-disk128-b2-directed-w255+white-pixels",
+    "nodata_stripped": "nodata-r128-w254-n2:black-tiles+black-pixels+white-tiles+white-pixels",
     "downscaled": "2026-08-08",
     "downscale_source_zoom": "15",
     "downscale_filter": "box-2x-premultiplied",
@@ -123,7 +123,7 @@ def test_manifest_records_size_digest_edition_and_processing(tmp_path, dest):
     assert entry["source_edition"] == "2026-06-21"
     assert entry["source_edition_oldest"] == "2025-05-30"
     assert entry["name"] == "Veneilykartat 2026-06-21"
-    assert entry["processing"] == ("opaque-black-disk128-b2-directed-w255+white-pixels; "
+    assert entry["processing"] == ("nodata-r128-w254-n2:black-tiles+black-pixels+white-tiles+white-pixels; "
                                    "box-2x-premultiplied from z15 on 2026-08-08")
     assert manifest_of(dest)["pipeline"] not in ("", None)
 
