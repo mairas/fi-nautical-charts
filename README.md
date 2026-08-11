@@ -354,6 +354,32 @@ tiles and classifies any fill still there as a *marking*, so black left behind
 walls its flood; its counts moving is how an under-strip shows up even when no
 pixel is inspected.
 
+### What each layer gets
+
+The stages are not the same for every layer, because the layers do not render
+no-data the same way. `--stages` picks them, and the stamp records which ran.
+
+| Layer | `--stages` | `--white-level` |
+|---|---|---|
+| Yleiskartat 250k | all four | 254 |
+| Rannikkokartat | `black-tiles,black-pixels,white-tiles` | 254 |
+| Merikarttasarjat | `black-tiles,black-pixels,white-tiles` | 254 |
+| Satamakartat | none — no strip at all | — |
+
+Satamakartat draws neither kind of no-data: it is harbour sheets, each one
+covering its own basin, with nothing off-sheet to remove. Running the strip on
+it can only take chart, and a review measured it doing exactly that — 5.18M
+pixels over 1,340 tiles.
+
+`white-pixels` trims the blank on tiles the outer limit crosses, and needs that
+limit to be *drawn* to stop at. Yleiskartat draws it, as a dashed line the
+radius closes. Where a sheet simply ends there is no line, the water inside is
+the same white as the blank outside, and the trim takes both — which is why the
+coastal layers stop at `white-tiles`.
+
+`--white-level 254` everywhere because the south-eastern sheets render blank as
+`fefefe`, corner fill included, and at 255 none of it is found.
+
 ## Downscaling the pyramid
 
 Traficom serves each layer's lower zoom levels as crude rescales of the deepest
