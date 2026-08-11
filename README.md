@@ -131,6 +131,12 @@ The `public` suffix marks the openly-licensed subset of each product.
 ./run ab                   # A/B render (default: Helsinki front, Rannikkokartat vs Merikarttasarjat)
 ./run ab --sources "traficom:Satamakartat,traficom:Veneilykartat public" --bbox 26.7,60.3,27.0,60.45
 
+# Browse local sets in a browser, several at once. Every file becomes a
+# switchable layer, on a backdrop the colour of the basemap the boat draws
+# under the chart -- so anything the strip removed reads as that colour
+# rather than as paper.
+./run serve mbtiles/fi-yleiskartat250k-2026-06-02.mbtiles out/fi-yleiskartat250k-2026-06-02.mbtiles
+
 # Download a layer to MBTiles. Descent (default) prunes empty subtrees; sparse
 # overlays seed with --full-until so no isolated feature is pruned.
 ./run dl --layer "Merikarttasarjat public" --out mbtiles/merikarttasarjat.mbtiles
@@ -187,13 +193,85 @@ so the walk that finds the water outside the EEZ finds it too. Chart tiles wall
 that walk. Only tiles it reaches, and the chart tiles they touch, are examined at
 all — the interior is never a candidate, whatever its ink looks like.
 
-Inside an examined tile three things narrow it further. Fractions are measured
-over *opaque* pixels, since fill often arrives with a transparent margin where
-the fetch ran past the served extent. The seeds grow back through the solid black
-only, because at a sheet edge the chart's own ink abuts the fill and connectivity
-would otherwise run down it. And on a chart tile the result keeps only black that
-reaches the border facing the off-sheet region: fill continues into the tile the
-walk came from, a place name set clear of the edge does not.
+Inside an examined tile the question becomes a shape one, but at a scale no
+place name reaches: a fill pixel is dark for `--radius` (128) in every direction.
+Nothing narrower than twice that can satisfy it, and Traficom sets its capitals
+at 10–16px across, so type cannot start a removal however the tile is bounded.
+The fill is then what that test finds running in from the tile's margin, and the
+margin is real: each tile is padded with its neighbours' own pixels — all eight
+of them, since a sheet edge crossing the grid diagonally leaves a tile whose only
+contact with the fill is a corner — so a band that is thin here but wide a few
+pixels into the next tile is still found.
+
+**And it may only run in from the sides the outside actually lies past**, which
+the tile-grid walk has already named. Direction is half the method rather than a
+refinement of it, and the reason is the white pass: the blank beyond the limit
+and the open water inside it are the same white, so nothing local separates
+them. A tile the limit crosses has qualifying white on *both* sides of it, and
+seeded from the whole margin one such tile empties both — 566 tiles at z13, some
+of them see-through end to end, reported as a rectangle of basemap showing
+through open water south of Helsinki.
+
+Once seeded there, the flood travels through the margin freely. Barring it —
+letting it occupy the tile and the outward margins only — was tried, and it
+leaves a row of peaks wherever the boundary runs diagonally across the grid: a
+tile whose only outward side is a corner cannot then reach the rest of its own
+outside without crossing a neighbour. What that barring was for is handled by
+the radius and by padding an outward neighbour on the walk's word; with both in
+place it blocks nothing and costs 295k px of blank left standing. Seams: 501
+disagreeing over 1,925px with the flood free, against 642 over 12,706px with it
+barred.
+
+The case that would justify barring it is a neighbour blank throughout and yet
+not outward, which the grid does not produce: blank throughout is what
+featureless means, and the walk crosses featureless cells.
+
+**Only the deepest zoom is examined**, and every level below it is deleted for
+`downscale` to rebuild. Each of those levels is a separate rendering of the same
+coastline with its own fill, so asking the same question of all nine put the
+boundary in a different place at every zoom; and the answers below the deepest
+were overwritten by the downscale anyway.
+
+**No-data counts as black.** Where the fetch ran past the served extent the tile
+comes back transparent, and that is the same thing the fill is — not chart. It
+matters more than it sounds: along the western edge of the data the fill is a
+band 2–13px wide for its whole length, far too thin to qualify on its own, and
+it becomes findable only once the emptiness beside it counts as part of the same
+region. A missing neighbour tile pads solid black for the same reason.
+
+**So does a neighbour the walk reached**, whatever it draws there. Reading its
+pixels instead puts the question to a predicate that knows only one of the two
+ways Traficom renders "no chart" — black past a sheet edge, white past the outer
+limit — so where the two meet, the black pass reads the white side as chart and
+walls itself out of its own fill. On the tile where they meet west of Tallinn
+that cost 704px of fill left at radius 64 and 13,104 at 128; taking the walk's
+word costs 188 and 227, and the radius stops mattering, which is the sign that
+the boundary is now being found rather than approached.
+
+The result is then dilated back by the radius and intersected with the fill
+mask, which puts the edge where the fill actually ended and bounds how far the
+mask can run down a stroke joined to it.
+
+There used to be a further two pixels of unconditional growth past that, to take
+the chart's own neatline along with the fill's anti-aliased skirt. It is gone.
+Being unconditional, it was the one step that could erase a pixel that is
+neither fill nor blank, and it grew outward from the padding across a tile seam
+into the neighbour's own ground — so every tile drew a two-pixel transparent
+line along its edges and a cross where four of them met. Measured on
+Merikarttasarjat: it accounted for 47,436 of the 65,781 pixels erased on those
+tiles, and for 12,416 of the 13,251 that lay within two pixels of a seam. The
+skirt does not need it, because `DARK` (40) already covers it — the softest real
+edge measured ran to a mean RGB of 2 over 300-odd pixels.
+
+Measured on the archive: the Åland boundary tile goes from 17,858 dark pixels to
+20, a whole-tile fill from 58,843 to 15, and an inland tile carrying a place name
+across a seam keeps 6,036 of its 6,115. Across the whole of Yleiskartat at z13,
+seven tiles keep dark too thick to be type (15,363px) — leftover fill in wedges
+narrower than the radius can find. Two of those seven are the radius's own cost:
+at 10 they were removed, and the same setting erased chart on 868 other tiles.
+
+Fractions are measured over *opaque* pixels, since fill often arrives with a
+transparent margin where the fetch ran past the served extent.
 
 A tile that is 95% solid black and was *not* examined stops the run and is named.
 Selecting by position is only as good as the walk, and a walk that stops short
@@ -214,14 +292,23 @@ grey is indistinguishable from chart content — no later pass can find it.
 
 ### The white beyond the chart limits
 
-The same layers also render the area beyond the Finnish EEZ as **opaque white**,
-which occludes whatever basemap sits under the chart. This half of the problem
-needs a different method, because white is not a colour the chart reserves for
-off-sheet: open sea is white too, and locally the two are identical — same
-colour, same solidity. Only what encloses them differs.
+The same layers also render the area beyond the chart's outer limits as **opaque
+white**, which occludes whatever basemap sits under the chart. `--remove-white`
+says how far to go after it: `tiles` (the default) for whole blank tiles only,
+`pixels` to trim the tiles the limit crosses as well, or `none`. This half of
+the problem needs a different method, because white is not a colour the chart
+reserves for off-sheet: open sea is white too, and locally the two are identical
+— same colour, same solidity. Only what encloses them differs.
+
+Blank means every channel at `--white-level` or above, 255 by default. Not mean
+luminance: that puts a sounding's anti-aliased skirt and the pale tint at the
+edge of a depth area on the no-data side of the line, and the flood then reads a
+figure's own soft edge as more of the blank it stands in. The level is a setting
+because Traficom does not render blank the same everywhere — the south-eastern
+sheets draw it `fefefe`, corner fill included, and at 255 none of it is found.
 
 So the second pass works on the **tile grid**, not on pixels. A tile is *marked*
-if any opaque pixel of it is non-white, *featureless* otherwise. Flood the grid
+if any opaque pixel of it is non-blank, *featureless* otherwise. Flood the grid
 inward from beyond the data, crossing only featureless tiles; a marked tile is a
 wall. Featureless tiles the flood reaches are outside and get deleted; those it
 cannot reach are enclosed by chart content — open water between soundings — and
@@ -231,27 +318,74 @@ Tile granularity is what makes this safe rather than a limitation. The EEZ line
 is dashed, and at pixel scale a flood slips between the dashes and empties water
 that is well inside coverage; at tile scale every tile the line crosses holds
 some of it, so the fence is unbroken. And since the only action is deleting whole
-tiles that carry nothing, no chart pixel can be lost — there is no radius or
-threshold to mistune.
+tiles that carry nothing, no chart pixel can be lost — there is no threshold to
+mistune.
 
-The deepest zoom decides the boundary, since it resolves it most finely. Coarser
-zooms cannot refine it: a coarse tile is marked when *any* part of its ground has
-content, so it can say "something here" but never where. Ancestors then follow
-their descendants — a tile whose deeper detail survives is kept whatever its own
-rendering shows, or the pyramid gains holes that appear and vanish as you zoom.
+Dropping whole tiles can only take one that is blank throughout, so where the
+limit crosses a tile the blank half stays: the same shape of leftover the fill
+used to leave, in the other colour. `--remove-white pixels` gives those tiles
+the same treatment as the black fill, and it is that pass — not this one — that
+needs both of its guards, because on a tile the limit crosses, tile granularity
+has run out:
 
-Verified per chart by comparing against a `--skip-offeez` build: chart markings
-are identical at every zoom, to the pixel, while off-sheet tiles go (9,254 on
-Yleiskartat, 2,901 on Rannikkokartat). A one-tile white margin survives where a
-tile straddles the limit, since such a tile is marked and therefore untouched.
+- **The radius**, because the dashes the tile fence closes are still open at
+  pixel scale. A disk of 10 passes between them and empties water well inside
+  coverage — 868 tiles at z13, whole coastlines and depth contours gone. At 128
+  no disk fits through a gap.
+- **The direction**, because the tile's inward side has open water on it, and
+  open water is qualifying white. A flood seeded from the whole margin starts
+  there and empties the chart side too, with no dash to squeeze through and no
+  radius large enough to stop it. 566 tiles at z13, several of them see-through
+  end to end.
 
-Verified both directions on Yleiskartat, the layer with the most fill. Tiles that
-are essentially nothing but fill go from 4,127 at z13 to 1, and every tile that
-carries a place name — the ones a shape-only test hollowed out — comes through
-byte-identical to the source. The two halves check each other: the off-EEZ pass
-that follows classifies unstripped fill as a *marking*, so black left behind
-walls its flood, and its counts moving (9,294 tiles dropped, none kept at any
-zoom) is how an under-strip shows up even when the pixels are not inspected.
+Both guards hold only where the limit is *drawn*. Where a sheet simply ends —
+Rannikkokartat's seaward edges, most of Merikarttasarjat — there is no line at
+all: the water inside is the same white as the blank outside, the flood enters
+wherever a 128-radius disk fits between the soundings, and it takes surveyed
+water with the soundings left standing on transparency. Measured on
+Rannikkokartat z15: 2,365 tiles lost more than 20,000 pixels each. That is why
+`tiles` is the default and `pixels` is opt-in.
+
+The boundary is decided once, at the deepest zoom, and every coarser level
+inherits it by being built from those tiles: a parent exists only where a child
+survived. There is no second classification to reconcile, and a tile that
+survives at one zoom cannot vanish at the next.
+
+Measured on Yleiskartat at z13, the layer with the most of both: 4,256 tiles are
+off-sheet and 1,786 more straddle a sheet edge; 6,676 blank tiles are dropped
+past the limit and 1,793 straddle it. Six tiles end up keeping dark too thick to
+be type — leftover fill in wedges narrower than the radius can find.
+
+The two passes check each other. The white pass runs on the black-stripped
+tiles and classifies any fill still there as a *marking*, so black left behind
+walls its flood; its counts moving is how an under-strip shows up even when no
+pixel is inspected.
+
+### What each layer gets
+
+The stages are not the same for every layer, because the layers do not render
+no-data the same way. `--stages` picks them, and the stamp records which ran.
+
+| Layer | `--stages` | `--white-level` |
+|---|---|---|
+| Yleiskartat 250k | all four | 254 |
+| Rannikkokartat | `black-tiles,black-pixels,white-tiles` | 254 |
+| Merikarttasarjat | `black-tiles,black-pixels,white-tiles` | 254 |
+| Satamakartat | none — no strip at all | — |
+
+Satamakartat draws neither kind of no-data: it is harbour sheets, each one
+covering its own basin, with nothing off-sheet to remove. Running the strip on
+it can only take chart, and a review measured it doing exactly that — 5.18M
+pixels over 1,340 tiles.
+
+`white-pixels` trims the blank on tiles the outer limit crosses, and needs that
+limit to be *drawn* to stop at. Yleiskartat draws it, as a dashed line the
+radius closes. Where a sheet simply ends there is no line, the water inside is
+the same white as the blank outside, and the trim takes both — which is why the
+coastal layers stop at `white-tiles`.
+
+`--white-level 254` everywhere because the south-eastern sheets render blank as
+`fefefe`, corner fill included, and at 255 none of it is found.
 
 ## Downscaling the pyramid
 
@@ -277,12 +411,23 @@ them apart — it scores how much each level adds over an upscale of its parent:
 | `Merikarttasarjat public` | z15 | default |
 | `Rannikkokartat public` | z15 | default |
 | `Satamakartat` | z15 | default |
-| `Yleiskartat 250k` | **z12** | `--source-zoom 12` |
+| `Yleiskartat 250k` | z12, but see below | default |
 
-Yleiskartat is the exception: 94% of its z13 pixels reproduce exactly by
-nearest-neighbour from z12, so z13 is Traficom's upscale and z12 is the deepest
-real cartography. Downscaling it from z13 leaves the place names at z10 broken
-into illegible fragments; from z12 they come out clean.
+Yleiskartat is where the two rules meet: 94% of its z13 pixels reproduce exactly
+by nearest-neighbour from z12, so z13 is Traficom's upscale and z12 is the
+deepest real cartography — but `strip-nodata` cleans the deepest level present
+and deletes the rest, so z12 has to be derived from z13 or it keeps its fill.
+
+It costs nothing measurable. Because z13 *is* an upscale, halving it back gives
+z12 again: over 200 sampled tiles, 1.9% of pixels differ from Traficom's own z12
+by more than 32/255, and every one of them is on the edge of a stroke. Cascading
+to z10 from z13 rather than z12 moves 1.0% of pixels by that much, again only at
+stroke edges — the place names come out identical. (An earlier note here claimed
+z13 left the z10 names in illegible fragments. It does not reproduce.)
+
+What it does cost is file size: the whole pyramid below z13 is now anti-aliased
+rather than Traficom's flat colour, which compresses worse. Yleiskartat went from
+255MB to 297MB.
 
 - Cascades one octave at a time (z15→z14→…), each level from the level above —
   a standard mip pyramid.
@@ -299,7 +444,10 @@ into illegible fragments; from z12 they come out clean.
   is kept. Per-tile image work is fanned out across all cores.
 
 `--source-zoom` overrides the level to downscale from (default: deepest present);
-`--min-zoom` limits how far down to regenerate (default: the file's lowest zoom).
+`--min-zoom` limits how far down to regenerate. Its default is the lower of the
+file's lowest level and its `minzoom` metadata — after `strip-nodata` the file
+holds one level of tiles and a `minzoom` describing the chart it is about to
+become, and the levels in between have to be rebuilt rather than assumed absent.
 
 `./run native-zoom <file>` reports whether each level is genuine detail or an
 upscale, confirming the deepest level is worth downscaling from.
@@ -437,7 +585,7 @@ same layer and an older edition — matching on the filename would also hit buil
 variants, hand-placed files, and a newer edition being republished over.
 
 The manifest closes a gap the filenames cannot. A name records the *source*
-edition, so the fill-strip and off-EEZ work changed the tiles without changing
+edition, so the fill-strip and white-removal work changed the tiles without changing
 any name, and anything caching by URL kept serving the old content.
 
 | Field | Meaning |
@@ -466,7 +614,7 @@ any name, and anything caching by URL kept serving the old content.
       "sha256": "ad697da38f74…",
       "source_edition": "2026-06-21",
       "source_edition_oldest": "2025-01-20",
-      "processing": "opaque-black-r4-edge+offeez-tilelevel; box-2x-premultiplied from z15 on 2026-08-09",
+      "processing": "nodata-r128-w254-n2:black-tiles+black-pixels+white-tiles+white-pixels; box-2x-premultiplied from z15 on 2026-08-09",
       "name": "Veneilykartat 2026-06-21"
     }
   ]

@@ -21,7 +21,7 @@ META = {
     "source_updated": "2026-06-21",
     "source_updated_oldest": "2025-05-30",
     "downloaded": "2026-06-21",
-    "nodata_stripped": "opaque-black-r4+offeez-tilelevel",
+    "nodata_stripped": "nodata-r128-w254-n2:black-tiles+black-pixels+white-tiles+white-pixels",
     "downscaled": "2026-08-08",
     "downscale_source_zoom": "15",
     "downscale_filter": "box-2x-premultiplied",
@@ -123,7 +123,7 @@ def test_manifest_records_size_digest_edition_and_processing(tmp_path, dest):
     assert entry["source_edition"] == "2026-06-21"
     assert entry["source_edition_oldest"] == "2025-05-30"
     assert entry["name"] == "Veneilykartat 2026-06-21"
-    assert entry["processing"] == ("opaque-black-r4+offeez-tilelevel; "
+    assert entry["processing"] == ("nodata-r128-w254-n2:black-tiles+black-pixels+white-tiles+white-pixels; "
                                    "box-2x-premultiplied from z15 on 2026-08-08")
     assert manifest_of(dest)["pipeline"] not in ("", None)
 
@@ -357,6 +357,24 @@ def test_one_bad_file_does_not_publish_the_good_ones_either(tmp_path, dest):
 
     assert charts_in(dest) == []
     assert not (dest / publish.MANIFEST).exists()
+
+
+def test_a_stripped_intermediate_is_refused_and_retires_nothing(tmp_path, dest):
+    """strip_nodata deletes every level below the one it cleans and leaves
+    `pyramid_pending` for downscale to build back. Such a file is a valid
+    SQLite database with the right name, the right layer and the right edition,
+    so every other check passes it -- and publishing it would serve one zoom
+    level and retire the last edition that had the rest."""
+    live = make_mbtiles(dest / "fi-veneilykartat-2026-05-30.mbtiles",
+                        dict(META, source_updated="2026-05-30"))
+    half = make_mbtiles(tmp_path / "half.processed.mbtiles",
+                        dict(META, pyramid_pending="5"))
+
+    with pytest.raises(publish.Unpublishable, match="waiting for its lower"):
+        publish.publish([half], dest)
+
+    assert live.exists(), "the last good edition was retired for a half-built one"
+    assert charts_in(dest) == ["fi-veneilykartat-2026-05-30.mbtiles"]
 
 
 def test_a_failure_while_staging_the_second_set_publishes_neither(tmp_path, dest, monkeypatch):

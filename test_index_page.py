@@ -15,7 +15,7 @@ ENTRY = {
     "sha256": "d0fe1c15a850d68df2fb163344e5400e6fc4b4b27b2948dd191c97ebcb3f08f5",
     "source_edition": "2026-06-29",
     "source_edition_oldest": "2024-11-16",
-    "processing": "opaque-black-r4-edge+offeez-tilelevel",
+    "processing": "nodata-r128-w254-n2:black-tiles+black-pixels+white-tiles+white-pixels",
     "name": "Satamakartat 2026-06-29",
 }
 

@@ -52,8 +52,7 @@ from PIL import Image
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from strip_nodata import (MIN_FILL as NODATA_MIN_FILL, RADIUS as NODATA_RADIUS,
-                          nodata_mask, wholly_offsheet)
+from strip_nodata import nodata_mask, wholly_offsheet
 
 WMTS_CAPS = ("https://julkinen.traficom.fi/rasteripalvelu/wmts"
              "?service=WMTS&request=GetCapabilities")
@@ -375,8 +374,8 @@ def strip_fill(arr, original):
     is returned byte-for-byte as the server sent it."""
     if not wholly_offsheet(arr):
         return original
-    m = nodata_mask(arr, NODATA_RADIUS, protect=False)
-    if m.sum() < NODATA_MIN_FILL:
+    m = nodata_mask(arr)
+    if not m.any():
         return original
     a = arr.copy()
     a[m] = (255, 255, 255, 0)

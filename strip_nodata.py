@@ -17,18 +17,26 @@ capitals, and at native zoom their strokes survive the same erosion -- so the
 local test called HELSINKI a no-data fill and deleted it, leaving the hollow
 anti-aliased outline behind. It cost 6-12% of the ink on interior tiles.
 
-Position separates them. The fill is not a shape inside a tile but a region of
-the tile grid: it lies beyond the last sheet and runs to the edge of the data,
-so the same walk that finds the water outside the EEZ finds it. Only tiles that
-walk reaches, and the chart tiles they touch, are examined at all; the interior
-is never a candidate, whatever its ink looks like. Within those tiles, eroding
-seeds the fill and growing them back recovers it exactly to its own hard edge --
-which is genuinely hard, the source anti-aliases the boundary not at all -- but
-the growth runs through the solid black only, since at a sheet edge the chart's
-own ink abuts the fill and connectivity would otherwise follow it out.
+Position separates them, at both scales. The fill is not a shape inside a tile
+but a region of the tile grid: it lies beyond the last sheet and runs to the
+edge of the data, so the same walk that finds the water outside the EEZ finds
+it. Only tiles that walk reaches, and the chart tiles they touch, are examined
+at all; the interior is never a candidate, whatever its ink looks like.
 
-Run this on the raw download, before downscaling. Averaging black into a parent
-turns it grey, and grey is indistinguishable from chart content.
+Within one of those tiles the same question is asked again in pixels: the fill
+is what runs in from the borders the walk came through. Seeding it by shape
+instead -- eroding the black and growing the seeds back -- fails on the tiles
+that matter, because where the sheet edge crosses a tile at a shallow angle the
+fill enters as a wedge only a few pixels wide, thinner than any erosion that
+also spares a place name. Flooding in from the border has no width to lose.
+
+Only the deepest zoom is examined, and every level below it is deleted for
+downscale to rebuild. Running the detection per zoom asked the same question of
+nine renderings of the same coastline and got nine answers, so the boundary
+moved as you zoomed; and the answers below the deepest level were thrown away by
+the downscale anyway. Averaging black into a parent turns it grey, which is
+indistinguishable from chart content, so the order matters: strip, then
+downscale.
 """
 
 from __future__ import annotations
@@ -46,31 +54,131 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-RADIUS = 4          # erosion radius; ink vanishes by 2, fills survive past 8
-MIN_FILL = 64       # ignore specks: a real fill is far larger than this
-FILL_FRACTION = .95 # above this a tile is off-sheet rather than chart
-THIN = 2            # strokes narrower than this survive as ink, not fill
+RADIUS = 128        # a fill pixel is dark for this far in every direction.
+                    # Wide enough that no disk fits through a gap in the dashed
+                    # limit line, which is how the blank got into land at 10;
+                    # Traficom's capitals run 10-16px across, so none can
+                    # qualify. At 128 the disk is wider than a tile, so no
+                    # passage inside one can admit it -- the fill has to be wide
+                    # across the seam as well, which is what smooths the edge
+DARK = 40           # the transition is one pixel; this catches it
 TILE = 256
-WHITE_LUM = 250     # above this an opaque pixel counts as blank paper
+WHITE = 255         # an opaque pixel is blank paper if every channel is at
+                    # least this. Most sheets render blank as ffffff, but the
+                    # south-eastern ones render it fefefe, corner fill included,
+                    # so at 255 nothing there is blank and none of it is found
 BATCH = 2000        # tiles held in memory at once
+MAX_CHART_NEIGHBOURS = 2
+                    # a blank tile with more chart than this against it is
+                    # held to be inside the chart, whatever it draws
 
 
-def tile_has_marks(blob):
+# The four removals, in the order they run. Each is a separate question, and
+# only two of them are risky: dropping a tile that is fill or blank throughout
+# cannot touch chart, while the pixel floods need a drawn boundary to stop at.
+# Most sheets simply end, with the water inside the same white as the blank
+# outside and no line between them, so white-pixels is off by default.
+STAGES = ("black-tiles", "black-pixels", "white-tiles", "white-pixels")
+DEFAULT_STAGES = ("black-tiles", "black-pixels", "white-tiles")
+
+
+def processing_stamp(radius: int = RADIUS, *,
+                     stages=DEFAULT_STAGES, white: int = WHITE,
+                     limit: int = MAX_CHART_NEIGHBOURS) -> str:
+    """What a run with these settings records as nodata_stripped.
+
+    Written into the file and read back by anything deciding whether a
+    published chart was built by the current recipe, so the two must be one
+    definition rather than two strings that agree until one of them changes.
+    """
+    return (f"nodata-r{radius}-w{white}-n{limit}:"
+            + "+".join(s for s in STAGES if s in stages))
+
+
+def blank(a: np.ndarray, white: int = WHITE) -> np.ndarray:
+    """Blank paper, and nothing else.
+
+    Every channel has to reach `white`. Anything below it is something the
+    cartographer drew -- the anti-aliased skirt of a sounding, the pale tint at
+    the edge of a depth area, a hairline at less than full contrast. Judging by
+    mean luminance instead put all of that on the no-data side of the line, and
+    the flood then treats a figure's own soft edge as more of the blank it is
+    standing in.
+
+    The level is a setting rather than 255 because Traficom does not render
+    blank the same everywhere: the south-eastern sheets draw it fefefe, and one
+    step of slack there is the difference between finding all of it and finding
+    none of it.
+    """
+    return a[..., :3].min(axis=2) >= white
+
+
+def tile_has_marks(blob, white: int = WHITE):
     """True if the tile carries anything but blank paper. Deliberately generous:
     one non-white opaque pixel is enough, so any doubt makes a tile untouchable."""
     a = np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA"))
     op = a[..., 3] == 255
     if not op.any():
         return False
-    return bool((op & (a[..., :3].mean(axis=2) <= WHITE_LUM)).any())
+    return bool((op & ~blank(a, white)).any())
 
 
-def classify(con, z):
+SIDES = ((1, 0), (-1, 0), (0, 1), (0, -1))
+
+
+def removable(marked, feat, limit: int = MAX_CHART_NEIGHBOURS):
+    """Which blank tiles may go, and which are held. Returns (drops, held).
+
+    A peel, starting from nothing removed. A blank tile goes when at most
+    `limit` tiles are still standing against it, counted over the four sides
+    only; removing it lowers the count for its own neighbours, which is what
+    lets the removal travel. Nothing is ever put back, so the order tiles are
+    tested in does not change the result.
+
+    Beginning with everything standing is what makes this safe. Open water
+    carries soundings, but not on every tile: a tile between two of them draws
+    nothing at all and is blank by every local test. Such a tile begins with
+    four neighbours against it and can only lose them to removals, so a field of
+    open water enclosed by chart never starts peeling at all -- there is no tile
+    in it, or on its rim, with fewer than three standing against it. The peel
+    can only begin where tiles are absent, which is the edge of the data, and
+    that is where the blank past the outer limit is.
+
+    So the walk is not needed here: what it used to establish -- that a blank
+    region reaches the outside -- is what having an absent neighbour says, and
+    the count says it tile by tile instead of in one sweep.
+
+    A corridor of water with chart above and below never goes either: two chart
+    tiles are against every tile of it, and chart is never removed, so the count
+    cannot fall below three until both blank neighbours have gone, and they are
+    held by the same argument.
+    """
+    present = set(marked) | set(feat)
+
+    def standing(t):
+        return sum((t[0] + dx, t[1] + dy) in present for dx, dy in SIDES)
+
+    removed = set()
+    q = deque(t for t in feat if standing(t) <= limit)
+    while q:
+        t = q.popleft()
+        if t not in present:
+            continue
+        removed.add(t)
+        present.discard(t)
+        for dx, dy in SIDES:
+            nb = (t[0] + dx, t[1] + dy)
+            if nb in feat and nb in present and standing(nb) <= limit:
+                q.append(nb)
+    return removed, feat - removed
+
+
+def classify(con, z, white: int = WHITE):
     """(marked, featureless) tile sets at one zoom, in XYZ coordinates."""
     marked, feat = set(), set()
     for x, row, blob in con.execute("SELECT tile_column, tile_row, tile_data FROM tiles "
                                     "WHERE zoom_level=?", (z,)):
-        (marked if tile_has_marks(blob) else feat).add((x, (1 << z) - 1 - row))
+        (marked if tile_has_marks(blob, white) else feat).add((x, (1 << z) - 1 - row))
     return marked, feat
 
 
@@ -110,71 +218,146 @@ def walk_outside(marked, feat):
     return seen
 
 
-def flood_outside(marked, feat):
-    """Featureless tiles reachable from beyond the data.
-
-    Those the walk cannot reach are enclosed by chart content -- open water
-    between soundings -- and are kept."""
-    return feat & walk_outside(marked, feat)
-
-
-def offsheet_plan(con, zs):
-    """Which tiles to delete at each zoom, agreed across every zoom.
-
-    The deepest zoom sets the boundary, because it resolves it most finely.
-    Coarser zooms cannot refine it: a coarse tile is marked when any part of its
-    ground carries content, so it can say "something here" but never where.
-
-    Ancestors follow their descendants. A tile whose deeper detail survives is
-    depicting something, whatever its own rendering shows, so it stays -- without
-    that the pyramid gains holes that appear and vanish as you zoom."""
-    deep = max(zs)
-    drops = {z: flood_outside(*classify(con, z)) for z in zs}
-    present_deep = {(x, (1 << deep) - 1 - r) for x, r in
-                    con.execute("SELECT tile_column, tile_row FROM tiles WHERE zoom_level=?", (deep,))}
-    kept_deep = present_deep - drops[deep]
-    plan = {}
-    for z in zs:
-        s = deep - z
-        protected = {(d[0] >> s, d[1] >> s) for d in kept_deep} if s >= 0 else set()
-        plan[z] = drops[z] - protected
-    return plan, drops
-
-
 def _survey(task):
-    """One tile's character: how much of its ink is black, and how much is not.
+    """One tile's character: how much of it is off-sheet fill, and how much is
+    neither fill nor blank paper -- which is to say, chart.
 
     Both counts are over opaque pixels only. Off-sheet fill routinely arrives
     with a transparent margin where the fetched tile runs past the served
     extent, and measuring against the whole 256x256 would read those tiles as
-    only nine-tenths black and let them pass for chart.
+    only nine-tenths fill and let them pass for chart.
     """
-    z, x, row, blob = task
+    z, x, row, blob, white = task
     a = np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA"))
     opaque = a[..., 3] == 255
-    black = opaque & (a[..., :3].max(axis=2) == 0)
-    other = opaque & (a[..., :3].mean(axis=2) <= WHITE_LUM) & ~black
-    n = int(opaque.sum())
-    return x, row, int(black.sum()), int(other.sum()), n
+    fill = opaque & (a[..., :3].max(axis=2) <= DARK)
+    other = opaque & ~fill & ~blank(a, white)
+    return x, row, int(fill.sum()), int(other.sum()), int(opaque.sum())
 
 
-def survey(con, z, pool):
-    """One zoom's tiles as (ink, plain, black), in XYZ coordinates.
+def survey(con, z, pool, white: int = WHITE):
+    """One zoom's tiles as (chart, plain, fill counts, solid), in XYZ.
 
-    `ink` is everything that draws in a colour other than black -- chart, and
-    only chart. It is what walls the walk. `plain` is everything else: solid
-    fill, blank paper, and the tiles that are part of each. `black` counts the
-    opaque black pixels on every tile, so the caller can tell a tile with fill
-    to remove from one with nothing on it.
+    `chart` is every tile carrying a single pixel that is neither fill nor blank
+    paper. One is enough: a tile with anything drawn on it is not a tile to
+    remove, so it walls the walk and can never be a whole-tile candidate. Its
+    fill, if it has any, comes off by the pixel flood instead, which is also
+    what takes the anti-aliased skirt where the fill meets the sheet edge.
+
+    `plain` is everything else -- fill, blank paper, and the tiles that are part
+    of each. `fill` counts the fill pixels on every tile so the caller can tell
+    one with fill to remove from one with nothing on it, and `solid` names the
+    tiles that are fill and nothing else.
     """
-    ink, plain, black = set(), set(), {}
+    chart, plain, fill, solid = set(), set(), {}, set()
     for rows in batches(con, z, BATCH):
-        tasks = [(z, x, row, blob) for x, row, blob in rows]
-        for x, row, blk, other, opaque in pool.map(_survey, tasks, chunksize=32):
+        tasks = [(z, x, row, blob, white) for x, row, blob in rows]
+        for x, row, f, other, opaque in pool.map(_survey, tasks, chunksize=32):
             xy = (x, (1 << z) - 1 - row)
-            black[xy] = blk
-            (ink if other > MIN_FILL else plain).add(xy)
-    return ink, plain, black
+            fill[xy] = f
+            (chart if other else plain).add(xy)
+            if opaque and f == opaque:
+                solid.add(xy)
+    return chart, plain, fill, solid
+
+
+def fillable(a: np.ndarray) -> np.ndarray:
+    """Pixels that are either the fill's own black or no data at all.
+
+    Where the fetch ran past the served extent the tile comes back transparent,
+    and that is the same thing the fill is: not chart. Counting it as black is
+    what lets the radius test find a fill that runs along the data's edge as a
+    band a few pixels wide -- too thin to qualify on its own, but part of one
+    wide region once the emptiness beside it counts.
+    """
+    return (((a[..., :3].max(axis=2) <= DARK) & (a[..., 3] == 255))
+            | (a[..., 3] == 0))
+
+
+def vacant(a: np.ndarray, white: int = WHITE) -> np.ndarray:
+    """Blank paper, or no data at all.
+
+    The other thing Traficom renders where there is no chart: past the outer
+    limit it draws nothing rather than black, so the same question -- what runs
+    in from outside -- has a second answer in a second colour.
+    """
+    return ((a[..., 3] == 255) & blank(a, white)) | (a[..., 3] == 0)
+
+
+def nodata_test(kind: str, white: int = WHITE):
+    """The test for one of the two colours Traficom renders no chart in.
+
+    Bound to its level rather than looked up bare, because the white one has a
+    setting and the black one does not, and a worker is handed the kind as a
+    string.
+    """
+    return fillable if kind == "black" else lambda a: vacant(a, white)
+
+
+def _edges(task):
+    """One neighbour tile's no-data mask, bit-packed.
+
+    Whole, not a border strip. The padding is a tile deep (see `nodata_mask`),
+    so what goes beside the subject tile is the neighbour itself; packed because
+    a run holds one of these for every neighbour of every candidate at once, and
+    a bool array costs eight times as much.
+    """
+    z, x, row, blob, kind, white = task
+    d = nodata_test(kind, white)(
+        np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA")))
+    return x, row, np.packbits(d)
+
+
+def edge_lines(con, z, want, pool, kind="black", white=WHITE):
+    """The no-data mask of every tile a candidate needs to be padded with.
+
+    A tile cannot tell fill from ink at its own edge without knowing what is on
+    the other side, and the tile grid alone cannot say: a sheet edge crossing
+    diagonally gives a chart tile whose neighbour is chart in every straight
+    direction and fill only past a corner.
+    """
+    out = {}
+    for i in range(0, len(want), BATCH):
+        chunk = want[i:i + BATCH]
+        tasks = []
+        for x, y in chunk:
+            r = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
+                            "tile_column=? AND tile_row=?",
+                            (z, x, (1 << z) - 1 - y)).fetchone()
+            if r:
+                tasks.append((z, x, (1 << z) - 1 - y, r[0], kind, white))
+        for x, row, e in pool.map(_edges, tasks, chunksize=32):
+            out[(x, (1 << z) - 1 - row)] = e
+    return out
+
+
+def unpack(buf) -> np.ndarray:
+    """A tile-sized bool mask back out of `_edges`."""
+    return np.unpackbits(buf).reshape(TILE, TILE).astype(bool)
+
+
+def surround(xy, edges, outward=frozenset()):
+    """What lies just past each of a tile's eight sides and corners.
+
+    A side maps to that neighbour's own mask, or to None -- meaning solid
+    no-data -- where there is no tile at all.
+
+    It also maps to None on the sides the walk called outward, whatever the
+    neighbour draws there. Those are tiles the walk reached, which is to say
+    tiles carrying no chart; that is the same fact an absent neighbour states,
+    and it deserves the same padding. Reading their pixels instead asks a
+    predicate that knows only one of the two ways Traficom renders "no chart" --
+    black past a sheet edge, white past the outer limit -- so where the two meet,
+    the black pass reads the white side as chart and walls itself out of its own
+    fill. Measured on the tile where they meet at 59 31'N: 704px of fill left at
+    radius 64 and 13,104 at 128, against 188 and 227 once the walk is believed.
+    """
+    x, y = xy
+    pad = {}
+    for (dx, dy), side in AROUND.items():
+        n = None if side in outward else edges.get((x + dx, y + dy))
+        pad[side] = None if n is None else unpack(n)
+    return pad
 
 
 # dx, dy over the eight tiles around one, and the tile borders each lies past.
@@ -183,135 +366,218 @@ def survey(con, z, pool):
 AROUND = {(1, 0): "r", (-1, 0): "l", (0, 1): "b", (0, -1): "t",
           (1, 1): "rb", (1, -1): "rt", (-1, 1): "lb", (-1, -1): "lt"}
 
-BORDER = {"l": np.s_[:, 0], "r": np.s_[:, -1], "t": np.s_[0, :], "b": np.s_[-1, :]}
+def clips(margin: int) -> dict:
+    """Which part of a neighbour's own mask sits against the subject tile.
+
+    The left neighbour contributes its rightmost `margin` columns, the up-left
+    one its bottom-right corner, and so on. At a margin of a whole tile every
+    one of these is the neighbour entire.
+    """
+    m = margin
+    return {"l": np.s_[:, -m:], "r": np.s_[:, :m],
+            "t": np.s_[-m:, :], "b": np.s_[:m, :],
+            "lt": np.s_[-m:, -m:], "rt": np.s_[-m:, :m],
+            "lb": np.s_[:m, -m:], "rb": np.s_[:m, :m]}
 
 
-def edge_tiles(ink, plain, black):
-    """Tiles where off-sheet fill can be, and only those.
+def regions(margin: int) -> dict:
+    """Where each side's padding sits in the widened array."""
+    m = margin
+    return {"l": np.s_[m:-m, :m], "r": np.s_[m:-m, -m:],
+            "t": np.s_[:m, m:-m], "b": np.s_[-m:, m:-m],
+            "lt": np.s_[:m, :m], "rt": np.s_[:m, -m:],
+            "lb": np.s_[-m:, :m], "rb": np.s_[-m:, -m:]}
+
+
+def facing(tiles, reached) -> dict:
+    """For each tile, which of its sides the outside lies past.
+
+    Empty for a tile the outside does not touch, so the caller can use this to
+    pick candidates as well as to aim them.
+    """
+    out = {}
+    for x, y in tiles:
+        sides = frozenset(s for (dx, dy), s in AROUND.items()
+                          if (x + dx, y + dy) in reached)
+        if sides:
+            out[(x, y)] = sides
+    return out
+
+
+def edge_tiles(chart, plain, fill):
+    """Every tile that carries fill and that the outside touches, and the sides
+    it touches each from.
 
     The fill is not a shape to recognise inside a tile. It is a region of the
     tile grid: it lies beyond the last sheet and runs to the edge of the data,
-    so the same walk that finds the water outside the EEZ finds it. A tile the
-    walk cannot reach is enclosed by chart, and whatever black it holds is ink
-    -- however thick, and Traficom sets place names heavy enough that no local
-    shape test can tell them from fill.
+    so the same walk that finds the water outside the limits finds it. A tile
+    the walk cannot reach is enclosed by chart, and whatever black it holds is
+    ink -- however thick, and Traficom sets place names heavy enough that no
+    local shape test can tell them from fill.
 
-    The walk is a protective mask, not a classifier: everything it reaches that
-    carries black is examined, and so is every chart tile it touches. Deciding
-    candidacy by class instead would exempt whole classes of tile that plainly
-    hold fill -- a sheet corner that is half fill and half blank paper draws no
-    colour at all, and is neither chart nor wholly off-sheet.
-
-    Returns the off-sheet tiles and the chart tiles that abut them.
+    Candidacy is not decided by class. A sheet corner that is half fill and half
+    blank paper draws no colour at all, so it is neither chart nor a tile the
+    walk can cross; deciding by class would exempt it and leave its fill. What
+    qualifies a tile is having fill on it and having the outside against it.
     """
-    reached = walk_outside(ink, plain)
-    offsheet = {t for t in reached & plain if black.get(t, 0) >= MIN_FILL}
-    straddling = {}
-    for x, y in ink:
-        sides = "".join(s for (dx, dy), s in AROUND.items()
-                        if (x + dx, y + dy) in reached)
-        if sides:
-            straddling[(x, y)] = frozenset(sides)
-    return offsheet, straddling
+    reached = walk_outside(chart, plain)
+    return facing({t for t, n in fill.items() if n}, reached)
 
 
 def wholly_offsheet(a: np.ndarray) -> bool:
-    """True if the only thing on this tile is off-sheet fill.
+    """True if every opaque pixel on this tile is off-sheet fill.
 
-    The one question about fill a single tile can answer. Whether a black
-    region *within* a chart tile is fill or a place name needs the tile grid to
-    settle, but a tile that draws no chart at all cannot be showing a place
-    name, however solid its black -- so a caller with no positional context,
-    like the downloader, can still act on this much.
+    The one question about fill a single tile can answer. Whether a dark region
+    *within* a chart tile is fill or a place name needs the tile grid to settle,
+    but a tile that draws no chart at all cannot be showing a place name,
+    however solid its black -- so a caller with no positional context, like the
+    downloader, can still act on this much.
+
+    One drawn pixel is enough to fail it. A tile carrying anything at all is not
+    a tile to discard whole; the pixel flood is what takes fill off a tile that
+    also has chart on it.
     """
     opaque = a[..., 3] == 255
     n = int(opaque.sum())
     if not n:
         return False
-    black = opaque & (a[..., :3].max(axis=2) == 0)
-    other = opaque & (a[..., :3].mean(axis=2) <= WHITE_LUM) & ~black
-    return (int(black.sum()) >= MIN_FILL and int(other.sum()) <= MIN_FILL
-            and int(black.sum()) / n >= FILL_FRACTION)
+    return int((opaque & (a[..., :3].max(axis=2) <= DARK)).sum()) == n
 
 
 class Leaked(RuntimeError):
     """Tiles hold solid fill that the walk did not reach, so it would ship."""
 
 
-def leaked(black, candidates, z, cap=TILE * TILE * FILL_FRACTION):
+def leaked(solid, candidates, z):
     """Refuse to leave a tile that is nothing but fill unexamined.
 
     Selecting by position is only as good as the walk, and a walk that stops
-    short leaves black in the output while every counter reports success --
+    short leaves fill in the output while every counter reports success --
     which is exactly how the previous selection shipped. This costs nothing:
-    the survey has already counted the black on every tile.
+    the survey has already said which tiles are fill and nothing else.
     """
-    missed = sorted(t for t, n in black.items() if n >= cap and t not in candidates)
+    missed = sorted(solid - candidates)
     if missed:
         raise Leaked(
-            f"z{z}: {len(missed)} tiles are at least {FILL_FRACTION:.0%} solid black "
-            f"but the walk did not reach them, so their fill would ship: "
+            f"z{z}: {len(missed)} tiles are solid fill but the walk did not "
+            f"reach them, so their fill would ship: "
             f"{missed[:5]}{' ...' if len(missed) > 5 else ''}")
 
 
-def reaching(mask: np.ndarray, sides) -> np.ndarray:
-    """The parts of the mask that run off the tile past one of `sides`.
+def widen(dark: np.ndarray, pad: dict, margin: int) -> np.ndarray:
+    """The tile's dark mask with a margin of what lies past each side.
 
-    Off-sheet fill continues into the tile the walk came from, so on a chart
-    tile it always meets the border facing that tile. A place name set near the
-    sheet edge does not, and that is the whole difference between them once the
-    grid has narrowed the question to one tile.
+    Without it nothing within `margin` of a seam can satisfy the radius test,
+    because the disk hangs off the array -- and the fill always meets a seam,
+    since that is how it got here. A missing neighbour pads solid: beyond the
+    data is outside, and outside is what the fill is.
+
+    The corners are filled from the diagonal neighbours rather than left blank.
+    A blank corner is a square of not-fill `margin` on a side, sitting exactly
+    where a sheet edge crossing the grid diagonally puts its fill.
     """
-    labels, n = ndimage.label(mask)
-    if not n:
-        return mask
-    keep = set()
-    for s in sides:
-        keep.update(np.unique(labels[BORDER[s]]).tolist())
-    keep.discard(0)
-    return np.isin(labels, list(keep))
+    m = margin
+    if m > TILE:
+        raise ValueError(f"a margin of {m} needs more than the eight tiles "
+                         f"around this one; radius must be at most {TILE // 2}")
+    big = np.zeros((dark.shape[0] + 2 * m, dark.shape[1] + 2 * m), bool)
+    big[m:-m, m:-m] = dark
+    clip = clips(m)
+    for side, sl in regions(m).items():
+        strip = pad.get(side)
+        big[sl] = True if strip is None else strip[clip[side]]
+    return big
 
 
-def nodata_mask(a: np.ndarray, radius: int, protect: bool = True, sides=None) -> np.ndarray:
-    """Pixels belonging to a solid opaque-black region rather than to chart ink.
+def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
+                kind: str = "black",
+                outward: frozenset | None = None,
+                white: int = WHITE) -> np.ndarray:
+    """Pixels belonging to off-sheet fill rather than to chart ink.
 
-    `protect` buys ink safety with a little unremoved fill, so it is for tiles
-    that carry chart. On a tile the walk placed wholly outside the last sheet
-    there is no ink to protect, and the opening would only strand the fill in
-    corners too narrow to survive it.
+    A fill pixel is dark for `radius` in every direction, and that is the whole
+    test for what may start a removal. Nothing narrower than twice the radius
+    can satisfy it, so a place name -- Traficom sets them at 10-16px across --
+    cannot be reached from anywhere, however the tile is bounded.
 
-    `sides` names the tile borders the off-sheet region lies past, and confines
-    the result to black that reaches one of them. Without it the local shape
-    test is all that stands between a heavy place name and deletion, which is
-    not enough: Traficom's capitals seed the erosion exactly as a fill does.
+    The fill is then whatever that test finds running in **from the sides the
+    outside lies past**, which the tile-grid walk has already named in
+    `outward`. Direction is half the method, not a refinement of it: the other
+    sides face more chart, and a tile at the limit has open water on them --
+    white, wide, and every bit as qualified to start a flood as the blank beyond
+    the limit is. Seeded from all four, one such tile empties both sides of the
+    boundary it straddles. `outward` of None seeds from anywhere, which is only
+    right when the caller has established there is nothing to protect.
+
+    The margin carries the neighbouring tiles' own pixels -- their real ones, so
+    a band that is thin here but wide a few pixels into the next tile is still
+    found, and the flood is free to travel through it. Barring it from the
+    margins that are not outward stops it following the fill along a boundary
+    that runs diagonally across the grid, which leaves a row of peaks standing
+    where a tile could not reach its own outside without crossing a neighbour.
+
+    `pad` of None means the tile is wholly outside the last sheet. Nothing there
+    is chart, so nothing needs protecting.
     """
-    black = (a[..., :3].max(axis=2) == 0) & (a[..., 3] == 255)
-    if not black.any():
-        return black
-    if not protect:
-        return black
-    k = np.ones((2 * radius + 1, 2 * radius + 1), bool)
-    seeds = ndimage.binary_erosion(black, structure=k)
-    if not seeds.any():
-        return np.zeros_like(black)
-    # Grown back through the solid part of the black, not through all of it.
-    # Reconstruction follows connectivity, and at a sheet edge the chart's own
-    # ink abuts the fill, so propagating through every black pixel runs down
-    # those strokes and takes them too. An opening drops anything thinner than
-    # ink while leaving a straight boundary exactly where it was, which is what
-    # the fill has -- the source anti-aliases it not at all.
-    solid = ndimage.binary_opening(black, structure=np.ones((2 * THIN + 1,) * 2, bool))
-    grown = ndimage.binary_propagation(seeds, mask=solid)
-    return reaching(grown, sides) if sides else grown
+    dark = nodata_test(kind, white)(a)
+    if not dark.any() or pad is None:
+        return dark
+    # Padded two radii deep, and the flood let into one of them.
+    #
+    # The outer radius is there for the distance transform and nothing else.
+    # `distance_transform_edt` measures distance to background inside the array
+    # only, so a pixel within a radius of the array's own edge has its clearance
+    # inflated -- a disk hanging off the edge counts as fitting, and a band of
+    # no-data far too shallow to hold one still seeds a flood. Two tiles then
+    # read one seam differently, because which sides are outward decides which
+    # margin each leans on. Measured on the Aland boundary at radius 64: 67 of
+    # 256 seam rows disagreed at margin 64, 1 at margin 128.
+    #
+    # The inner radius is where the flood may go. It cannot be held to the tile:
+    # a fill band along the data edge is narrower than the disk, so every core
+    # pixel it has lies outside the tile, and a flood held to the tile finds no
+    # seed at all -- 68 of 948 candidate tiles were touched, and the boundary
+    # broke into straight lines at every seam, each tile having answered on its
+    # own ground. One radius out is enough ground to seed on and to round the
+    # boundary continuously, and short enough that the flood cannot cross a
+    # neighbour's open water and come back.
+    margin = 2 * radius
+    big = widen(dark, pad, margin)
+    if big.all():
+        # Nothing within a radius of this tile is chart. Said explicitly because
+        # the distance transform below has no answer for an array with no
+        # background in it, and returns a small number rather than an infinite
+        # one -- which reads as "no fill here" and keeps the lot.
+        return np.ones_like(dark)
+    # Erosion and dilation by a disk, as distances rather than as a kernel: a
+    # 129x129 structuring element over a 384x384 tile is billions of comparisons,
+    # the same answer costs two linear passes. Euclidean, so a stroke crossing
+    # at 45 degrees is measured the same as one crossing square -- a chessboard
+    # metric would make it 1.41x harder to keep.
+    core = ndimage.distance_transform_edt(big) > radius
+    if not core.any():
+        return np.zeros_like(dark)
+    reach = np.zeros(big.shape, bool)
+    reach[radius:-radius, radius:-radius] = True
+    rim = np.zeros(big.shape, bool)
+    where = regions(margin)
+    for side in (where if outward is None else outward):
+        rim[where[side]] = True
+    out = ndimage.binary_propagation(core & rim & reach, mask=core & reach)
+    if not out.any():
+        return np.zeros_like(dark)
+    out = (ndimage.distance_transform_edt(~out) <= radius) & big
+    return out[margin:-margin, margin:-margin]
+
 
 
 def _strip(task):
-    z, x, row, blob, radius, sides = task
+    z, x, row, blob, pad, outward, radius, kind, white = task
     img = Image.open(io.BytesIO(blob)).convert("RGBA")
     a = np.asarray(img).copy()
-    m = nodata_mask(a, radius, protect=bool(sides), sides=sides)
+    m = nodata_mask(a, pad, radius, kind, outward, white)
     n = int(m.sum())
-    if n < MIN_FILL:
+    if not n:
         return None
     a[m] = (255, 255, 255, 0)          # off-sheet: white, and transparent
     if a[..., 3].max() == 0:
@@ -339,7 +605,7 @@ def batches(con, z, size):
         last = (rows[-1][0], rows[-1][1])
 
 
-def scan(src: Path, radius: int, jobs: int) -> None:
+def scan(src: Path, jobs: int, white: int = WHITE) -> None:
     """What a run would examine, by the same reckoning the run uses.
 
     Answering this with the local shape test alone -- as a dry run naturally
@@ -348,25 +614,76 @@ def scan(src: Path, radius: int, jobs: int) -> None:
     set the run exists not to touch.
     """
     con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
-    zs = [z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level")]
+    deep = max(z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles"))
     print(f"=== {src.name} ===")
-    total = 0
     with ProcessPoolExecutor(max_workers=jobs) as pool:
-        for z in zs:
-            ink, plain, black = survey(con, z, pool)
-            offsheet, straddling = edge_tiles(ink, plain, black)
-            seen = len(ink) + len(plain)
-            if offsheet or straddling:
-                px = sum(black.get(t, 0) for t in offsheet)
-                print(f"  z{z:<3} {len(offsheet):>6} off-sheet and {len(straddling):>5} "
-                      f"straddling of {seen:>7} tiles, {px / 65536:.0f} tiles' worth "
-                      f"of fill beyond the sheets")
-            total += len(offsheet) + len(straddling)
-    print(f"  {total} tiles would be examined")
+        chart, plain, fill, solid = survey(con, deep, pool, white)
+    straddling = edge_tiles(chart, plain, fill)
+    px = sum(fill.get(t, 0) for t in straddling)
+    print(f"  z{deep:<3} {len(solid):>6} tiles are fill throughout and "
+          f"{len(straddling):>5} carry fill the outside touches, of "
+          f"{len(chart) + len(plain):>7}; {px / 65536:.0f} tiles' worth of fill")
     con.close()
 
 
-def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
+def pixel_pass(con, z, whole, straddle, kind, radius, pool, white=WHITE):
+    """Erase one colour of no-data from one zoom. Returns (rewritten, dropped).
+
+    `whole` are tiles that are nothing but it. `straddle` maps each chart tile
+    the outside touches to the sides it touches from -- both the pixels those
+    sides carry and the direction the flood may enter by.
+    """
+    if not whole and not straddle:
+        return 0, 0
+    rewritten = dropped = 0
+    # only the neighbours whose pixels are actually read: an outward one is
+    # padded solid on the walk's word, so its tile never needs decoding for that
+    # candidate
+    want = sorted({(x + dx, y + dy) for (x, y), sides in straddle.items()
+                   for (dx, dy), side in AROUND.items() if side not in sides}
+                  | straddle.keys())
+    edges = edge_lines(con, z, want, pool, kind, white)
+    todo = sorted(whole | straddle.keys())
+    for i in range(0, len(todo), BATCH):
+        tasks = []
+        for x, y in todo[i:i + BATCH]:
+            row = (1 << z) - 1 - y
+            blob = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
+                               "tile_column=? AND tile_row=?", (z, x, row)).fetchone()
+            pad = (None if (x, y) in whole
+                   else surround((x, y), edges, straddle[(x, y)]))
+            if blob:
+                tasks.append((z, x, row, blob[0], pad, straddle.get((x, y)),
+                              radius, kind, white))
+        for res in pool.map(_strip, tasks, chunksize=32):
+            if res is None:
+                continue
+            rz, rx, rrow, data, _ = res
+            if data is None:
+                con.execute("DELETE FROM tiles WHERE zoom_level=? AND tile_column=? "
+                            "AND tile_row=?", (rz, rx, rrow))
+                dropped += 1
+            else:
+                con.execute("UPDATE tiles SET tile_data=? WHERE zoom_level=? AND "
+                            "tile_column=? AND tile_row=?",
+                            (sqlite3.Binary(data), rz, rx, rrow))
+                rewritten += 1
+        con.commit()
+    return rewritten, dropped
+
+
+def drop(con, z, tiles) -> int:
+    """Delete whole tiles at one zoom. Returns how many."""
+    for x, y in tiles:
+        con.execute("DELETE FROM tiles WHERE zoom_level=? AND tile_column=? "
+                    "AND tile_row=?", (z, x, (1 << z) - 1 - y))
+    con.commit()
+    return len(tiles)
+
+
+def run(src: Path, out: Path, jobs: int, stages=DEFAULT_STAGES,
+        radius: int = RADIUS, white: int = WHITE,
+        limit: int = MAX_CHART_NEIGHBOURS) -> None:
     # built beside the target and moved into place at the end, so a run that
     # dies partway cannot leave a valid-looking partial chart where the good
     # one was
@@ -386,66 +703,88 @@ def run(src: Path, out: Path, radius: int, jobs: int, offeez: bool) -> None:
     con.commit()
 
     zs = [z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles ORDER BY zoom_level")]
+    deep = max(zs)
     rewritten = dropped = 0
     with ProcessPoolExecutor(max_workers=jobs) as pool:
-        for z in zs:
-            zr = zd = 0
-            ink, plain, black = survey(con, z, pool)
-            offsheet, straddling = edge_tiles(ink, plain, black)
-            candidates = offsheet | straddling.keys()
-            leaked(black, candidates, z)
-            todo = sorted(((x, (1 << z) - 1 - y), straddling.get((x, y)))
-                          for (x, y) in candidates)
-            if todo:
-                print(f"  z{z:<3} {len(offsheet)} off-sheet, {len(straddling)} straddling "
-                      f"of {len(ink) + len(plain)} tiles")
-            for i in range(0, len(todo), BATCH):
-                tasks = []
-                for (x, row), sides in todo[i:i + BATCH]:
-                    blob = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
-                                       "tile_column=? AND tile_row=?", (z, x, row)).fetchone()
-                    tasks.append((z, x, row, blob[0], radius, sides))
-                for res in pool.map(_strip, tasks, chunksize=32):
-                    if res is None:
-                        continue
-                    rz, rx, rrow, data, _ = res
-                    if data is None:
-                        con.execute("DELETE FROM tiles WHERE zoom_level=? AND tile_column=? "
-                                    "AND tile_row=?", (rz, rx, rrow))
-                        zd += 1
-                    else:
-                        con.execute("UPDATE tiles SET tile_data=? WHERE zoom_level=? AND "
-                                    "tile_column=? AND tile_row=?",
-                                    (sqlite3.Binary(data), rz, rx, rrow))
-                        zr += 1
-                con.commit()
-            rewritten += zr
-            dropped += zd
-            if zr or zd:
-                print(f"  z{z:<3} rewrote {zr:>6}, dropped {zd:>5}")
+        if "black-tiles" in stages:
+            # Tiles that are fill and nothing else, and that the walk reaches
+            # from beyond the data. Nothing is drawn on them, so this cannot
+            # take chart however solid the fill is.
+            chart, plain, fill, solid = survey(con, deep, pool, white)
+            gone = drop(con, deep, solid & walk_outside(chart, plain))
+            dropped += gone
+            print(f"  z{deep} fill: {gone} tiles dropped whole "
+                  f"of {len(chart) + len(plain)}")
 
-    stamp = f"opaque-black-r{radius}-edge"
-    if offeez:
-        # classified from the black-stripped tiles, so removed fill cannot pose
-        # as a marking and wall the flood out of its own region
-        print("  planning off-EEZ removal across all zooms ...")
-        plan, drops = offsheet_plan(con, zs)
-        for z in zs:
-            dis = len(drops[z]) - len(plan[z])
-            if drops[z]:
-                print(f"  z{z:<3} off-EEZ: {len(drops[z]):>6} flood-reachable, "
-                      f"{dis:>5} kept (deeper detail survives), {len(plan[z]):>6} to drop")
-        total = 0
-        for z in zs:
-            for x, y in plan[z]:
-                con.execute("DELETE FROM tiles WHERE zoom_level=? AND tile_column=? AND tile_row=?",
-                            (z, x, (1 << z) - 1 - y))
-                total += 1
-            con.commit()
-        print(f"  off-EEZ total: {total} tiles dropped, 0 modified")
-        stamp += "+offeez-tilelevel"
+        if "black-pixels" in stages:
+            # Re-surveyed: the drop above has changed what each remaining tile
+            # faces, and a tile whose fill neighbour is now an empty cell is
+            # padded from the walk's word rather than from the neighbour.
+            chart, plain, fill, solid = survey(con, deep, pool, white)
+            straddling = edge_tiles(chart, plain, fill)
+            leaked(solid, straddling.keys(), deep)
+            r, d = pixel_pass(con, deep, set(), straddling,
+                              "black", radius, pool, white)
+            print(f"  z{deep} fill: {len(straddling)} tiles the outside touches, "
+                  f"{r} rewritten, {d} dropped")
+            rewritten += r
+            dropped += d
 
-    con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)", ("nodata_stripped", stamp))
+        if "white-tiles" in stages:
+            drops, held = removable(*classify(con, deep, white), limit)
+            gone = drop(con, deep, drops)
+            dropped += gone
+            print(f"  z{deep} blank: {gone} tiles dropped whole, "
+                  f"{len(held)} held by their neighbours")
+
+        if "white-pixels" in stages:
+            # Dropping tiles can only take one that is blank throughout. Where
+            # the limit crosses one, the blank half stays -- the same shape of
+            # leftover the fill used to leave, in the other colour. Trimming it
+            # is a pixel flood, and a flood needs a drawn boundary to stop at:
+            # where a sheet simply ends, the water inside is the same white as
+            # the blank outside and it takes both.
+            marked, feat = classify(con, deep, white)
+            # A tile the neighbour count holds is a wall here too, or the walk
+            # crosses it and the flood trims the next tile in instead.
+            _, held = removable(marked, feat, limit)
+            marked, feat = marked | held, feat - held
+            # walk_outside, not the drop set: white-tiles has just deleted the
+            # blank tiles, so what a boundary tile now faces is an empty cell
+            # rather than a featureless neighbour
+            reached = walk_outside(marked, feat)
+            straddle = facing(marked, reached)
+            wr, wd = pixel_pass(con, deep, set(), straddle, "white",
+                                radius, pool, white)
+            print(f"  z{deep} limit: {len(straddle)} straddling, {wr} rewritten, "
+                  f"{wd} dropped")
+            rewritten += wr
+            dropped += wd
+
+    # Every level below the one just cleaned is a separate rendering of the same
+    # coastline and still carries its fill. Downscale rebuilds them all from
+    # here, so leaving them would ship whichever the rebuild happened not to
+    # overwrite.
+    #
+    # What is left is not a chart, and it says so. `minzoom` becomes the one
+    # level it holds, because a file that claims a pyramid it does not have will
+    # pass every check that reads the header and none that looks at the tiles;
+    # `pyramid_pending` carries the floor downscale is to rebuild to, and
+    # downscale clears it. Publish refuses anything still carrying it.
+    stale = [z for z in zs if z < deep]
+    if stale:
+        con.execute("DELETE FROM tiles WHERE zoom_level<?", (deep,))
+        con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
+                    ("pyramid_pending", str(min(stale))))
+        con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
+                    ("minzoom", str(deep)))
+        con.commit()
+        print(f"  dropped z{min(stale)}..z{deep - 1} for downscale to rebuild from z{deep}")
+
+    con.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
+                ("nodata_stripped",
+                 processing_stamp(radius, stages=stages,
+                                  white=white, limit=limit)))
     con.commit()
     con.execute("VACUUM")
     con.close()
@@ -457,20 +796,45 @@ def main():
     p = argparse.ArgumentParser(description="Strip opaque-black no-data fill from MBTiles")
     p.add_argument("input", type=Path)
     p.add_argument("--out", type=Path, help="default: <input>.stripped.mbtiles")
-    p.add_argument("--radius", type=int, default=RADIUS,
-                   help=f"erosion radius separating fill from ink (default {RADIUS})")
     p.add_argument("--jobs", type=int, default=0, help="worker processes (default: all cores)")
+    p.add_argument("--radius", type=int, default=RADIUS,
+                   help=f"a fill pixel is dark for this far in every direction "
+                        f"(default {RADIUS}); below half the width of a place name "
+                        f"the type starts qualifying too")
     p.add_argument("--scan", action="store_true", help="report what would change, write nothing")
-    p.add_argument("--skip-offeez", action="store_true",
-                   help="leave the blank white beyond the chart limits in place")
+    p.add_argument("--stages", default=",".join(DEFAULT_STAGES),
+                   help=f"which removals to run, comma separated, in any order "
+                        f"(they always run in the order listed here): "
+                        f"{', '.join(STAGES)}. Default {','.join(DEFAULT_STAGES)}. "
+                        f"The two tile stages drop only tiles that are fill or "
+                        f"blank throughout and so cannot take chart; the two "
+                        f"pixel stages are floods and need a drawn boundary to "
+                        f"stop at")
+    p.add_argument("--white-level", type=int, default=WHITE,
+                   help=f"an opaque pixel is blank paper when every channel is "
+                        f"at least this (default {WHITE}). The south-eastern "
+                        f"sheets render blank as fefefe, corner fill included, "
+                        f"and need {WHITE - 1}")
+    p.add_argument("--max-chart-neighbours", type=int, default=MAX_CHART_NEIGHBOURS,
+                   help=f"a blank tile counts as blank only if at most this many "
+                        f"of its four neighbours carry chart (default "
+                        f"{MAX_CHART_NEIGHBOURS}); above it the tile is held to "
+                        f"be water between soundings rather than paper past the "
+                        f"last sheet")
     args = p.parse_args()
     if not args.input.exists():
         sys.exit(f"no such file: {args.input}")
+    stages = tuple(s.strip() for s in args.stages.split(",") if s.strip())
+    unknown = [s for s in stages if s not in STAGES]
+    if unknown:
+        sys.exit(f"unknown stage(s): {', '.join(unknown)}; "
+                 f"choose from {', '.join(STAGES)}")
     if args.scan:
-        scan(args.input, args.radius, args.jobs or None)
+        scan(args.input, args.jobs or None, args.white_level)
         return
     out = args.out or args.input.with_suffix(".stripped.mbtiles")
-    run(args.input, out, args.radius, args.jobs or None, not args.skip_offeez)
+    run(args.input, out, args.jobs or None, stages, args.radius,
+        args.white_level, args.max_chart_neighbours)
 
 
 if __name__ == "__main__":

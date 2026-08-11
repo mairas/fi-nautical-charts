@@ -157,14 +157,33 @@ def regen_level(con: sqlite3.Connection, z: int, pool) -> int:
     return made
 
 
+def floor_zoom(zooms: list[int], meta: dict[str, str]) -> int:
+    """How far down the pyramid should reach when nobody says.
+
+    Not simply the lowest level present: strip_nodata cleans the deepest level
+    and deletes the rest, since each of the others is a separate rendering of
+    the same coastline carrying its own fill. What it leaves behind is one level
+    of tiles and `pyramid_pending`, the floor it wants rebuilt. Its `minzoom` by
+    then describes what it actually holds, so reading that would rebuild
+    nothing.
+    """
+    for key in ("pyramid_pending", "minzoom"):
+        try:
+            return min(min(zooms), int(meta[key]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return min(zooms)
+
+
 def build(inp: Path, out: Path, source_zoom: int | None, min_zoom: int | None, jobs: int):
     src = sqlite3.connect(f"file:{inp}?mode=ro", uri=True)
     zooms = sorted(z for (z,) in src.execute("SELECT DISTINCT zoom_level FROM tiles"))
+    meta = dict(src.execute("SELECT name, value FROM metadata"))
     src.close()
     if not zooms:
         sys.exit(f"{inp}: no tiles")
     szoom = source_zoom if source_zoom is not None else max(zooms)
-    mzoom = min_zoom if min_zoom is not None else min(zooms)
+    mzoom = min_zoom if min_zoom is not None else floor_zoom(zooms, meta)
     if mzoom >= szoom:
         sys.exit(f"nothing to do: min-zoom {mzoom} >= source-zoom {szoom}")
 
@@ -201,6 +220,9 @@ def build(inp: Path, out: Path, source_zoom: int | None, min_zoom: int | None, j
     con.execute("DETACH DATABASE src")
     if filled:
         print(f"  kept {filled} original tiles where no source existed to downscale")
+
+    # the pyramid this file was waiting for is now built
+    con.execute("DELETE FROM metadata WHERE name='pyramid_pending'")
 
     present = sorted(z for (z,) in con.execute("SELECT DISTINCT zoom_level FROM tiles"))
     meta = {"minzoom": str(min(present)), "maxzoom": str(max(present)),
