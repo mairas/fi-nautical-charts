@@ -279,19 +279,21 @@ def nodata_test(kind: str, white: int = WHITE):
 
 
 def _edges(task):
-    """A tile's borders and corners, `margin` deep, under one predicate."""
-    z, x, row, blob, margin, kind, white = task
+    """One neighbour tile's no-data mask, bit-packed.
+
+    Whole, not a border strip. The padding is a tile deep (see `nodata_mask`),
+    so what goes beside the subject tile is the neighbour itself; packed because
+    a run holds one of these for every neighbour of every candidate at once, and
+    a bool array costs eight times as much.
+    """
+    z, x, row, blob, kind, white = task
     d = nodata_test(kind, white)(
         np.asarray(Image.open(io.BytesIO(blob)).convert("RGBA")))
-    m = margin
-    return x, row, {"l": d[:, :m].copy(), "r": d[:, -m:].copy(),
-                    "t": d[:m, :].copy(), "b": d[-m:, :].copy(),
-                    "lt": d[:m, :m].copy(), "rt": d[:m, -m:].copy(),
-                    "lb": d[-m:, :m].copy(), "rb": d[-m:, -m:].copy()}
+    return x, row, np.packbits(d)
 
 
-def edge_lines(con, z, want, pool, kind="black", margin=RADIUS, white=WHITE):
-    """The border strips of every tile a candidate needs to be padded with.
+def edge_lines(con, z, want, pool, kind="black", white=WHITE):
+    """The no-data mask of every tile a candidate needs to be padded with.
 
     A tile cannot tell fill from ink at its own edge without knowing what is on
     the other side, and the tile grid alone cannot say: a sheet edge crossing
@@ -307,16 +309,21 @@ def edge_lines(con, z, want, pool, kind="black", margin=RADIUS, white=WHITE):
                             "tile_column=? AND tile_row=?",
                             (z, x, (1 << z) - 1 - y)).fetchone()
             if r:
-                tasks.append((z, x, (1 << z) - 1 - y, r[0], margin, kind, white))
+                tasks.append((z, x, (1 << z) - 1 - y, r[0], kind, white))
         for x, row, e in pool.map(_edges, tasks, chunksize=32):
             out[(x, (1 << z) - 1 - row)] = e
     return out
 
 
+def unpack(buf) -> np.ndarray:
+    """A tile-sized bool mask back out of `_edges`."""
+    return np.unpackbits(buf).reshape(TILE, TILE).astype(bool)
+
+
 def surround(xy, edges, outward=frozenset()):
     """What lies just past each of a tile's eight sides and corners.
 
-    A side maps to the neighbour's facing piece, or to None -- meaning solid
+    A side maps to that neighbour's own mask, or to None -- meaning solid
     no-data -- where there is no tile at all.
 
     It also maps to None on the sides the walk called outward, whatever the
@@ -333,7 +340,7 @@ def surround(xy, edges, outward=frozenset()):
     pad = {}
     for (dx, dy), side in AROUND.items():
         n = None if side in outward else edges.get((x + dx, y + dy))
-        pad[side] = None if n is None else n[FACING[side]]
+        pad[side] = None if n is None else unpack(n)
     return pad
 
 
@@ -343,8 +350,18 @@ def surround(xy, edges, outward=frozenset()):
 AROUND = {(1, 0): "r", (-1, 0): "l", (0, 1): "b", (0, -1): "t",
           (1, 1): "rb", (1, -1): "rt", (-1, 1): "lb", (-1, -1): "lt"}
 
-FACING = {"l": "r", "r": "l", "t": "b", "b": "t",
-          "lt": "rb", "rb": "lt", "rt": "lb", "lb": "rt"}
+def clips(margin: int) -> dict:
+    """Which part of a neighbour's own mask sits against the subject tile.
+
+    The left neighbour contributes its rightmost `margin` columns, the up-left
+    one its bottom-right corner, and so on. At a margin of a whole tile every
+    one of these is the neighbour entire.
+    """
+    m = margin
+    return {"l": np.s_[:, -m:], "r": np.s_[:, :m],
+            "t": np.s_[-m:, :], "b": np.s_[:m, :],
+            "lt": np.s_[-m:, -m:], "rt": np.s_[-m:, :m],
+            "lb": np.s_[:m, -m:], "rb": np.s_[:m, :m]}
 
 
 def regions(margin: int) -> dict:
@@ -444,11 +461,15 @@ def widen(dark: np.ndarray, pad: dict, margin: int) -> np.ndarray:
     where a sheet edge crossing the grid diagonally puts its fill.
     """
     m = margin
+    if m > TILE:
+        raise ValueError(f"a margin of {m} needs more than the eight tiles "
+                         f"around this one; radius must be at most {TILE // 2}")
     big = np.zeros((dark.shape[0] + 2 * m, dark.shape[1] + 2 * m), bool)
     big[m:-m, m:-m] = dark
+    clip = clips(m)
     for side, sl in regions(m).items():
         strip = pad.get(side)
-        big[sl] = True if strip is None else strip
+        big[sl] = True if strip is None else strip[clip[side]]
     return big
 
 
@@ -485,7 +506,27 @@ def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
     dark = nodata_test(kind, white)(a)
     if not dark.any() or pad is None:
         return dark
-    big = widen(dark, pad, radius)
+    # Padded two radii deep, and the flood let into one of them.
+    #
+    # The outer radius is there for the distance transform and nothing else.
+    # `distance_transform_edt` measures distance to background inside the array
+    # only, so a pixel within a radius of the array's own edge has its clearance
+    # inflated -- a disk hanging off the edge counts as fitting, and a band of
+    # no-data far too shallow to hold one still seeds a flood. Two tiles then
+    # read one seam differently, because which sides are outward decides which
+    # margin each leans on. Measured on the Aland boundary at radius 64: 67 of
+    # 256 seam rows disagreed at margin 64, 1 at margin 128.
+    #
+    # The inner radius is where the flood may go. It cannot be held to the tile:
+    # a fill band along the data edge is narrower than the disk, so every core
+    # pixel it has lies outside the tile, and a flood held to the tile finds no
+    # seed at all -- 68 of 948 candidate tiles were touched, and the boundary
+    # broke into straight lines at every seam, each tile having answered on its
+    # own ground. One radius out is enough ground to seed on and to round the
+    # boundary continuously, and short enough that the flood cannot cross a
+    # neighbour's open water and come back.
+    margin = 2 * radius
+    big = widen(dark, pad, margin)
     if big.all():
         # Nothing within a radius of this tile is chart. Said explicitly because
         # the distance transform below has no answer for an array with no
@@ -500,15 +541,17 @@ def nodata_mask(a: np.ndarray, pad: dict | None = None, radius: int = RADIUS,
     core = ndimage.distance_transform_edt(big) > radius
     if not core.any():
         return np.zeros_like(dark)
+    reach = np.zeros(big.shape, bool)
+    reach[radius:-radius, radius:-radius] = True
     rim = np.zeros(big.shape, bool)
-    where = regions(radius)
+    where = regions(margin)
     for side in (where if outward is None else outward):
         rim[where[side]] = True
-    out = ndimage.binary_propagation(core & rim, mask=core)
+    out = ndimage.binary_propagation(core & rim & reach, mask=core & reach)
     if not out.any():
         return np.zeros_like(dark)
     out = (ndimage.distance_transform_edt(~out) <= radius) & big
-    return spread(out, bleed)[radius:-radius, radius:-radius]
+    return spread(out, bleed)[margin:-margin, margin:-margin]
 
 
 def spread(mask: np.ndarray, n: int) -> np.ndarray:
@@ -596,7 +639,7 @@ def pixel_pass(con, z, whole, straddle, kind, radius, bleed, pool, white=WHITE):
     want = sorted({(x + dx, y + dy) for (x, y), sides in straddle.items()
                    for (dx, dy), side in AROUND.items() if side not in sides}
                   | straddle.keys())
-    edges = edge_lines(con, z, want, pool, kind, radius, white)
+    edges = edge_lines(con, z, want, pool, kind, white)
     todo = sorted(whole | straddle.keys())
     for i in range(0, len(todo), BATCH):
         tasks = []

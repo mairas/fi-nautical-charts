@@ -376,11 +376,10 @@ def _limit_pad():
     The ink line runs the full width of the padded array, so the only way from
     one side of it to the other is through the line itself.
     """
-    R = sn.RADIUS
-    side = np.ones((256, R), bool)
+    side = np.ones((256, 256), bool)
     side[128:131, :] = False
-    return {"t": np.ones((R, 256), bool), "b": None, "l": side, "r": side.copy(),
-            "lt": np.ones((R, R), bool), "rt": np.ones((R, R), bool),
+    return {"t": np.ones((256, 256), bool), "b": None, "l": side, "r": side.copy(),
+            "lt": np.ones((256, 256), bool), "rt": np.ones((256, 256), bool),
             "lb": None, "rb": None}
 
 
@@ -511,11 +510,8 @@ def test_a_band_too_thin_to_hold_a_core_is_still_reached(tmp_path):
     a = np.zeros((256, 256, 4), np.uint8)
     a[:, :] = PAPER
     a[:, :8] = (255, 255, 255, 255)
-    R = sn.RADIUS
-    pad = {"l": None, "lt": None, "lb": None,
-           "r": np.zeros((256, R), bool), "t": np.zeros((R, 256), bool),
-           "b": np.zeros((R, 256), bool),
-           "rt": np.zeros((R, R), bool), "rb": np.zeros((R, R), bool)}
+    pad = {"l": None, "lt": None, "lb": None}
+    pad |= {s: np.zeros((256, 256), bool) for s in ("r", "t", "b", "rt", "rb")}
     m = sn.nodata_mask(a, pad, kind="white",
                        outward=frozenset({"l", "lt", "lb"}))
     # away from the ends, where the paper above and below closes in on it
@@ -537,7 +533,7 @@ def test_the_outside_counts_whichever_colour_it_is_drawn_in(tmp_path):
     R = sn.RADIUS
     white = np.zeros((256, 256, 4), np.uint8)
     white[:, :] = (255, 255, 255, 255)           # the outer limit's blank
-    edges = {(1, 0): sn._edges((Z, 1, 0, tile("blank"), R, "black", sn.WHITE))[2]}
+    edges = {(1, 0): sn._edges((Z, 1, 0, tile("blank"), "black", sn.WHITE))[2]}
     pad = sn.surround((1, 1), edges, frozenset({"t", "lt", "rt"}))
     assert pad["t"] is None, "the walk said outward and the padding argued"
     m = sn.nodata_mask(a, pad, outward=frozenset({"t", "lt", "rt"}))
@@ -551,10 +547,7 @@ def test_a_tile_whose_whole_neighbourhood_is_fill_is_erased(tmp_path):
     a tile that is nothing but fill, in the middle of more of it."""
     a = np.zeros((256, 256, 4), np.uint8)
     a[:, :] = (0, 0, 0, 255)
-    pad = {s: np.ones((sn.RADIUS, 256) if s in "tb" else (256, sn.RADIUS), bool)
-           for s in ("l", "r", "t", "b")}
-    pad |= {s: np.ones((sn.RADIUS, sn.RADIUS), bool)
-            for s in ("lt", "rt", "lb", "rb")}
+    pad = {s: np.ones((256, 256), bool) for s in sn.AROUND.values()}
     assert sn.nodata_mask(a, pad).all()
 
 
@@ -572,7 +565,7 @@ def test_a_diagonal_neighbour_pads_the_corner(tmp_path):
     for (x, y) in [(0, 0)]:
         r = con.execute("SELECT tile_data FROM tiles WHERE zoom_level=? AND "
                         "tile_column=? AND tile_row=?", (Z, x, (1 << Z) - 1 - y)).fetchone()
-        _, _, e = sn._edges((Z, x, 0, r[0], sn.RADIUS, "black", sn.WHITE))
+        _, _, e = sn._edges((Z, x, 0, r[0], "black", sn.WHITE))
         edges[(x, y)] = e
     con.close()
     pad = sn.surround((1, 1), edges)
