@@ -100,6 +100,10 @@ PAGE = """<!doctype html><meta charset=utf-8><title>fi-nautical-charts</title>
  #map{background:__BACKDROP__}
  .leaflet-control-layers-list{font:13px/1.5 system-ui,sans-serif}
  .note{color:#666;font-size:11px}
+ /* Every chart after the first is reference, drawn under the first and at half
+    brightness, so what the first one removed reads as the dim original showing
+    through rather than as a hole. */
+ .backdrop{filter:brightness(.5)}
 </style><div id=map></div><script>
 const charts = __CHARTS__;
 // The floor is the shallowest level any of these files actually holds. Below
@@ -114,17 +118,24 @@ charts.forEach((c, i) => {
   const opts = {
     maxNativeZoom: c.maxzoom, minNativeZoom: c.minzoom, tileSize: 256,
     keepBuffer: 2, updateWhenZooming: false,
+    // the first file is the subject and sits on top; the rest are reference
+    zIndex: charts.length - i,
     attribution: '&copy; Traficom. Not for navigation use.'
   };
+  if (i > 0) opts.className = 'backdrop';
   if (c.bounds) {
     opts.bounds = [[c.bounds[1], c.bounds[0]], [c.bounds[3], c.bounds[2]]];
   }
   const layer = L.tileLayer('/tiles/' + c.key + '/{z}/{x}/{y}', opts);
   layer.on('tileerror', e => console.warn('tile failed', c.key, e.coords));
-  overlays[c.label + ' <span class=note>' + c.note + '</span>'] = layer;
-  if (i === 0) layer.addTo(map);
+  const dim = i > 0 ? ' &middot; dimmed backdrop' : '';
+  overlays[c.label + ' <span class=note>' + c.note + dim + '</span>'] = layer;
+  layer.addTo(map);
 });
-L.control.layers(null, overlays, {collapsed: false, sortLayers: false}).addTo(map);
+// autoZIndex off: the control renumbers layers in the order it was given them,
+// which puts the last one on top and undoes the stacking set above
+L.control.layers(null, overlays, {collapsed: false, sortLayers: false,
+                                  autoZIndex: false}).addTo(map);
 L.control.scale({imperial: false}).addTo(map);
 const readout = L.control({position: 'bottomleft'});
 readout.onAdd = function () {
