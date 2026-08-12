@@ -636,5 +636,71 @@ have changed since the set was downloaded: `strip-nodata` and `downscale` copy
 metadata verbatim, so a rebuilt chart carries its old label forward until
 relabelled.
 
+## The monthly run
+
+`pipeline` is the whole sequence — refresh, decide, reprocess, publish — over
+every layer in turn:
+
+```bash
+./run pipeline --archive /path/archive --work /path/work --dest /path/charts
+```
+
+Three directories, because the archive is the asset and it is not what gets
+published. Refresh runs against the raw archive and nothing else writes to it:
+`strip-nodata` deletes off-sheet and off-EEZ tiles, and next month's
+`If-Modified-Since` sweep has to reason about tiles that are still on the
+server. Refreshing a downscaled file would be worse still — it would compare our
+anti-aliased z5–z14 against the server's own rescales and quietly replace them.
+
+Layers run one at a time and every step is wrapped in `nice` and `ionice -c 3`,
+with `--jobs 1` by default. The build host has two cores and neighbours that
+want one of them; a layer that runs alone finishes late and bothers nobody.
+
+Most months most layers do nothing. A layer is reprocessed when its edition
+moved, when the archive has moved since the published set was built, or when
+**the recipe changed** — the pipeline compares the published file's own
+`nodata_stripped` and `downscale_source_zoom` against what this build would
+write, so a strip fix or a corrected source zoom rebuilds the layer even though
+Traficom has not. A set published before the downscale step existed carries the
+server's own rescales at every level below native, and neither its filename nor
+its edition date shows it.
+
+Both comparisons are against durable state, which matters more than it sounds.
+The tile counts a refresh returns live for one run, and neither a withdrawn tile
+nor a tile the cache rendered on demand moves `source_updated` — so a month that
+moved the archive and then failed to build would be indistinguishable from a
+quiet one next time. The archive instead carries a `pipeline_revision` the
+refresh bumps whenever tiles actually move, and a processed file inherits it,
+so the rebuild stays owed until a rebuild lands.
+
+`--dry-run` prints the decision for each layer and contacts nobody.
+`--skip-refresh` rebuilds from the archive as it stands, which is what a recipe
+fix wants when a ten-hour sweep would tell it nothing new. `--force` rebuilds
+regardless.
+
+Before anything is offered to `publish`, a processed set must still be the chart
+it was meant to be: it keeps at least half the tiles the layer had **before the
+run started** (off-EEZ removal is the heavy step and takes Yleiskartat down to
+0.76; the others stay within a percent of 1.0), it records the metadata
+publishing needs, and its strip stamp and source zoom are the ones this build
+asked for. Measuring against the pre-run count is what catches a refresh that
+deleted coverage rather than a strip that did — the server answering 404 through
+a maintenance window is indistinguishable from tiles being withdrawn, and
+measured against the archive it just gutted the loss would read as no loss at
+all.
+
+A layer that fails stops there and the rest carry on; the exit status is
+non-zero. Nothing is renamed in the destination until every processed set has
+been staged and verified, so a refusal leaves the published set exactly as it
+was — but a failure *during* the renames reports `DESTINATION CHANGED` and wants
+a look, as the publishing section above describes.
+
+One run at a time: the whole run holds an exclusive lock on the work directory.
+`publish` takes its own lock on the destination, but only for the minutes it is
+renaming; the ten hours before that refresh the archive in place and build
+scratch at paths derived from the layer alone, so a second run would delete the
+first one's partials. Scratch from an earlier run is swept at startup rather
+than trusted to a `finally` a `kill -9` never reaches.
+
 Python tools run via [uv](https://docs.astral.sh/uv/) with PEP 723 inline
 dependencies — no manual environment setup. `./run test` runs the suite.

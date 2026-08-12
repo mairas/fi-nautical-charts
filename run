@@ -91,6 +91,12 @@ function publish {
   uv run publish.py "$@"
 }
 
+function pipeline {
+  #@ Refresh every layer, reprocess what moved, and publish it
+  #@ Category: Publish
+  uv run pipeline.py "$@"
+}
+
 ################################################################################
 # Utility Commands
 
@@ -101,7 +107,7 @@ function test {
   # files and _local/, so a stray test elsewhere would fail the suite.
   uv run --with 'pytest>=8,<9' --with pillow --with numpy --with scipy \
     pytest test_publish.py test_index_page.py test_strip_nodata.py \
-    test_downscale.py "$@"
+    test_downscale.py test_pipeline.py "$@"
 }
 
 function deps {
