@@ -11,6 +11,7 @@ The steps themselves -- refresh, strip, downscale, publish -- have their own
 tests. Here they are subprocesses and stay that way.
 """
 
+import ast
 import errno
 import re
 import sqlite3
@@ -20,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import pipeline
+import publish
 import strip_nodata
 from pipeline import Failed, Layer
 
@@ -1072,3 +1074,99 @@ def test_the_service_passes_only_flags_the_pipeline_accepts():
     source = (pipeline.REPO / "pipeline.py").read_text()
     for flag in re.findall(r'--[a-z-]+', exec_line):
         assert f'"{flag}"' in source, f"{flag} is not an argument pipeline.py adds"
+
+
+# --- the image has to carry what the run reaches -------------------------------
+
+def dockerfile() -> str:
+    return (pipeline.REPO / "Dockerfile").read_text()
+
+
+def runtime_stage() -> str:
+    """The last stage, which is what the image ships. Everything before it
+    builds the environment and is thrown away."""
+    return "FROM " + dockerfile().split("\nFROM ")[-1]
+
+
+def reachable_modules() -> set[str]:
+    """Every file in this repo the monthly run reaches, by import or by exec.
+
+    Followed rather than listed: a list is a second place to remember, and the
+    thing it would be remembered for -- a new import -- is exactly what a list
+    misses. Starts at pipeline.py, takes every sibling it imports and every
+    script it names as a string, and repeats. Names that are not files here are
+    the standard library and drop out.
+    """
+    found: set[str] = set()
+    queue = ["pipeline.py"]
+    while queue:
+        name = queue.pop()
+        if name in found or not (pipeline.REPO / name).is_file():
+            continue
+        found.add(name)
+        source = (pipeline.REPO / name).read_text()
+        queue += re.findall(r'"(\w+\.py)"', source)
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                queue += [f"{a.name}.py" for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                queue.append(f"{node.module}.py")
+    return found
+
+
+def test_the_image_carries_every_file_the_run_reaches():
+    """publish.py imports preview.py, and nothing about the entry point says so.
+    A file left out surfaces ten hours in, at the step that publishes."""
+    copied: set[str] = set()
+    for line in runtime_stage().splitlines():
+        if line.startswith("COPY "):
+            copied.update(re.findall(r'\w+\.py', line))
+    assert reachable_modules() <= copied
+
+
+def test_the_entrypoint_does_not_go_through_the_run_dispatcher():
+    """Verified: the dispatcher's bash function behind the `time` builtin
+    swallows SIGTERM. The container exits 137, the handler never runs, and
+    multi-gigabyte scratch survives the month. A shell-form ENTRYPOINT fails the
+    same way, because docker wraps it in `sh -c` with no exec."""
+    entry = next(l for l in runtime_stage().splitlines()
+                 if l.startswith("ENTRYPOINT"))
+    assert entry.startswith("ENTRYPOINT [")
+    assert "/run" not in entry
+
+
+def test_every_base_image_is_pinned_by_digest():
+    """A tag moves under the two hosts that build from it. The lockfiles hash-pin
+    every wheel, so the base image is what is left to drift."""
+    stages = set(re.findall(r'^FROM \S+ AS (\S+)', dockerfile(), re.M))
+    refs = re.findall(r'^FROM (\S+)', dockerfile(), re.M)
+    refs += re.findall(r'^COPY --from=(\S+)', dockerfile(), re.M)
+    for ref in refs:
+        if ref not in stages:
+            assert "@sha256:" in ref, f"{ref} is a tag, and a tag moves"
+
+
+def test_the_image_sets_the_variables_the_code_reads():
+    """Rename either constant and the image keeps exporting the old name. Steps
+    fall back to a uv the image does not carry, and the manifest to 'unknown' --
+    neither of which fails a build or a run."""
+    stage = runtime_stage()
+    for var in (pipeline.INTERPRETER, publish.VERSION):
+        assert re.search(rf'\b{var}=\S', stage), f"the image never sets {var}"
+
+
+def test_the_build_target_passes_the_argument_the_image_declares():
+    """The commit reaches the served manifest through three files. A rename
+    anywhere along that chain publishes charts that name no code at all."""
+    declared = set(re.findall(r'^ARG (\w+)', dockerfile(), re.M))
+    passed = set(re.findall(r'--build-arg (\w+)=',
+                            (pipeline.REPO / "run").read_text()))
+    assert passed and passed <= declared
+
+
+def test_the_build_context_excludes_what_the_repo_already_ignores():
+    """The archives beside the checkout are gigabytes. Every one of them would
+    be packed up and handed to the daemon on each build."""
+    ignored = (pipeline.REPO / ".dockerignore").read_text().split()
+    for pattern in (pipeline.REPO / ".gitignore").read_text().split():
+        assert pattern in ignored, f"{pattern} reaches the build context"

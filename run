@@ -97,6 +97,15 @@ function pipeline {
   uv run --locked pipeline.py "$@"
 }
 
+function image {
+  #@ Build the container image the monthly run executes in
+  #@ Category: Publish
+  # The commit is the only way the served manifest can name the code that made
+  # it: the image carries no .git for publish.py to ask.
+  docker build --build-arg REVISION="$(git describe --always --dirty)" \
+    --tag fi-nautical-charts "$@" .
+}
+
 function relock {
   #@ Re-resolve the pinned dependencies of every script the pipeline runs
   #@ Category: Publish

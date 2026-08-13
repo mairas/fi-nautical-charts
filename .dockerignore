@@ -1,0 +1,13 @@
+# The whole context is handed to the daemon before the first instruction runs,
+# and the chart archives beside this checkout are gigabytes.
+out/
+*.mbtiles
+*.mbtiles-wal
+*.mbtiles-shm
+__pycache__/
+.venv/
+_local/
+.pytest_cache/
+CLAUDE.local.md
+mbtiles/
+.git/
