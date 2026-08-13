@@ -710,5 +710,52 @@ the build host does not have it, memory is a binding constraint there, and a
 regression that only shows under a full archive is not something to go looking
 for twice.
 
+## Running it monthly
+
+`systemd/` holds a user timer and service. They are user units because `uv`
+installs user-scoped and the archives live in the user's home: nothing here
+needs root. Every path is host-specific and stays out of the repository, in an
+environment file the unit reads.
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp systemd/fi-nautical-charts.{service,timer} ~/.config/systemd/user/
+cp systemd/fi-nautical-charts.env.example ~/.config/fi-nautical-charts.env
+$EDITOR ~/.config/fi-nautical-charts.env        # the four directories
+
+systemctl --user daemon-reload
+systemctl --user enable --now fi-nautical-charts.timer
+loginctl enable-linger "$USER"
+```
+
+**`enable-linger` is not optional.** Without it a user manager exists only while
+the user has a session, so the timer stops firing at logout and starts again at
+the next login — the whole job quietly not running, which is the one failure
+this schedule cannot show you. It is also the reason the pipeline is registered
+as a target of the monitoring stack rather than trusted to report for itself.
+
+Check what you got:
+
+```bash
+systemctl --user list-timers fi-nautical-charts.timer    # next elapse
+systemctl --user status fi-nautical-charts.service       # did enabling start one?
+journalctl --user -u fi-nautical-charts.service -f       # follow a live run
+```
+
+The status check is worth doing straight after enabling. `Persistent=true` makes
+a timer catch up on a run it missed while the host was off, and whether that
+counts a never-yet-run timer as missed depends on the systemd version — so
+confirm you have not just started a ten-hour job in the middle of the afternoon.
+
+The service runs the pipeline exactly as the command above does, so anything
+you can pass by hand you can add to `ExecStart`, and a manual `systemctl --user
+start fi-nautical-charts.service` is a real run under the same limits as the
+scheduled one. The pipeline refuses to run twice at once regardless.
+
+Nothing here notifies anyone. A failed run exits non-zero, names the layer, and
+leaves the published set untouched, but it does not reach a phone: alerting
+belongs to the monitoring stack, tracked at
+[hatlabs/admin#21](https://github.com/hatlabs/admin/issues/21).
+
 Python tools run via [uv](https://docs.astral.sh/uv/) with PEP 723 inline
 dependencies — no manual environment setup. `./run test` runs the suite.

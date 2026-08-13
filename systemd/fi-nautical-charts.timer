@@ -1,0 +1,23 @@
+[Unit]
+Description=Monthly refresh and publish of the Traficom raster chart sets
+Documentation=https://github.com/mairas/fi-nautical-charts
+
+[Timer]
+Unit=fi-nautical-charts.service
+
+# Overnight on the first of the month. The run is long enough to overflow into
+# the working day whatever the start time; nice and ionice are what make that
+# tolerable, not the hour it begins.
+OnCalendar=*-*-01 01:00:00
+
+# Spread the start across an hour. Every bulk client scheduled "monthly at
+# midnight" reaches the source at the same instant, and this one then asks for
+# roughly 820k conditional GETs in a row.
+RandomizedDelaySec=1h
+
+# A host that was off on the first still runs, at the next boot, instead of
+# skipping the month in silence. Monthly is too coarse to lose one to a reboot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
