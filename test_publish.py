@@ -125,7 +125,9 @@ def test_manifest_records_size_digest_edition_and_processing(tmp_path, dest):
     assert entry["name"] == "Veneilykartat 2026-06-21"
     assert entry["processing"] == ("nodata-r128-w254-n2:black-tiles+black-pixels+white-tiles+white-pixels; "
                                    "box-2x-premultiplied from z15 on 2026-08-08")
-    assert manifest_of(dest)["pipeline"] not in ("", None)
+    # not merely non-empty: "unknown" is non-empty and is the value an image
+    # with no git tree published for months without failing anything
+    assert manifest_of(dest)["pipeline"] != "unknown"
 
 
 @pytest.mark.parametrize("meta,expected", [
@@ -569,3 +571,33 @@ def test_generated_is_a_utc_instant_not_a_bare_local_date(tmp_path, dest):
     generated = manifest_of(dest)["generated"]
     assert generated.endswith("+00:00")
     assert len(generated) == len("2026-08-08T12:00:00+00:00")
+
+
+# --- which code made these charts ----------------------------------------------
+
+def test_an_explicit_version_is_what_the_manifest_records(monkeypatch):
+    """An image has no git tree. Without this the manifest records "unknown",
+    and filenames carry the source edition, not the processing version -- so
+    nothing would say which code produced a given chart."""
+    monkeypatch.setenv(publish.VERSION, "sha-abc1234")
+    monkeypatch.setattr(publish.subprocess, "run",
+                        lambda *a, **k: pytest.fail("git ran despite an explicit version"))
+    assert publish.pipeline_version() == "sha-abc1234"
+
+
+def test_a_checkout_still_describes_itself(monkeypatch):
+    monkeypatch.delenv(publish.VERSION, raising=False)
+    assert publish.pipeline_version() not in ("", "unknown")
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_version_falls_through_rather_than_publishing_nothing(monkeypatch, blank):
+    monkeypatch.setenv(publish.VERSION, blank)
+    assert publish.pipeline_version() not in ("", "   ")
+
+
+def test_no_git_and_no_explicit_version_is_still_reported_not_crashed(monkeypatch):
+    monkeypatch.delenv(publish.VERSION, raising=False)
+    monkeypatch.setattr(publish.subprocess, "run",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("no git here")))
+    assert publish.pipeline_version() == "unknown"
