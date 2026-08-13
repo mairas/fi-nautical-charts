@@ -92,6 +92,10 @@ NICE = 19           # every step yields the CPU; the neighbours are production
 IONICE_IDLE = "3"   # ionice class: disk only when nobody else wants it
 LOCK = ".pipeline.lock"
 
+# Names the interpreter each step runs under. Unset outside a container, where
+# uv owns the environment; set by the image, which baked one at build time.
+INTERPRETER = "CHARTS_PYTHON"
+
 # strip and downscale hold a full copy each, and publish stages a third beside
 # the destination. Two archive-sets of headroom is the rough peak.
 HEADROOM = 2
@@ -255,11 +259,22 @@ def run_step(cmd: list[str], what: str) -> None:
 
 
 def uv(script: str, *args: str) -> list[str]:
-    # --locked: refuse to resolve. The inline dependency blocks carry no version
-    # bounds, so without a lockfile an unattended 01:00 run would silently take
-    # whatever pillow, numpy or scipy released since anyone last looked, and
-    # write the result into the served directory. A dependency change should be
-    # a commit someone read.
+    """How a step is invoked.
+
+    --locked: refuse to resolve. The inline dependency blocks carry no version
+    bounds, so without a lockfile an unattended 01:00 run would silently take
+    whatever pillow, numpy or scipy released since anyone last looked, and write
+    the result into the served directory. A dependency change should be a commit
+    someone read.
+
+    An image resolves once, at build time, and bakes the result. Naming its
+    interpreter here keeps that guarantee while dropping the machinery that
+    enforces it per-run: there is nothing left to resolve, and uv's cache cannot
+    be made read-only, so keeping uv in the container would mean a writable
+    cache tied to whichever uid the run happens to use.
+    """
+    if interpreter := os.environ.get(INTERPRETER, "").strip():
+        return [interpreter, str(REPO / script), *args]
     return ["uv", "run", "--locked", str(REPO / script), *args]
 
 

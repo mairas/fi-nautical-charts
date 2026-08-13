@@ -890,6 +890,31 @@ def test_peak_memory_reads_the_units_of_the_host_it_runs_on(monkeypatch):
     assert pipeline.peak_process_memory() == 4096
 
 
+# --- how a step gets invoked ---------------------------------------------------
+
+def test_a_step_runs_under_uv_against_the_lockfile_by_default(monkeypatch):
+    monkeypatch.delenv(pipeline.INTERPRETER, raising=False)
+    assert pipeline.uv("downscale.py", "--jobs", "1") == [
+        "uv", "run", "--locked", str(pipeline.REPO / "downscale.py"), "--jobs", "1"]
+
+
+def test_a_named_interpreter_replaces_uv_entirely(monkeypatch):
+    """The image resolves its dependencies once, at build time. Re-resolving at
+    01:00 is the thing --locked exists to prevent, and an interpreter that was
+    given its environment at build time has nothing left to resolve."""
+    monkeypatch.setenv(pipeline.INTERPRETER, "/usr/local/bin/python3")
+    assert pipeline.uv("downscale.py", "--jobs", "1") == [
+        "/usr/local/bin/python3", str(pipeline.REPO / "downscale.py"), "--jobs", "1"]
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_interpreter_reads_as_unset_not_as_an_empty_argument(monkeypatch, blank):
+    """Same shape as the blank --dest that published into the clone: an unset
+    variable arrives as an empty string, and honouring it would exec ''."""
+    monkeypatch.setenv(pipeline.INTERPRETER, blank)
+    assert pipeline.uv("downscale.py")[0] == "uv"
+
+
 # --- the timer has to invoke a command this repo actually has ------------------
 
 def unit_text(name: str) -> str:
