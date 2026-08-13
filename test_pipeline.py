@@ -1146,22 +1146,29 @@ def test_every_base_image_is_pinned_by_digest():
             assert "@sha256:" in ref, f"{ref} is a tag, and a tag moves"
 
 
-def test_the_image_sets_the_variables_the_code_reads():
-    """Rename either constant and the image keeps exporting the old name. Steps
-    fall back to a uv the image does not carry, and the manifest to 'unknown' --
-    neither of which fails a build or a run."""
-    stage = runtime_stage()
-    for var in (pipeline.INTERPRETER, publish.VERSION):
-        assert re.search(rf'\b{var}=\S', stage), f"the image never sets {var}"
+def test_the_image_names_the_interpreter_it_built():
+    """Both ends read out of the Dockerfile rather than being spelled here: a
+    path spelled twice in a test is a rename that fails for the wrong reason,
+    and a rename that misses the one line steps are invoked through is the one
+    that has to fail. It fails at 01:00 otherwise -- the build is happy, and
+    nothing tries to exec the path until the first step."""
+    venv = re.search(r'uv venv (\S+)', dockerfile()).group(1)
+    assert re.search(rf'\b{pipeline.INTERPRETER}={re.escape(venv)}/bin/python\b',
+                     runtime_stage())
 
 
-def test_the_build_target_passes_the_argument_the_image_declares():
-    """The commit reaches the served manifest through three files. A rename
-    anywhere along that chain publishes charts that name no code at all."""
+def test_the_commit_reaches_the_manifest():
+    """Three files carry it: `run` reads it from git, the Dockerfile declares it
+    as an argument, and the image exports it under the name publish.py looks up.
+    A break anywhere along that chain -- a rename, or a version pinned to a
+    literal -- publishes charts that name no code, and nothing fails."""
+    named = re.search(rf'\b{publish.VERSION}=\$(\w+)', runtime_stage())
+    assert named, "the image pins a fixed version instead of the commit built"
     declared = set(re.findall(r'^ARG (\w+)', dockerfile(), re.M))
     passed = set(re.findall(r'--build-arg (\w+)=',
                             (pipeline.REPO / "run").read_text()))
-    assert passed and passed <= declared
+    assert named.group(1) in declared and named.group(1) in passed
+    assert passed <= declared, "the build passes an argument the image ignores"
 
 
 def test_the_build_context_excludes_what_the_repo_already_ignores():
