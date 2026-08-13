@@ -1096,7 +1096,7 @@ def run_exec_start(tmp_path, **overrides) -> subprocess.CompletedProcess:
     """
     stub = tmp_path / "docker"
     argv = tmp_path / "argv.txt"
-    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {argv}\n')
+    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {shlex.quote(str(argv))}\n')
     stub.chmod(0o755)
 
     line = exec_start().removeprefix("ExecStart=")
