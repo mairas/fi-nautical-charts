@@ -1172,6 +1172,16 @@ def test_the_commit_reaches_the_manifest():
     assert passed <= declared, "the build passes an argument the image ignores"
 
 
+def test_a_caller_cannot_talk_the_build_into_a_different_revision():
+    """The target forwards what it is given, because --no-cache and a second
+    --tag are reasonable things to want. Docker takes the last value of a
+    repeated --build-arg, so where the forwarding sits decides whether a caller
+    can put a commit in the manifest that built nothing."""
+    build = re.search(r'docker build (.*?) \.$',
+                      (pipeline.REPO / "run").read_text(), re.M).group(1)
+    assert build.index('"$@"') < build.index('--build-arg')
+
+
 def test_the_build_context_excludes_what_the_repo_already_ignores():
     """The archives beside the checkout are gigabytes. Every one of them would
     be packed up and handed to the daemon on each build."""
