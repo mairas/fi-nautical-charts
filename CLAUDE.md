@@ -1,10 +1,14 @@
 # Working on this repository
 
-Tooling that turns Finnish open nautical charts into MBTiles chart sets for
-Signal K and Freeboard-SK. `README.md` documents what each tool does and why the
-processing is the way it is; read it before changing any of them. This file is
-the shorter thing: the rules that are not obvious from the code, and the ones
-that are easy to get wrong.
+Tooling that turns Finnish open nautical charts into MBTiles chart sets. MBTiles
+is a general format and the sets are not built for one consumer; Signal K with
+Freeboard-SK is the target they are deployed to and verified against, so it is
+what the deployment notes describe. Nothing in the processing assumes it.
+
+`README.md` documents what each tool does and why the processing is the way it
+is; read it before changing any of them. This file is the shorter thing: the
+rules that are not obvious from the code, and the ones that are easy to get
+wrong.
 
 Host names, paths and deployment specifics are deliberately absent. **This
 repository is public.** They live in `CLAUDE.local.md`, which is gitignored.

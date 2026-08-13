@@ -183,10 +183,12 @@ reviews:
         because it is the honest justification for a design decision — and the
         constraint can almost always be stated as a property of the work instead.
 
-        **This does not include third-party software the project targets or
-        depends on.** Signal K, Freeboard-SK, Traficom, uv, systemd and SQLite
-        are public projects and services, and naming them is the point of the
-        document. Do not ask for them to be genericised.
+        **Naming third-party software is not an inventory disclosure.** Signal
+        K, Freeboard-SK, Traficom, uv, systemd and SQLite are public projects,
+        and the document has to name them to say anything useful. Do raise a
+        naming when it overstates scope — the output is MBTiles, a general
+        format, and no consumer is the project's sole purpose — but say that is
+        the reason, not privacy.
 
 knowledge_base:
   code_guidelines:
