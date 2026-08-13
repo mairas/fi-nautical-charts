@@ -908,11 +908,50 @@ def test_a_failed_layer_is_still_timed(cli, monkeypatch, capsys):
     assert "took 0 min" in capsys.readouterr().out.split("=== Yleiskartat")[1]
 
 
-def test_the_run_reports_the_peak_memory_of_its_steps(cli, monkeypatch, capsys):
-    monkeypatch.setattr(pipeline, "peak_process_memory", lambda: 412 * 1024 * 1024)
+def test_a_cgroup_reports_the_whole_subtree_and_says_so(tmp_path, monkeypatch):
+    """ru_maxrss is the largest single process. Both heavy steps fan out across
+    a worker pool, so the number that matters is the parent plus its workers
+    resident together, which only the cgroup counter sees."""
+    peak = tmp_path / "memory.peak"
+    peak.write_text("224395264\n")
+    monkeypatch.setattr(pipeline, "CGROUP_PEAK", peak)
+    assert pipeline.peak_memory() == (224395264, "subtree")
+
+
+def test_without_a_cgroup_the_process_figure_is_used_and_labelled(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "CGROUP_PEAK", tmp_path / "absent")
+    value, scope = pipeline.peak_memory()
+    assert scope == "one process"
+
+
+@pytest.mark.parametrize("content", ["", "   ", "not a number"])
+def test_an_unreadable_cgroup_value_falls_back_rather_than_failing_the_run(
+        tmp_path, monkeypatch, content):
+    """This runs in the last line of a ten-hour job. It must not be what fails
+    it."""
+    peak = tmp_path / "memory.peak"
+    peak.write_text(content)
+    monkeypatch.setattr(pipeline, "CGROUP_PEAK", peak)
+    assert pipeline.peak_memory()[1] == "one process"
+
+
+def test_a_cgroup_that_cannot_be_read_falls_back(tmp_path, monkeypatch):
+    peak = tmp_path / "memory.peak"
+    peak.write_text("123")
+    peak.chmod(0o000)
+    monkeypatch.setattr(pipeline, "CGROUP_PEAK", peak)
+    try:
+        assert pipeline.peak_memory()[1] == "one process"
+    finally:
+        peak.chmod(0o644)
+
+
+def test_the_run_says_which_measurement_it_reported(cli, monkeypatch, capsys):
+    monkeypatch.setattr(pipeline, "peak_memory", lambda: (412 * 1024 * 1024, "subtree"))
     monkeypatch.setattr(pipeline, "run_step", lambda *a: None)
     assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 0
-    assert "412 MiB" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "412 MiB" in out and "subtree" in out
 
 
 def test_peak_memory_measures_the_steps_and_not_the_pipeline_itself(monkeypatch):

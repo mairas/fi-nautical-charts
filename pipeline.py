@@ -96,6 +96,10 @@ LOCK = ".pipeline.lock"
 # uv owns the environment; set by the image, which baked one at build time.
 INTERPRETER = "CHARTS_PYTHON"
 
+# The cgroup's own memory high-water mark, present under cgroup v2 from kernel
+# 5.19. Absent outside a cgroup, and absent on older kernels.
+CGROUP_PEAK = Path("/sys/fs/cgroup/memory.peak")
+
 # strip and downscale hold a full copy each, and publish stages a third beside
 # the destination. Two archive-sets of headroom is the rough peak.
 HEADROOM = 2
@@ -237,17 +241,35 @@ def duration(seconds: float) -> str:
 def peak_process_memory() -> int:
     """The largest resident size any one finished process reached, in bytes.
 
-    Stands in for `/usr/bin/time`, which the build host does not have. Memory is
-    a binding constraint on that host and `strip-nodata` has had to be bounded
-    once already, so a regression should show up in the monthly log rather than
-    need a ten-hour rerun to find.
-
     One process, not one step, and the distinction matters: strip and downscale
     both fan out across a worker pool, so a step's real footprint is its parent
-    plus however many workers are resident at once. This number never sums them.
+    plus however many workers are resident at once. This never sums them, which
+    is why `peak_memory` prefers the cgroup counter where there is one.
     """
     peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     return peak if sys.platform == "darwin" else peak * 1024   # KiB elsewhere
+
+
+def peak_memory() -> tuple[int, str]:
+    """How much memory the run needed, in bytes, and what that figure covers.
+
+    Stands in for `/usr/bin/time`, which the build host does not have. Memory is
+    a binding constraint there and `strip-nodata` has had to be bounded once
+    already, so a regression should show up in the monthly log rather than need
+    a ten-hour rerun to find.
+
+    Under a cgroup this is the whole subtree's high-water mark, which is the
+    figure that decides whether the host runs out: every worker resident at
+    once, not the largest one. Without a cgroup there is only the per-process
+    number. They are not comparable, so the log says which it got rather than
+    leaving a reader of two months' logs to guess.
+
+    Never writes to the file: a write resets the counter for that descriptor.
+    """
+    try:
+        return int(CGROUP_PEAK.read_text().strip()), "subtree"
+    except (OSError, ValueError):
+        return peak_process_memory(), "one process"
 
 
 def run_step(cmd: list[str], what: str) -> None:
@@ -736,7 +758,8 @@ def run(layers: list[Layer], found: dict[str, Path],
 
     print(f"\nrun finished in {duration(time.monotonic() - started)}: "
           f"{len(ready)} processed, {len(failures)} failed")
-    print(f"peak memory in any one process: {peak_process_memory() / 2**20:.0f} MiB")
+    used, scope = peak_memory()
+    print(f"peak memory ({scope}): {used / 2**20:.0f} MiB")
     for name, why in failures:
         print(f"  {name}: {why}", file=sys.stderr)
     return 1 if failures else 0
