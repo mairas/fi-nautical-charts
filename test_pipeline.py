@@ -11,6 +11,7 @@ The steps themselves -- refresh, strip, downscale, publish -- have their own
 tests. Here they are subprocesses and stay that way.
 """
 
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -592,6 +593,26 @@ def test_pointing_two_of_the_directories_at_one_place_is_refused(tmp_path, alias
     assert "same directory" in pipeline.resolve_dirs(args)
 
 
+@pytest.mark.parametrize("which", ["--archive", "--work", "--dest"])
+def test_an_empty_directory_argument_is_refused(cli, which):
+    """A variable the unit's environment file does not set arrives as an empty
+    argument, and Path("") is the cwd -- a real directory that passes every
+    check in resolve_dirs. Blank --dest publishes into the clone; blank --work
+    sweeps it."""
+    with pytest.raises(SystemExit) as exit:
+        cli(which, "")
+    assert exit.value.code == 2
+
+
+def test_a_second_run_reports_the_refusal_rather_than_a_traceback(cli, work, capsys):
+    """Exit 2 is "did not run" everywhere else in main(). Letting Failed escape
+    gave exit 1 -- what run() returns when a layer broke -- so a refused month
+    and a broken one were one signal."""
+    with pipeline.exclusive(work):
+        assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 2
+    assert "refusing to run concurrently" in capsys.readouterr().err
+
+
 def test_a_missing_directory_is_named(tmp_path):
     import argparse
     (tmp_path / "a").mkdir()
@@ -747,16 +768,38 @@ def test_the_hour_boundary_does_not_read_as_zero_minutes():
     assert pipeline.duration(3600) == "1 h 0 min"
 
 
-def test_every_layer_says_how_long_it_took_including_the_ones_that_did_nothing(
-        cli, monkeypatch, capsys):
-    """The sweep runs whether or not anything is rebuilt, and it is the long
-    step. A skipped layer that took nine hours is the normal month, so a
-    duration only on the layers that built would leave the bulk unaccounted."""
+def test_a_run_that_rounds_up_to_the_hour_never_reads_as_sixty_minutes():
+    """Branching on the seconds rather than on the rounded minutes puts the
+    boundary in the wrong place, and 3599 s prints as `60 min`."""
+    assert pipeline.duration(3599) == "1 h 0 min"
+
+
+def test_each_layer_is_timed_from_its_own_start_not_the_run_s(
+        cli, archive, dest, monkeypatch, capsys):
+    """Timing every layer from the whole run's start would read as plausible
+    increasing numbers -- 9 h, 9 h 30, 9 h 45 -- and hide which layer is slow,
+    which is the only question a ten-hour log gets asked."""
+    satama = ARCHIVE_META | {"wmts_layer": "Satamakartat",
+                             "source_updated": "2026-06-29"}
+    make_mbtiles(archive / "fi-satamakartat-2026-06-29.mbtiles", satama)
+    # published too, so both layers skip and the run's exit code stays readable
+    published = PUBLISHED_META | satama
+    published.pop("nodata_stripped")
+    make_mbtiles(dest / "fi-satamakartat-2026-06-29.mbtiles", published)
+    ticks = iter([0,                                  # run start
+                  100, 100 + 9 * 3600,                # Yleiskartat start, end
+                  100 + 9 * 3600, 100 + 12 * 3600,    # Satamakartat start, end
+                  100 + 12 * 3600])                   # run end
+    monkeypatch.setattr(pipeline.time, "monotonic", lambda: next(ticks))
     monkeypatch.setattr(pipeline, "run_step", lambda *a: None)
-    assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 0
-    out = capsys.readouterr().out
-    assert "nothing to do" in out
-    assert "took 0 min" in out.split("=== Yleiskartat")[1]
+    assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public",
+               "--layer", "Satamakartat") == 0
+    logged = {}
+    for chunk in capsys.readouterr().out.split("\n=== ")[1:]:
+        name, _, body = chunk.partition(" ===\n")
+        logged[name] = body
+    assert "took 9 h 0 min" in logged["Yleiskartat 250k public"]
+    assert "took 3 h 0 min" in logged["Satamakartat"]
 
 
 def test_a_failed_layer_is_still_timed(cli, monkeypatch, capsys):
@@ -770,13 +813,24 @@ def test_a_failed_layer_is_still_timed(cli, monkeypatch, capsys):
 
 
 def test_the_run_reports_the_peak_memory_of_its_steps(cli, monkeypatch, capsys):
-    """Stands in for /usr/bin/time, which the build host does not have. Memory
-    is a binding constraint and strip-nodata has had to be bounded once already,
-    so a regression belongs in the monthly log rather than in a ten-hour rerun."""
-    monkeypatch.setattr(pipeline, "peak_step_memory", lambda: 412 * 1024 * 1024)
+    monkeypatch.setattr(pipeline, "peak_process_memory", lambda: 412 * 1024 * 1024)
     monkeypatch.setattr(pipeline, "run_step", lambda *a: None)
     assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 0
     assert "412 MiB" in capsys.readouterr().out
+
+
+def test_peak_memory_measures_the_steps_and_not_the_pipeline_itself(monkeypatch):
+    """RUSAGE_SELF would report this process -- tens of MiB, never the multi-GB
+    peak of a strip -- and the whole point is to catch a step's regression."""
+    seen = []
+
+    class Usage:
+        ru_maxrss = 4096
+
+    monkeypatch.setattr(pipeline.resource, "getrusage",
+                        lambda who: (seen.append(who), Usage())[1])
+    pipeline.peak_process_memory()
+    assert seen == [pipeline.resource.RUSAGE_CHILDREN]
 
 
 def test_peak_memory_reads_the_units_of_the_host_it_runs_on(monkeypatch):
@@ -787,6 +841,45 @@ def test_peak_memory_reads_the_units_of_the_host_it_runs_on(monkeypatch):
 
     monkeypatch.setattr(pipeline.resource, "getrusage", lambda who: Usage())
     monkeypatch.setattr(pipeline.sys, "platform", "linux")
-    assert pipeline.peak_step_memory() == 4096 * 1024
+    assert pipeline.peak_process_memory() == 4096 * 1024
     monkeypatch.setattr(pipeline.sys, "platform", "darwin")
-    assert pipeline.peak_step_memory() == 4096
+    assert pipeline.peak_process_memory() == 4096
+
+
+# --- the timer has to invoke a command this repo actually has ------------------
+
+def unit_text(name: str) -> str:
+    return (pipeline.REPO / "systemd" / name).read_text()
+
+
+def test_the_service_passes_only_variables_the_example_env_file_sets():
+    """The two files are coupled by hand across a directory boundary. Rename one
+    and the timer's next fire passes an empty path, a month later."""
+    exec_line = next(l for l in unit_text("fi-nautical-charts.service").splitlines()
+                     if l.startswith("ExecStart="))
+    used = set(re.findall(r'\$([A-Z_]+)', exec_line))
+    defined = set(re.findall(r'^([A-Z_]+)=',
+                             unit_text("fi-nautical-charts.env.example"), re.M))
+    assert used == defined
+
+
+def test_the_timer_names_a_service_file_that_exists():
+    unit = re.search(r'^Unit=(\S+)$', unit_text("fi-nautical-charts.timer"),
+                     re.M).group(1)
+    assert (pipeline.REPO / "systemd" / unit).exists()
+
+
+def test_the_service_runs_a_command_the_run_script_defines():
+    exec_line = next(l for l in unit_text("fi-nautical-charts.service").splitlines()
+                     if l.startswith("ExecStart="))
+    target = re.search(r'/run"?\s+([a-z][\w-]*)', exec_line).group(1)
+    assert re.search(rf'^function {target} ',
+                     (pipeline.REPO / "run").read_text(), re.M)
+
+
+def test_the_service_passes_only_flags_the_pipeline_accepts():
+    exec_line = next(l for l in unit_text("fi-nautical-charts.service").splitlines()
+                     if l.startswith("ExecStart="))
+    source = (pipeline.REPO / "pipeline.py").read_text()
+    for flag in re.findall(r'--[a-z-]+', exec_line):
+        assert f'"{flag}"' in source, f"{flag} is not an argument pipeline.py adds"

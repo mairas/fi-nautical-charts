@@ -211,14 +211,17 @@ def duration(seconds: float) -> str:
     return f"{minutes // 60} h {minutes % 60} min"
 
 
-def peak_step_memory() -> int:
-    """The largest resident size any finished step reached, in bytes.
+def peak_process_memory() -> int:
+    """The largest resident size any one finished process reached, in bytes.
 
     Stands in for `/usr/bin/time`, which the build host does not have. Memory is
     a binding constraint on that host and `strip-nodata` has had to be bounded
     once already, so a regression should show up in the monthly log rather than
-    need a ten-hour rerun to find. This is the high-water mark of any one step,
-    not the sum: steps run strictly one at a time.
+    need a ten-hour rerun to find.
+
+    One process, not one step, and the distinction matters: strip and downscale
+    both fan out across a worker pool, so a step's real footprint is its parent
+    plus however many workers are resident at once. This number never sums them.
     """
     peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     return peak if sys.platform == "darwin" else peak * 1024   # KiB elsewhere
@@ -478,6 +481,21 @@ def check_space(work: Path, archives: list[Path]) -> None:
                      f"partway through a build")
 
 
+def directory(value: str) -> Path:
+    """Refuse an empty path before it silently becomes the current directory.
+
+    A variable the unit's environment file does not set expands to an empty
+    argument rather than being dropped, and `Path("")` resolves to the cwd --
+    a real directory, distinct from the other two, so every check in
+    `resolve_dirs` passes. A blank `--dest` publishes ten hours of work into
+    the clone and a blank `--work` sweeps it.
+    """
+    if not value.strip():
+        raise argparse.ArgumentTypeError(
+            "empty path: check that the environment file sets every directory")
+    return Path(value)
+
+
 def resolve_dirs(args: argparse.Namespace) -> str | None:
     """Absolute, distinct, and all three present. Returns a complaint or None.
 
@@ -501,11 +519,12 @@ def resolve_dirs(args: argparse.Namespace) -> str | None:
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Refresh, reprocess and publish the Traficom raster sets")
-    p.add_argument("--archive", required=True, type=Path,
+    p.add_argument("--archive", required=True, type=directory,
                    help="the raw archives; refreshed in place, never published")
-    p.add_argument("--work", required=True, type=Path,
+    p.add_argument("--work", required=True, type=directory,
                    help="scratch for processed copies; same filesystem as --dest")
-    p.add_argument("--dest", required=True, type=Path, help="the served chart directory")
+    p.add_argument("--dest", required=True, type=directory,
+                   help="the served chart directory")
     p.add_argument("--layer", action="append", dest="only",
                    help="restrict the run to this WMTS layer (repeatable)")
     p.add_argument("--jobs", type=int, default=1,
@@ -545,8 +564,16 @@ def main() -> int:
     if args.dry_run:
         return dry_run(layers, found, args)
 
-    with exclusive(args.work):
-        return run(layers, found, args)
+    try:
+        with exclusive(args.work):
+            return run(layers, found, args)
+    except Failed as exc:
+        # 2 is "did not run", which every other refusal in main() already
+        # returns. Letting this escape gave a traceback and exit 1 -- the code
+        # run() returns when a layer failed, so a refused month and a broken
+        # one were the same signal to whatever reads the exit status.
+        print(exc, file=sys.stderr)
+        return 2
 
 
 def dry_run(layers: list[Layer], found: dict[str, Path],
@@ -598,9 +625,9 @@ def run(layers: list[Layer], found: dict[str, Path],
             print(f"  FAILED: {exc}", file=sys.stderr)
             continue
         finally:
-            # Every layer, not only the ones that built: the sweep runs
-            # regardless and is the long step, so a quiet month spends nearly
-            # all its hours in layers this line is the only account of.
+            # The sweep runs whether or not anything is rebuilt and is the long
+            # step, so a quiet month spends nearly all its hours in layers this
+            # line is the only account of.
             print(f"  took {duration(time.monotonic() - began)}", flush=True)
         if out is not None:
             ready.append(out)
@@ -620,7 +647,7 @@ def run(layers: list[Layer], found: dict[str, Path],
 
     print(f"\nrun finished in {duration(time.monotonic() - started)}: "
           f"{len(ready)} processed, {len(failures)} failed")
-    print(f"peak memory in any one step: {peak_step_memory() / 2**20:.0f} MiB")
+    print(f"peak memory in any one process: {peak_process_memory() / 2**20:.0f} MiB")
     for name, why in failures:
         print(f"  {name}: {why}", file=sys.stderr)
     return 1 if failures else 0

@@ -700,9 +700,17 @@ def refresh(con, args, src, limits, bbox, zooms):
         flush_editions(con)
         con.commit()
         frontier = data_tiles_at(con, z)
-        print(f"\r  z{z:<2} checked {checked:,}  updated {updated:,}  "
-              f"removed {removed:,}  errors {errors:,}", end="", flush=True)
-    print()
+        progress = (f"  z{z:<2} checked {checked:,}  updated {updated:,}  "
+                    f"removed {removed:,}  errors {errors:,}")
+        # A terminal redraws one line; journald frames entries on newlines, so
+        # \r with no newline holds the whole sweep in its pending-line buffer
+        # and the operator sees nothing until the layer finishes hours later.
+        if sys.stdout.isatty():
+            print(f"\r{progress}", end="", flush=True)
+        else:
+            print(progress, flush=True)
+    if sys.stdout.isatty():
+        print()
     # only now, and only if nothing failed: refresh reads this as its
     # If-Modified-Since baseline, so advancing it past a tile whose new edition
     # never transferred would leave that tile stale in the archive forever

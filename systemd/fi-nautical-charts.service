@@ -36,6 +36,12 @@ TimeoutStartSec=24h
 # but leaves a bare $VAR that is not a word of its own, so these reach bash
 # intact and bash expands them -- which is what keeps a path containing a space
 # one argument. WorkingDirectory= cannot be used instead: it takes no variables.
-ExecStart=/usr/bin/env bash -c 'cd "$CHARTS_REPO" && exec ./run pipeline --archive "$CHARTS_ARCHIVE" --work "$CHARTS_WORK" --dest "$CHARTS_DEST"'
+#
+# CHARTS_REPO is checked here because it is the one path the pipeline cannot
+# check for itself. An unset variable expands to an empty argument rather than
+# being dropped, and `cd ""` succeeds on every bash before 5.3 -- so an earlier
+# form of this line ran from the home directory and reported nothing. `run`
+# cd's to its own directory, so an absolute path to it needs no cd at all.
+ExecStart=/usr/bin/env bash -c '[ -n "$CHARTS_REPO" ] || { echo "CHARTS_REPO is empty: check the environment file" >&2; exit 78; }; exec "$CHARTS_REPO/run" pipeline --archive "$CHARTS_ARCHIVE" --work "$CHARTS_WORK" --dest "$CHARTS_DEST"'
 
 SyslogIdentifier=fi-nautical-charts
