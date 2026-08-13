@@ -101,9 +101,16 @@ function image {
   #@ Build the container image the monthly run executes in
   #@ Category: Publish
   # The commit is the only way the served manifest can name the code that made
-  # it: the image carries no .git for publish.py to ask.
-  docker build --build-arg REVISION="$(git describe --always --dirty)" \
-    --tag fi-nautical-charts "$@" .
+  # it: the image carries no .git for publish.py to ask, and an empty value is
+  # the one that reaches the charts as "unknown" with nothing along the way
+  # having gone wrong.
+  #
+  # Assigned on a line of its own rather than as `local revision=$(...)`:
+  # `local` reports its own status, which hides the failure and hands the build
+  # an empty string. Split, errexit stops here instead.
+  local revision
+  revision=$(git describe --always --dirty)
+  docker build --build-arg REVISION="$revision" --tag fi-nautical-charts "$@" .
 }
 
 function relock {

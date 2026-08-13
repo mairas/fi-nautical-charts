@@ -1147,11 +1147,11 @@ def test_every_base_image_is_pinned_by_digest():
 
 
 def test_the_image_names_the_interpreter_it_built():
-    """Both ends read out of the Dockerfile rather than being spelled here: a
-    path spelled twice in a test is a rename that fails for the wrong reason,
-    and a rename that misses the one line steps are invoked through is the one
-    that has to fail. It fails at 01:00 otherwise -- the build is happy, and
-    nothing tries to exec the path until the first step."""
+    """The image's own check is what proves the interpreter is there and works;
+    this only catches the halves drifting apart, which it can do without a
+    daemon and before a build. Both ends are read out of the Dockerfile rather
+    than spelled here, so renaming the venv consistently stays a rename and not
+    a test failure."""
     venv = re.search(r'uv venv (\S+)', dockerfile()).group(1)
     assert re.search(rf'\b{pipeline.INTERPRETER}={re.escape(venv)}/bin/python\b',
                      runtime_stage())
@@ -1160,8 +1160,9 @@ def test_the_image_names_the_interpreter_it_built():
 def test_the_commit_reaches_the_manifest():
     """Three files carry it: `run` reads it from git, the Dockerfile declares it
     as an argument, and the image exports it under the name publish.py looks up.
-    A break anywhere along that chain -- a rename, or a version pinned to a
-    literal -- publishes charts that name no code, and nothing fails."""
+    A missing value stops the build, but a wrong one cannot be caught by anything
+    that has not built the image -- so what is pinned here is the chain, which is
+    what a rename breaks."""
     named = re.search(rf'\b{publish.VERSION}=\$(\w+)', runtime_stage())
     assert named, "the image pins a fixed version instead of the commit built"
     declared = set(re.findall(r'^ARG (\w+)', dockerfile(), re.M))

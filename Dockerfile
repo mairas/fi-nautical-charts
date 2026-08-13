@@ -27,23 +27,31 @@ RUN for s in pipeline traficom_dl strip_nodata downscale publish; do \
 
 FROM python:3.13-slim@sha256:ffb752e139c0a19692a43af8d8523b274222dd68eebad5d583b45c2201c6e30a
 
-# Without these, nicely() prints one warning into hour three of a ten-hour log
-# and every step runs at normal priority. Yielding the CPU and the disk is the
-# arrangement under which this job is allowed on a host with production
-# neighbours, so losing it should stop a build, not a boat.
-RUN command -v nice >/dev/null && command -v ionice >/dev/null
-
 COPY --from=deps /opt/charts-venv /opt/charts-venv
 
 WORKDIR /opt/charts
 COPY pipeline.py traficom_dl.py strip_nodata.py downscale.py publish.py currency.py index_page.py preview.py ./
 COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/charts-pipeline
 
-ARG REVISION=unknown
+ARG REVISION
 LABEL org.opencontainers.image.revision=$REVISION
 
 ENV CHARTS_PYTHON=/opt/charts-venv/bin/python \
     CHARTS_VERSION=$REVISION \
     PYTHONUNBUFFERED=1
+
+# The image saying it can run the job, rather than a file elsewhere saying so.
+# Everything above names something by text -- an interpreter path, eight scripts,
+# two wrappers, a commit -- and text is not evidence. Reaching for each of them
+# here turns "this image cannot run a step" into a build that stops, on whichever
+# host built it, rather than a month that ends at 01:00 with nothing published.
+#
+# The three imports pull in the whole set the run reaches, so a file left out of
+# the COPY above fails here rather than at the step that wanted it, hours in.
+# nicely() only warns when nice and ionice are missing, and a warning in hour
+# three of a ten-hour log ends the arrangement that lets this share a host.
+RUN command -v nice >/dev/null && command -v ionice >/dev/null \
+ && "$CHARTS_PYTHON" -c "import pipeline, traficom_dl, downscale" \
+ && { [ -n "$CHARTS_VERSION" ] || { echo "pass --build-arg REVISION=<commit>: a chart set that cannot name the code that made it is what this argument exists to prevent" >&2; exit 1; }; }
 
 ENTRYPOINT ["/usr/local/bin/charts-pipeline"]
