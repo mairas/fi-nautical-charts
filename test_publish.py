@@ -11,6 +11,7 @@ import json
 import os
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -125,9 +126,10 @@ def test_manifest_records_size_digest_edition_and_processing(tmp_path, dest):
     assert entry["name"] == "Veneilykartat 2026-06-21"
     assert entry["processing"] == ("nodata-r128-w254-n2:black-tiles+black-pixels+white-tiles+white-pixels; "
                                    "box-2x-premultiplied from z15 on 2026-08-08")
-    # not merely non-empty: "unknown" is non-empty and is the value an image
-    # with no git tree published for months without failing anything
-    assert manifest_of(dest)["pipeline"] != "unknown"
+    # both halves: "unknown" is non-empty, and dropping the non-empty check to
+    # add the "unknown" one would let "" and None through instead
+    pipeline = manifest_of(dest)["pipeline"]
+    assert pipeline not in ("", None) and pipeline != "unknown"
 
 
 @pytest.mark.parametrize("meta,expected", [
@@ -591,9 +593,14 @@ def test_a_checkout_still_describes_itself(monkeypatch):
 
 
 @pytest.mark.parametrize("blank", ["", "   "])
-def test_a_blank_version_falls_through_rather_than_publishing_nothing(monkeypatch, blank):
+def test_a_blank_version_falls_through_to_git_rather_than_publishing_nothing(
+        monkeypatch, blank):
+    """Asserting merely "not blank" would pass on "unknown" -- the value that
+    means the provenance was lost. Pin what the fallback actually produced."""
     monkeypatch.setenv(publish.VERSION, blank)
-    assert publish.pipeline_version() not in ("", "   ")
+    monkeypatch.setattr(publish.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(stdout="deadbee-dirty\n"))
+    assert publish.pipeline_version() == "deadbee-dirty"
 
 
 def test_no_git_and_no_explicit_version_is_still_reported_not_crashed(monkeypatch):

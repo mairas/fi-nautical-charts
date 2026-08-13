@@ -691,13 +691,44 @@ def test_the_probe_cleans_up_after_a_failed_rename(work, dest, monkeypatch):
     assert list(work.iterdir()) == []
 
 
-def test_a_destination_that_cannot_be_written_says_so(work, dest):
-    dest.chmod(0o500)
+def test_a_destination_that_cannot_be_written_says_so(work, dest, monkeypatch):
+    """Denied by a mocked errno rather than by mode bits: root ignores mode bits,
+    so a container running the suite as root would not exercise this at all."""
+    monkeypatch.setattr(pipeline.os, "replace",
+                        lambda s, d: (_ for _ in ()).throw(
+                            PermissionError(errno.EACCES, "Permission denied")))
+    complaint = pipeline.can_rename(work, dest)
+    assert complaint and str(dest) in complaint
+
+
+def test_the_probe_does_not_destroy_a_file_that_is_already_there(work, dest):
+    """os.replace overwrites whatever it lands on and the cleanup then removes
+    it, so a fixed probe name would delete a served chart that happened to
+    share it."""
+    for d in (work, dest):
+        (d / ".rename-probe").write_text("someone else's file")
+    assert pipeline.can_rename(work, dest) is None
+    assert (work / ".rename-probe").read_text() == "someone else's file"
+    assert (dest / ".rename-probe").read_text() == "someone else's file"
+
+
+def test_two_probes_at_once_do_not_collide(work, dest):
+    """can_rename runs before the lock is taken, so two runs can probe together."""
+    names = set()
+    real = pipeline.tempfile.mkstemp
+
+    def remember(**kwargs):
+        fd, path = real(**kwargs)
+        names.add(Path(path).name)
+        return fd, path
+
+    pipeline.tempfile.mkstemp = remember
     try:
-        complaint = pipeline.can_rename(work, dest)
-        assert complaint and str(dest) in complaint
+        for _ in range(5):
+            assert pipeline.can_rename(work, dest) is None
     finally:
-        dest.chmod(0o755)
+        pipeline.tempfile.mkstemp = real
+    assert len(names) == 5
 
 
 def test_a_run_is_refused_before_any_step_when_the_layout_cannot_rename(
@@ -920,11 +951,10 @@ def test_a_cgroup_reports_the_whole_subtree_and_says_so(tmp_path, monkeypatch):
 
 def test_without_a_cgroup_the_process_figure_is_used_and_labelled(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "CGROUP_PEAK", tmp_path / "absent")
-    value, scope = pipeline.peak_memory()
-    assert scope == "one process"
+    assert pipeline.peak_memory()[1] == "one process"
 
 
-@pytest.mark.parametrize("content", ["", "   ", "not a number"])
+@pytest.mark.parametrize("content", ["", "   ", "not a number", "1_0", "-5", "12.5"])
 def test_an_unreadable_cgroup_value_falls_back_rather_than_failing_the_run(
         tmp_path, monkeypatch, content):
     """This runs in the last line of a ten-hour job. It must not be what fails
@@ -935,15 +965,14 @@ def test_an_unreadable_cgroup_value_falls_back_rather_than_failing_the_run(
     assert pipeline.peak_memory()[1] == "one process"
 
 
-def test_a_cgroup_that_cannot_be_read_falls_back(tmp_path, monkeypatch):
-    peak = tmp_path / "memory.peak"
-    peak.write_text("123")
-    peak.chmod(0o000)
-    monkeypatch.setattr(pipeline, "CGROUP_PEAK", peak)
-    try:
-        assert pipeline.peak_memory()[1] == "one process"
-    finally:
-        peak.chmod(0o644)
+def test_a_cgroup_that_cannot_be_read_falls_back(monkeypatch):
+    """Denied by a raised error rather than by mode bits, which root ignores."""
+    class Denied:
+        def read_text(self):
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(pipeline, "CGROUP_PEAK", Denied())
+    assert pipeline.peak_memory()[1] == "one process"
 
 
 def test_the_run_says_which_measurement_it_reported(cli, monkeypatch, capsys):

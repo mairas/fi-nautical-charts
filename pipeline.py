@@ -33,6 +33,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -267,9 +268,14 @@ def peak_memory() -> tuple[int, str]:
     Never writes to the file: a write resets the counter for that descriptor.
     """
     try:
-        return int(CGROUP_PEAK.read_text().strip()), "subtree"
-    except (OSError, ValueError):
+        raw = CGROUP_PEAK.read_text().strip()
+    except OSError:
         return peak_process_memory(), "one process"
+    # int() accepts digit separators, so "1_0" would read as 10 rather than as
+    # the nonsense it is. Nothing but a plain count belongs in this file.
+    if not raw.isdigit():
+        return peak_process_memory(), "one process"
+    return int(raw), "subtree"
 
 
 def run_step(cmd: list[str], what: str) -> None:
@@ -571,10 +577,15 @@ def can_rename(work: Path, dest: Path) -> str | None:
     landing somewhere that is not the mount anyone meant, where the rename
     succeeds and the charts are never written to the storage that serves them.
     """
-    probe = work / ".rename-probe"
-    landed = dest / ".rename-probe"
+    # A fixed name would be a file this deletes: os.replace overwrites whatever
+    # it lands on, and the cleanup below then removes it. The destination is the
+    # served directory, and this runs before the lock, so a second run is not
+    # excluded either. mkstemp picks a name nothing else holds.
+    fd, made = tempfile.mkstemp(dir=work, prefix=".rename-probe-")
+    os.close(fd)
+    probe = Path(made)
+    landed = dest / probe.name
     try:
-        probe.write_bytes(b"")
         os.replace(probe, landed)
     except OSError as exc:
         return (f"cannot rename from {work} into {dest} ({exc.strerror}); publishing "
