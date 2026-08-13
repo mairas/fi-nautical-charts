@@ -4,7 +4,7 @@ Tooling that turns Finnish open nautical charts into MBTiles chart sets for
 Signal K and Freeboard-SK. `README.md` documents what each tool does and why the
 processing is the way it is; read it before changing any of them. This file is
 the shorter thing: the rules that are not obvious from the code, and the ones
-that have already been got wrong once.
+that are easy to get wrong.
 
 Host names, paths and deployment specifics are deliberately absent. **This
 repository is public.** They live in `CLAUDE.local.md`, which is gitignored.
@@ -132,8 +132,7 @@ implementation-status language, no "we used to".
 
 ## Working in the open
 
-This repository is public and an earlier pass had to scrub private
-infrastructure detail out of it.
+This repository is public.
 
 Infrastructure detail leaks through *reasoning*, not through carelessness with
 secrets — host names and service inventories get written down because they are

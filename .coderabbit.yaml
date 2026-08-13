@@ -163,17 +163,30 @@ reviews:
 
     - path: '**/*.md'
       instructions: |
-        Documentation describes the current state, not development history. Flag
-        implementation-status language ("Step 3", "TODO", "currently implemented
-        as"), build narratives, and unchecked checklist items.
+        Documentation describes the current state. Flag implementation-status
+        language ("Step 3", "TODO", "currently implemented as"), build
+        narratives, and unchecked checklist items.
 
-        This repository is **public**. Flag any host name, address, path,
-        username, hardware model or service inventory that appears in it — those
-        belong in the gitignored `CLAUDE.local.md`. Infrastructure detail leaks
-        through reasoning rather than through carelessness with secrets: it gets
-        written down because it is the honest justification for a design
-        decision. The constraint can almost always be stated as a property of the
-        work instead.
+        **A rule's justification is not development history.** "Publish by
+        rename, never by transfer — an upload once truncated three of five files
+        and nobody noticed for six days" is one sentence of rule and one of
+        evidence, and the evidence is what stops the rule being optimised away by
+        someone who thinks it is fussiness. Keep those. Flag narrative that no
+        rule depends on: what was tried in which order, what a previous pass
+        cleaned up, how the current state came about.
+
+        This repository is **public**, so flag detail that identifies *our own
+        infrastructure*: host names, addresses, filesystem paths, usernames,
+        hardware models, or a list of what runs on our machines. Those belong in
+        the gitignored `CLAUDE.local.md`. Such detail leaks through reasoning
+        rather than through carelessness with secrets — it gets written down
+        because it is the honest justification for a design decision — and the
+        constraint can almost always be stated as a property of the work instead.
+
+        **This does not include third-party software the project targets or
+        depends on.** Signal K, Freeboard-SK, Traficom, uv, systemd and SQLite
+        are public projects and services, and naming them is the point of the
+        document. Do not ask for them to be genericised.
 
 knowledge_base:
   code_guidelines:
