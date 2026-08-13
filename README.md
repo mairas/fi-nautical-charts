@@ -1,7 +1,9 @@
 # fi-nautical-charts
 
-Tooling to build [Signal K](https://signalk.org/) / Freeboard-SK MBTiles chart
-sets from Finnish open nautical charts.
+Tooling to build MBTiles chart sets from Finnish open nautical charts. The sets
+are plain MBTiles and work with anything that reads them; they are deployed to
+and verified against [Signal K](https://signalk.org/) with Freeboard-SK, which
+is what the publishing and deployment sections describe.
 
 ## Sources
 
