@@ -424,8 +424,7 @@ It costs nothing measurable. Because z13 *is* an upscale, halving it back gives
 z12 again: over 200 sampled tiles, 1.9% of pixels differ from Traficom's own z12
 by more than 32/255, and every one of them is on the edge of a stroke. Cascading
 to z10 from z13 rather than z12 moves 1.0% of pixels by that much, again only at
-stroke edges — the place names come out identical. (An earlier note here claimed
-z13 left the z10 names in illegible fragments. It does not reproduce.)
+stroke edges — the place names come out identical.
 
 What it does cost is file size: the whole pyramid below z13 is now anti-aliased
 rather than Traficom's flat colour, which compresses worse. Yleiskartat went from
@@ -547,11 +546,13 @@ missed at Helsinki). Fast previews only; `full` for authoritative charts.
 
 Each file is copied into `<dest>/.staging/`, read back and compared against what
 was read from the source, and only then renamed into place. Both halves matter.
-Staging inside the destination keeps the rename on one filesystem, where it is
-atomic — a client gets the whole old file or the whole new one, never a partial
-write. Reading back is what an upload cannot do: a transfer that silently
-truncated three of five files went unnoticed for six days, because size and exit
-status both looked plausible.
+Staging inside the destination is what makes the rename possible at all, and
+then atomic: `rename(2)` refuses to cross a mount point, so a staging directory
+elsewhere can fail with `EXDEV` even on the same filesystem. Renamed, a client
+gets the whole old file or the whole new one, never a partial write. Reading
+back is what an upload cannot do: a transfer that silently truncated three of
+five files went unnoticed for six days, because size and exit status both looked
+plausible.
 
 **The staging directory and `.publish.lock` are dotfiles inside the served
 directory**, and a partially written chart lives there for as long as a multi-GB
@@ -594,7 +595,7 @@ any name, and anything caching by URL kept serving the old content.
 |---|---|
 | `schema` | Format version. Fields may be added without a bump; an existing field never changes meaning or type without one. Refuse a number you do not know rather than guessing |
 | `generated` | RFC 3339 UTC instant the manifest was written, not when the charts were built |
-| `pipeline` | `git describe` of the code that ran, or `unknown` outside a checkout. An opaque token: not orderable, not comparable across repos |
+| `pipeline` | The code that produced the charts: the commit the image was built from, or `git describe` when the run came from a checkout, or `unknown` when neither is available. An opaque token: not orderable, not comparable across repos |
 | `filename` | Resolves relative to the manifest's own URL. Changes with every edition, so track a chart by `layer` instead |
 | `layer` | The chart this file is an edition of, and the prefix of its filename. Stable across editions. Null for a file that records no layer |
 | `bytes`, `sha256` | Size and lowercase-hex digest of the complete file as served |
@@ -655,8 +656,9 @@ server. Refreshing a downscaled file would be worse still — it would compare o
 anti-aliased z5–z14 against the server's own rescales and quietly replace them.
 
 Layers run one at a time and every step is wrapped in `nice` and `ionice -c 3`,
-with `--jobs 1` by default. The build host has two cores and neighbours that
-want one of them; a layer that runs alone finishes late and bothers nobody.
+with `--jobs 1` by default. The job is a guest: a small machine with work on it
+that matters more has nothing spare to take, and a layer that runs alone
+finishes late and bothers nobody.
 
 Most months most layers do nothing. A layer is reprocessed when its edition
 moved, when the archive has moved since the published set was built, or when
