@@ -60,6 +60,12 @@ ExecStop=-/usr/bin/env docker stop --time 300 %N
 # --user: the container writes as whoever owns this unit, which is the same
 # ownership the pipeline produced when it ran on the host directly. Files land
 # readable by the web server, and the archive stays writable by the pipeline.
-ExecStart=/usr/bin/env bash -c '[ -n "$CHARTS_IMAGE" ] || { echo "CHARTS_IMAGE is empty: check the environment file" >&2; exit 78; }; spool=$(dirname "$CHARTS_WORK"); [ "$spool" = "$(dirname "$CHARTS_DEST")" ] || { echo "CHARTS_WORK and CHARTS_DEST must sit side by side: publishing renames between them, and a rename cannot cross a mount point" >&2; exit 78; }; exec docker run --rm --name %N --user %U:%G --stop-timeout 300 --volume "$CHARTS_ARCHIVE":"$CHARTS_ARCHIVE" --volume "$spool":"$spool" "$CHARTS_IMAGE" --archive "$CHARTS_ARCHIVE" --work "$CHARTS_WORK" --dest "$CHARTS_DEST"'
+#
+# --pull=never: the image is built here and exists nowhere else. The default
+# policy fetches an image it cannot find locally, and this name carries no
+# registry, so a missing image would send an unattended 01:00 run to Docker Hub
+# for whatever answers to it -- and run that, as this user, with the archive and
+# the served directory mounted. Absent means stop, not substitute.
+ExecStart=/usr/bin/env bash -c '[ -n "$CHARTS_IMAGE" ] || { echo "CHARTS_IMAGE is empty: check the environment file" >&2; exit 78; }; spool=$(dirname "$CHARTS_WORK"); [ "$spool" = "$(dirname "$CHARTS_DEST")" ] || { echo "CHARTS_WORK and CHARTS_DEST must sit side by side: publishing renames between them, and a rename cannot cross a mount point" >&2; exit 78; }; exec docker run --rm --pull=never --name %N --user %U:%G --stop-timeout 300 --volume "$CHARTS_ARCHIVE":"$CHARTS_ARCHIVE" --volume "$spool":"$spool" "$CHARTS_IMAGE" --archive "$CHARTS_ARCHIVE" --work "$CHARTS_WORK" --dest "$CHARTS_DEST"'
 
 SyslogIdentifier=fi-nautical-charts

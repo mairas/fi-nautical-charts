@@ -13,8 +13,11 @@ tests. Here they are subprocesses and stay that way.
 
 import ast
 import errno
+import os
 import re
+import shlex
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
@@ -1065,15 +1068,6 @@ def exec_start() -> str:
                 if l.startswith("ExecStart="))
 
 
-def pipeline_arguments() -> str:
-    """What the unit passes to the pipeline, which is everything after the image
-    name. Before it are docker's own flags, which answer to docker.
-
-    The last occurrence, not the first: the variable is also read by the guard
-    that refuses an empty one, well before it names the image."""
-    return exec_start().split('"$CHARTS_IMAGE"')[-1]
-
-
 def test_the_service_runs_the_image_the_env_file_names():
     """The image is built here and pulled from nowhere, so the name in the
     example file and the tag the build writes are one string kept in two
@@ -1083,23 +1077,93 @@ def test_the_service_runs_the_image_the_env_file_names():
                      unit_text("fi-nautical-charts.env.example"), re.M)
 
 
-def test_the_service_passes_only_flags_the_pipeline_accepts():
-    source = (pipeline.REPO / "pipeline.py").read_text()
-    for flag in re.findall(r'--[a-z-]+', pipeline_arguments()):
-        assert f'"{flag}"' in source, f"{flag} is not an argument pipeline.py adds"
+SPOOL = "/srv/charts"
+SETTINGS = {"CHARTS_IMAGE": "an-image",
+            "CHARTS_ARCHIVE": "/srv/archive",
+            "CHARTS_WORK": f"{SPOOL}/work",
+            "CHARTS_DEST": f"{SPOOL}/published"}
 
 
-def test_work_and_dest_reach_the_container_through_one_mount():
+def run_exec_start(tmp_path, **overrides) -> subprocess.CompletedProcess:
+    """Run the unit's ExecStart with a stub docker on PATH.
+
+    The line is a bash program, and reading a program is not running it: the
+    mount it assembles is `$(dirname …)` of something the file never spells out,
+    and which of the quoting forms survives is bash's business, not a reader's.
+    So this runs it, and the stub reports the argv the real client would get.
+
+    Specifiers are systemd's and are substituted here the way systemd would.
+    """
+    stub = tmp_path / "docker"
+    argv = tmp_path / "argv.txt"
+    stub.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {argv}\n')
+    stub.chmod(0o755)
+
+    line = exec_start().removeprefix("ExecStart=")
+    for specifier, value in (("%N", "fi-nautical-charts"),
+                             ("%U", str(os.getuid())), ("%G", str(os.getgid()))):
+        line = line.replace(specifier, value)
+    done = subprocess.run(shlex.split(line), capture_output=True, text=True,
+                          env={"PATH": f"{tmp_path}:/usr/bin:/bin",
+                               **(SETTINGS | overrides)})
+    done.argv = argv.read_text().split("\n") if argv.exists() else []
+    return done
+
+
+def test_the_unit_hands_docker_one_mount_holding_both_work_and_dest(tmp_path):
     """Two volumes fail `os.replace` with EXDEV even when both sides are the
     same host filesystem, because a rename tests mount-point identity. Publishing
-    is a rename, so a second volume here would fail at hour ten, on the step that
-    has already cost the most. The unit mounts the parent the two share."""
-    mounted = re.findall(r'--volume "([^ ]+)"', exec_start())
-    assert not any("CHARTS_WORK" in m or "CHARTS_DEST" in m for m in mounted), (
-        "work or dest is mounted in its own right; publishing cannot rename "
-        "across two mounts")
-    assert '--work "$CHARTS_WORK"' in pipeline_arguments()
-    assert '--dest "$CHARTS_DEST"' in pipeline_arguments()
+    is a rename, so a second volume would fail at hour ten, on the step that has
+    already cost the most -- and no volume at all would fail at the first."""
+    mounts = [a for a in run_exec_start(tmp_path).argv if a.count(":") == 1
+              and a.startswith("/")]
+    assert f"{SPOOL}:{SPOOL}" in mounts, "the parent work and dest share is not mounted"
+    for path in (SETTINGS["CHARTS_WORK"], SETTINGS["CHARTS_DEST"]):
+        assert f"{path}:{path}" not in mounts, (
+            f"{path} is mounted in its own right; publishing cannot rename across "
+            f"two mounts")
+
+
+def test_the_unit_passes_only_flags_the_pipeline_declares(tmp_path):
+    """Taken from the parser rather than from the file's text: a flag that
+    argparse dropped can survive for years in a docstring, and a substring
+    search cannot tell the two apart."""
+    declared = {a.value for node in ast.walk(ast.parse(
+                    (pipeline.REPO / "pipeline.py").read_text()))
+                if isinstance(node, ast.Call)
+                and getattr(node.func, "attr", None) == "add_argument"
+                for a in node.args if isinstance(a, ast.Constant)}
+    argv = run_exec_start(tmp_path).argv
+    passed = argv[argv.index(SETTINGS["CHARTS_IMAGE"]) + 1:]
+    assert passed, "nothing follows the image name"
+    for flag in (a for a in passed if a.startswith("--")):
+        assert flag in declared, f"{flag} is not an argument pipeline.py declares"
+
+
+def test_the_unit_refuses_a_layout_that_cannot_publish(tmp_path):
+    """Work and dest in different parents cannot go in through one mount, and
+    the container would simply not have the destination -- reporting a directory
+    missing that plainly exists on the host."""
+    done = run_exec_start(tmp_path, CHARTS_DEST="/var/www/charts")
+    assert done.returncode == 78 and not done.argv
+    assert "side by side" in done.stderr
+
+
+def test_the_unit_refuses_an_empty_image_name(tmp_path):
+    """Empty is the one value docker reads as "the next argument is the image",
+    which makes it complain about a reference format and name nothing anyone
+    set. It is also the one thing here the pipeline cannot check for itself."""
+    done = run_exec_start(tmp_path, CHARTS_IMAGE="")
+    assert done.returncode == 78 and not done.argv
+    assert "CHARTS_IMAGE" in done.stderr
+
+
+def test_the_unit_never_reaches_a_registry(tmp_path):
+    """The name carries no registry and the image exists only where it was
+    built, so the default policy would send an unattended run to Docker Hub for
+    whatever answers to it, and run that as this user with the archive and the
+    served directory mounted."""
+    assert "--pull=never" in run_exec_start(tmp_path).argv
 
 
 def test_the_service_uses_only_the_three_specifiers_it_means_to():

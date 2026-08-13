@@ -707,9 +707,9 @@ than trusted to a `finally` a `kill -9` never reaches.
 Each layer reports how long it took, whether or not it rebuilt anything — the
 sweep runs either way and is the long step, so a quiet month spends nearly all
 its hours in layers that produced nothing else to log. The run ends with a peak
-memory figure, which stands in for `/usr/bin/time`; the build host does not have
-it, memory is a binding constraint there, and a regression that only shows under
-a full archive is not something to go looking for twice.
+memory figure, which stands in for `/usr/bin/time` where that is not installed.
+Memory is the binding constraint on a small machine, and a regression that only
+shows under a full archive is not something to go looking for twice.
 
 The figure says what it covers, because there are two of them and they are not
 comparable. Under a cgroup — which is to say in the container — it is the whole
@@ -765,10 +765,9 @@ served chart set names the code that produced it.
 
 ## Scheduling it with systemd
 
-`systemd/` holds a user timer and service. They are user units because the
-archives live in the user's home and nothing here needs root. Every path is
-host-specific and stays out of the repository, in an environment file the unit
-reads.
+`systemd/` holds a user timer and service. They are user units because nothing
+here needs root. Every path is host-specific and stays out of the repository, in
+an environment file the unit reads.
 
 ```bash
 cp systemd/fi-nautical-charts.env.example ~/.config/fi-nautical-charts.env
