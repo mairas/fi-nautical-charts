@@ -27,6 +27,7 @@ import argparse
 import fcntl
 import json
 import os
+import resource
 import shutil
 import sqlite3
 import subprocess
@@ -201,6 +202,26 @@ def nicely(cmd: list[str]) -> list[str]:
             print(f"  warning: no {tool} on this host; steps run at normal priority",
                   file=sys.stderr)
     return out + cmd
+
+
+def duration(seconds: float) -> str:
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    return f"{minutes // 60} h {minutes % 60} min"
+
+
+def peak_step_memory() -> int:
+    """The largest resident size any finished step reached, in bytes.
+
+    Stands in for `/usr/bin/time`, which the build host does not have. Memory is
+    a binding constraint on that host and `strip-nodata` has had to be bounded
+    once already, so a regression should show up in the monthly log rather than
+    need a ten-hour rerun to find. This is the high-water mark of any one step,
+    not the sum: steps run strictly one at a time.
+    """
+    peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    return peak if sys.platform == "darwin" else peak * 1024   # KiB elsewhere
 
 
 def run_step(cmd: list[str], what: str) -> None:
@@ -568,6 +589,7 @@ def run(layers: list[Layer], found: dict[str, Path],
             failures.append((layer.wmts, "no archive file for this layer"))
             print("  no archive file for this layer", file=sys.stderr)
             continue
+        began = time.monotonic()
         try:
             out = build_layer(layer, archive, args.work, args.dest,
                               max(1, args.jobs), args.force, args.skip_refresh)
@@ -575,6 +597,11 @@ def run(layers: list[Layer], found: dict[str, Path],
             failures.append((layer.wmts, str(exc)))
             print(f"  FAILED: {exc}", file=sys.stderr)
             continue
+        finally:
+            # Every layer, not only the ones that built: the sweep runs
+            # regardless and is the long step, so a quiet month spends nearly
+            # all its hours in layers this line is the only account of.
+            print(f"  took {duration(time.monotonic() - began)}", flush=True)
         if out is not None:
             ready.append(out)
 
@@ -591,9 +618,9 @@ def run(layers: list[Layer], found: dict[str, Path],
     else:
         print("\nnothing to publish")
 
-    mins = (time.monotonic() - started) / 60
-    print(f"\nrun finished in {mins:.0f} min: {len(ready)} processed, "
-          f"{len(failures)} failed")
+    print(f"\nrun finished in {duration(time.monotonic() - started)}: "
+          f"{len(ready)} processed, {len(failures)} failed")
+    print(f"peak memory in any one step: {peak_step_memory() / 2**20:.0f} MiB")
     for name, why in failures:
         print(f"  {name}: {why}", file=sys.stderr)
     return 1 if failures else 0

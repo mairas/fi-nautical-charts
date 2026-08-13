@@ -702,5 +702,13 @@ scratch at paths derived from the layer alone, so a second run would delete the
 first one's partials. Scratch from an earlier run is swept at startup rather
 than trusted to a `finally` a `kill -9` never reaches.
 
+Each layer reports how long it took, whether or not it rebuilt anything — the
+sweep runs either way and is the long step, so a quiet month spends nearly all
+its hours in layers that produced nothing else to log. The run ends with the
+peak resident size any one step reached, which stands in for `/usr/bin/time`;
+the build host does not have it, memory is a binding constraint there, and a
+regression that only shows under a full archive is not something to go looking
+for twice.
+
 Python tools run via [uv](https://docs.astral.sh/uv/) with PEP 723 inline
 dependencies — no manual environment setup. `./run test` runs the suite.

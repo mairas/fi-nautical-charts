@@ -731,3 +731,62 @@ def test_the_missing_tool_warning_is_not_repeated_every_step(monkeypatch, capsys
     capsys.readouterr()
     pipeline.nicely(["x"])
     assert capsys.readouterr().err == ""
+
+
+# --- a run log someone can read a month later ---------------------------------
+
+def test_a_long_run_reads_in_hours_rather_than_hundreds_of_minutes():
+    assert pipeline.duration(10.5 * 3600) == "10 h 30 min"
+
+
+def test_a_run_under_an_hour_stays_in_minutes():
+    assert pipeline.duration(5 * 60) == "5 min"
+
+
+def test_the_hour_boundary_does_not_read_as_zero_minutes():
+    assert pipeline.duration(3600) == "1 h 0 min"
+
+
+def test_every_layer_says_how_long_it_took_including_the_ones_that_did_nothing(
+        cli, monkeypatch, capsys):
+    """The sweep runs whether or not anything is rebuilt, and it is the long
+    step. A skipped layer that took nine hours is the normal month, so a
+    duration only on the layers that built would leave the bulk unaccounted."""
+    monkeypatch.setattr(pipeline, "run_step", lambda *a: None)
+    assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 0
+    out = capsys.readouterr().out
+    assert "nothing to do" in out
+    assert "took 0 min" in out.split("=== Yleiskartat")[1]
+
+
+def test_a_failed_layer_is_still_timed(cli, monkeypatch, capsys):
+    def fake(cmd, what):
+        if what == "strip-nodata":
+            raise Failed("strip-nodata exited 1")
+
+    monkeypatch.setattr(pipeline, "run_step", fake)
+    assert cli("--force", "--skip-refresh", "--layer", "Yleiskartat 250k public") == 1
+    assert "took 0 min" in capsys.readouterr().out.split("=== Yleiskartat")[1]
+
+
+def test_the_run_reports_the_peak_memory_of_its_steps(cli, monkeypatch, capsys):
+    """Stands in for /usr/bin/time, which the build host does not have. Memory
+    is a binding constraint and strip-nodata has had to be bounded once already,
+    so a regression belongs in the monthly log rather than in a ten-hour rerun."""
+    monkeypatch.setattr(pipeline, "peak_step_memory", lambda: 412 * 1024 * 1024)
+    monkeypatch.setattr(pipeline, "run_step", lambda *a: None)
+    assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 0
+    assert "412 MiB" in capsys.readouterr().out
+
+
+def test_peak_memory_reads_the_units_of_the_host_it_runs_on(monkeypatch):
+    """ru_maxrss is KiB on Linux and bytes on macOS. Production is Linux and the
+    tests run on both, so the wrong assumption is off by 1024 where nobody looks."""
+    class Usage:
+        ru_maxrss = 4096
+
+    monkeypatch.setattr(pipeline.resource, "getrusage", lambda who: Usage())
+    monkeypatch.setattr(pipeline.sys, "platform", "linux")
+    assert pipeline.peak_step_memory() == 4096 * 1024
+    monkeypatch.setattr(pipeline.sys, "platform", "darwin")
+    assert pipeline.peak_step_memory() == 4096
