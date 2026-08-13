@@ -29,6 +29,7 @@ import json
 import os
 import resource
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -100,17 +101,31 @@ class Failed(Exception):
     """A step failed. The layer stops; the run continues with the next one."""
 
 
-class exclusive:
-    """Hold the work directory for the length of a run.
+class Terminated(BaseException):
+    """The run was asked to stop.
 
-    publish takes its own lock, but only for the minutes it is renaming files.
-    The ten hours before that refresh the archive in place and build scratch at
-    paths derived from the layer alone, so two runs would delete each other's
-    partials and race the same SQLite archive.
+    Not an Exception on purpose: the per-layer handler catches Exception and
+    moves to the next layer, which is right for a step that failed and wrong
+    for a signal. This unwinds past it, running the sweeps in the `finally`
+    blocks on the way out.
     """
 
-    def __init__(self, work: Path):
-        self.path = work / LOCK
+
+class exclusive:
+    """Hold a directory for the length of a run.
+
+    Taken on both the archive and the work directory, because they are separate
+    resources and a run mutates both: refresh rewrites the archive in place and
+    currency renames it, while scratch is built at paths derived from the layer
+    alone. Locking only the work directory left two runs pointed at one archive
+    and different scratch free to race the same SQLite file.
+
+    publish takes its own lock on the destination, but only for the minutes it
+    is renaming files.
+    """
+
+    def __init__(self, where: Path):
+        self.path = where / LOCK
 
     def __enter__(self):
         self.fd = os.open(self.path, os.O_WRONLY | os.O_CREAT, 0o644)
@@ -204,6 +219,10 @@ def nicely(cmd: list[str]) -> list[str]:
     return out + cmd
 
 
+def terminate(signum, frame) -> None:
+    raise Terminated(f"stopped by signal {signum}; scratch swept, nothing published")
+
+
 def duration(seconds: float) -> str:
     minutes = round(seconds / 60)
     if minutes < 60:
@@ -236,7 +255,12 @@ def run_step(cmd: list[str], what: str) -> None:
 
 
 def uv(script: str, *args: str) -> list[str]:
-    return ["uv", "run", str(REPO / script), *args]
+    # --locked: refuse to resolve. The inline dependency blocks carry no version
+    # bounds, so without a lockfile an unattended 01:00 run would silently take
+    # whatever pillow, numpy or scipy released since anyone last looked, and
+    # write the result into the served directory. A dependency change should be
+    # a commit someone read.
+    return ["uv", "run", "--locked", str(REPO / script), *args]
 
 
 def revision(m: dict[str, str]) -> int:
@@ -564,8 +588,14 @@ def main() -> int:
     if args.dry_run:
         return dry_run(layers, found, args)
 
+    # The 24h TimeoutStartSec makes a SIGTERM mid-run a scheduled possibility
+    # rather than an accident, and Python's default handling exits without
+    # running a `finally` -- which is where every sweep of the multi-gigabyte
+    # scratch lives. The host has run out of disk before.
+    signal.signal(signal.SIGTERM, terminate)
+
     try:
-        with exclusive(args.work):
+        with exclusive(args.archive), exclusive(args.work):
             return run(layers, found, args)
     except Failed as exc:
         # 2 is "did not run", which every other refusal in main() already
@@ -574,6 +604,9 @@ def main() -> int:
         # one were the same signal to whatever reads the exit status.
         print(exc, file=sys.stderr)
         return 2
+    except Terminated as exc:
+        print(exc, file=sys.stderr)
+        return 128 + signal.SIGTERM
 
 
 def dry_run(layers: list[Layer], found: dict[str, Path],
@@ -609,28 +642,35 @@ def run(layers: list[Layer], found: dict[str, Path],
         print(exc, file=sys.stderr)
         return 2
 
-    for layer in layers:
-        archive = found.get(layer.wmts)
-        print(f"\n=== {layer.wmts} ===", flush=True)
-        if archive is None:
-            failures.append((layer.wmts, "no archive file for this layer"))
-            print("  no archive file for this layer", file=sys.stderr)
-            continue
-        began = time.monotonic()
-        try:
-            out = build_layer(layer, archive, args.work, args.dest,
-                              max(1, args.jobs), args.force, args.skip_refresh)
-        except Exception as exc:
-            failures.append((layer.wmts, str(exc)))
-            print(f"  FAILED: {exc}", file=sys.stderr)
-            continue
-        finally:
-            # The sweep runs whether or not anything is rebuilt and is the long
-            # step, so a quiet month spends nearly all its hours in layers this
-            # line is the only account of.
-            print(f"  took {duration(time.monotonic() - began)}", flush=True)
-        if out is not None:
-            ready.append(out)
+    try:
+        for layer in layers:
+            archive = found.get(layer.wmts)
+            print(f"\n=== {layer.wmts} ===", flush=True)
+            if archive is None:
+                failures.append((layer.wmts, "no archive file for this layer"))
+                print("  no archive file for this layer", file=sys.stderr)
+                continue
+            began = time.monotonic()
+            try:
+                out = build_layer(layer, archive, args.work, args.dest,
+                                  max(1, args.jobs), args.force, args.skip_refresh)
+            except Exception as exc:
+                failures.append((layer.wmts, str(exc)))
+                print(f"  FAILED: {exc}", file=sys.stderr)
+                continue
+            finally:
+                # The sweep runs whether or not anything is rebuilt and is the
+                # long step, so a quiet month spends nearly all its hours in
+                # layers this line is the only account of.
+                print(f"  took {duration(time.monotonic() - began)}", flush=True)
+            if out is not None:
+                ready.append(out)
+    except Terminated:
+        # build_layer's own finally has swept the layer it was on; these are the
+        # finished sets waiting for publish, which nothing else will collect.
+        for f in ready:
+            f.unlink(missing_ok=True)
+        raise
 
     if ready:
         print(f"\n=== publishing {len(ready)} set(s) ===", flush=True)

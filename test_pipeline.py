@@ -340,6 +340,16 @@ def only(steps, what):
     return next(cmd for w, cmd in steps if w == what)
 
 
+def step_input(cmd):
+    """The file a step reads: the first argument after the script it runs.
+
+    Found by shape rather than by index -- the uv invocation carries flags of
+    its own, and a test that counts positions breaks when one is added.
+    """
+    script = next(i for i, a in enumerate(cmd) if a.endswith(".py"))
+    return cmd[script + 1]
+
+
 def test_downscale_is_always_told_which_level_to_start_from(archive, work, steps):
     """Derived from recipe, not spelled out: the zoom process passes and the zoom
     why_run compares against have to be one number."""
@@ -604,6 +614,40 @@ def test_an_empty_directory_argument_is_refused(cli, which):
     assert exit.value.code == 2
 
 
+def test_a_terminated_run_sweeps_its_scratch_and_publishes_nothing(
+        cli, archive, work, dest, monkeypatch, capsys):
+    """TimeoutStartSec makes SIGTERM a scheduled possibility. Python's default
+    handling skips every `finally`, which is where the sweeps live, so the
+    multi-gigabyte scratch would sit until the next month's run."""
+    make_mbtiles(archive / "fi-satamakartat-2026-06-29.mbtiles",
+                 ARCHIVE_META | {"wmts_layer": "Satamakartat",
+                                 "source_updated": "2026-06-29"})
+
+    def fake(cmd, what):
+        if what == "publish":
+            pytest.fail("a terminated run must not publish")
+        if what == "downscale" and "satamakartat" in step_input(cmd):
+            raise pipeline.Terminated("stopped by signal 15")
+        if what in ("strip-nodata", "downscale"):
+            make_mbtiles(Path(cmd[cmd.index("--out") + 1]), PUBLISHED_META)
+
+    monkeypatch.setattr(pipeline, "run_step", fake)
+    before = sorted(p.name for p in dest.iterdir())
+    assert cli("--force", "--skip-refresh", "--layer", "Yleiskartat 250k public",
+               "--layer", "Satamakartat") == 143
+    # Yleiskartat finished and was waiting to publish; Satamakartat was mid-step
+    assert [p.name for p in work.iterdir()] == [pipeline.LOCK]
+    assert sorted(p.name for p in dest.iterdir()) == before
+    assert "stopped by signal 15" in capsys.readouterr().err
+
+
+def test_the_lock_covers_the_archive_as_well_as_the_work_directory(cli, archive):
+    """Refresh rewrites the archive in place and currency renames it. Two runs
+    with different --work would both acquire and race the same SQLite file."""
+    with pipeline.exclusive(archive):
+        assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 2
+
+
 def test_a_second_run_reports_the_refusal_rather_than_a_traceback(cli, work, capsys):
     """Exit 2 is "did not run" everywhere else in main(). Letting Failed escape
     gave exit 1 -- what run() returns when a layer broke -- so a refused month
@@ -658,16 +702,16 @@ def test_one_failing_layer_does_not_stop_the_others(cli, monkeypatch, archive, d
 
     def fake(cmd, what):
         if what == "strip-nodata":
-            attempted.append(cmd[3])
-            if "yleiskartat" in cmd[3]:
+            attempted.append(step_input(cmd))
+            if "yleiskartat" in step_input(cmd):
                 raise Failed("strip-nodata exited 1")
             make_mbtiles(Path(cmd[cmd.index("--out") + 1]), PUBLISHED_META)
         if what == "downscale":
             # Satamakartat is not stripped, so downscale reads the archive and
             # the result carries no strip stamp
-            stripped = ".stripped." in cmd[3]
+            stripped = ".stripped." in step_input(cmd)
             if not stripped:
-                attempted.append(cmd[3])
+                attempted.append(step_input(cmd))
             zoom = cmd[cmd.index("--source-zoom") + 1]
             m = PUBLISHED_META | {"wmts_layer": "Satamakartat",
                                   "source_updated": "2026-06-29",
