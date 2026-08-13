@@ -718,15 +718,19 @@ needs root. Every path is host-specific and stays out of the repository, in an
 environment file the unit reads.
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp systemd/fi-nautical-charts.{service,timer} ~/.config/systemd/user/
 cp systemd/fi-nautical-charts.env.example ~/.config/fi-nautical-charts.env
 $EDITOR ~/.config/fi-nautical-charts.env        # the four directories
 
-systemctl --user daemon-reload
+systemctl --user link "$PWD/systemd/fi-nautical-charts.service"
+systemctl --user link "$PWD/systemd/fi-nautical-charts.timer"
 systemctl --user enable --now fi-nautical-charts.timer
 loginctl enable-linger "$USER"
 ```
+
+`link` rather than `cp`: the clone stays the running copy, so a fix committed
+here reaches the host with a `git pull` and a `daemon-reload` instead of
+diverging from a copy nobody remembers making. The clone has to stay where it
+is — moving it breaks the symlinks.
 
 **`enable-linger` is not optional.** Without it a user manager exists only while
 the user has a session, so the timer stops firing at logout and starts again at
@@ -752,12 +756,21 @@ run is already pending.
 The service runs the pipeline exactly as the command above does, so anything
 you can pass by hand you can add to `ExecStart`, and a manual `systemctl --user
 start fi-nautical-charts.service` is a real run under the same limits as the
-scheduled one. The pipeline refuses to run twice at once regardless.
+scheduled one. A second run is refused with exit 2 rather than starting: the
+lock covers the archive and the work directory for the whole ten hours.
 
-Nothing here notifies anyone. A failed run exits non-zero, names the layer, and
-leaves the published set untouched, but it does not reach a phone: alerting
-belongs to the monitoring stack, tracked at
-[hatlabs/admin#21](https://github.com/hatlabs/admin/issues/21).
+Every step runs `uv run --locked`, so a scheduled run resolves nothing. The
+inline dependency blocks carry no version bounds, and an unattended 01:00 job
+that writes to the served directory should not be taking whatever pillow or
+numpy released last week. `./run relock` is how a dependency moves, and it
+moves as a commit someone read.
+
+Nothing here notifies anyone. A run that fails a step exits non-zero, names the
+layer and leaves the published set untouched — but it does not reach a phone,
+and it is not the only way a month can go wrong: a refresh in which every
+request failed still exits 0 and reads as a quiet month
+([#36](https://github.com/mairas/fi-nautical-charts/issues/36)). Alerting is
+handled by the monitoring stack, outside this repository.
 
 Python tools run via [uv](https://docs.astral.sh/uv/) with PEP 723 inline
 dependencies — no manual environment setup. `./run test` runs the suite.
