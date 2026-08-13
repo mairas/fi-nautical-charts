@@ -97,6 +97,26 @@ function pipeline {
   uv run --locked pipeline.py "$@"
 }
 
+function image {
+  #@ Build the container image the monthly run executes in
+  #@ Category: Publish
+  # The commit is the only way the served manifest can name the code that made
+  # it: the image carries no .git for publish.py to ask, and an empty value is
+  # the one that reaches the charts as "unknown" with nothing along the way
+  # having gone wrong.
+  #
+  # Assigned on a line of its own rather than as `local revision=$(...)`:
+  # `local` reports its own status, which hides the failure and hands the build
+  # an empty string. Split, errexit stops here instead.
+  local revision
+  revision=$(git describe --always --dirty)
+  # Forwarded arguments go first, so --no-cache and friends work while docker's
+  # last-one-wins rule for a repeated --build-arg leaves the commit below the
+  # winner. A caller can add to the build; it cannot make the served manifest
+  # name a commit that did not build these charts.
+  docker build "$@" --build-arg REVISION="$revision" --tag fi-nautical-charts .
+}
+
 function relock {
   #@ Re-resolve the pinned dependencies of every script the pipeline runs
   #@ Category: Publish
