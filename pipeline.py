@@ -535,6 +535,34 @@ def directory(value: str) -> Path:
     return Path(value)
 
 
+def can_rename(work: Path, dest: Path) -> str | None:
+    """Try the move publishing depends on. Returns a complaint or None.
+
+    `publish` stages beside the destination and renames into place, because an
+    upload once truncated three of five files and went unnoticed for six days.
+    That only works when the two directories are on one mount.
+
+    Tried rather than deduced. Comparing `st_dev` looks like the same check and
+    is not: two bind mounts of one filesystem report the same device and still
+    fail, because `rename(2)` refuses to cross a mount point even within a
+    filesystem. Trying it also catches the case no comparison can -- both paths
+    landing somewhere that is not the mount anyone meant, where the rename
+    succeeds and the charts are never written to the storage that serves them.
+    """
+    probe = work / ".rename-probe"
+    landed = dest / ".rename-probe"
+    try:
+        probe.write_bytes(b"")
+        os.replace(probe, landed)
+    except OSError as exc:
+        return (f"cannot rename from {work} into {dest} ({exc.strerror}); publishing "
+                f"renames rather than copies, so both must be on one mount")
+    finally:
+        probe.unlink(missing_ok=True)
+        landed.unlink(missing_ok=True)
+    return None
+
+
 def resolve_dirs(args: argparse.Namespace) -> str | None:
     """Absolute, distinct, and all three present. Returns a complaint or None.
 
@@ -579,6 +607,12 @@ def main() -> int:
     args = p.parse_args()
 
     if complaint := resolve_dirs(args):
+        print(complaint, file=sys.stderr)
+        return 2
+
+    # Before the ten hours, not after them: a layout that cannot rename fails in
+    # publish, having already refreshed and rebuilt everything.
+    if not args.dry_run and (complaint := can_rename(args.work, args.dest)):
         print(complaint, file=sys.stderr)
         return 2
 

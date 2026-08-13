@@ -11,6 +11,7 @@ The steps themselves -- refresh, strip, downscale, publish -- have their own
 tests. Here they are subprocesses and stay that way.
 """
 
+import errno
 import re
 import sqlite3
 import sys
@@ -655,6 +656,57 @@ def test_a_second_run_reports_the_refusal_rather_than_a_traceback(cli, work, cap
     with pipeline.exclusive(work):
         assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 2
     assert "refusing to run concurrently" in capsys.readouterr().err
+
+
+# --- publishing has to be able to rename, not copy -----------------------------
+
+def test_a_layout_that_can_rename_is_accepted(work, dest):
+    assert pipeline.can_rename(work, dest) is None
+
+
+def test_the_probe_leaves_nothing_behind_in_either_directory(work, dest):
+    before = sorted(p.name for p in dest.iterdir())
+    pipeline.can_rename(work, dest)
+    assert sorted(p.name for p in dest.iterdir()) == before
+    assert list(work.iterdir()) == []
+
+
+def test_a_layout_that_cannot_rename_is_named_not_discovered_at_hour_ten(
+        work, dest, monkeypatch):
+    """Two bind mounts of one host filesystem report the same st_dev and still
+    fail with EXDEV, because rename(2) tests mount-point identity. Only trying
+    it finds that out."""
+    def cross_device(src, dst):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(pipeline.os, "replace", cross_device)
+    complaint = pipeline.can_rename(work, dest)
+    assert str(work) in complaint and str(dest) in complaint
+
+
+def test_the_probe_cleans_up_after_a_failed_rename(work, dest, monkeypatch):
+    monkeypatch.setattr(pipeline.os, "replace",
+                        lambda s, d: (_ for _ in ()).throw(OSError(errno.EXDEV, "no")))
+    pipeline.can_rename(work, dest)
+    assert list(work.iterdir()) == []
+
+
+def test_a_destination_that_cannot_be_written_says_so(work, dest):
+    dest.chmod(0o500)
+    try:
+        complaint = pipeline.can_rename(work, dest)
+        assert complaint and str(dest) in complaint
+    finally:
+        dest.chmod(0o755)
+
+
+def test_a_run_is_refused_before_any_step_when_the_layout_cannot_rename(
+        cli, monkeypatch):
+    monkeypatch.setattr(pipeline, "run_step",
+                        lambda *a: pytest.fail("a step ran despite a bad layout"))
+    monkeypatch.setattr(pipeline, "can_rename",
+                        lambda w, d: "work and dest cannot rename between them")
+    assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 2
 
 
 def test_a_missing_directory_is_named(tmp_path):
