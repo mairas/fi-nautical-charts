@@ -5,25 +5,21 @@ Documentation=https://github.com/mairas/fi-nautical-charts
 [Service]
 Type=oneshot
 
-# Where the three directories and the clone are is the host's business, not the
-# repository's. See "Running it monthly" in the README for the file's shape.
+# Where the three directories are, and which image to run, is the host's
+# business rather than the repository's. See "Running it monthly" in the README
+# for the file's shape.
 EnvironmentFile=%h/.config/fi-nautical-charts.env
 
-# Python block-buffers stdout when it is not a tty, so without this a detached
-# run writes nothing to the journal until it exits. For a ten-hour unattended
-# job that removes the only way to tell "slow" from "wedged" while it still
-# matters. It also keeps stdout and stderr in the order they were written, so a
-# layer's failure lands next to the step that caused it.
-Environment=PYTHONUNBUFFERED=1
-
-# uv installs user-scoped, and a systemd unit gets none of the login shell's
-# PATH. Spelled out rather than inherited so the unit does not depend on what a
-# profile happens to export.
+# Only the docker client is looked up here; everything the pipeline needs is
+# inside the image, which brings its own interpreter and its own PATH. A
+# rootless daemon installs its client under the home directory, so that is named
+# alongside the system directories rather than inherited from a login shell.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
-# The pipeline wraps each step in nice and ionice itself; these cover the parent
-# and anything that escapes the wrapper. The neighbours on this host are
-# production and this job is a guest.
+# These reach the docker client and stop there. The container runs in a sibling
+# cgroup under dockerd, not as a child of this unit, so nothing set here follows
+# it. What keeps the job a guest is the nice and ionice each step is wrapped in
+# inside the container, which were measured taking effect unprivileged there.
 Nice=19
 IOSchedulingClass=idle
 
@@ -32,16 +28,44 @@ IOSchedulingClass=idle
 # next month's would start, and a run this long has no other upper bound.
 TimeoutStartSec=24h
 
+# On the way down the container gets SIGTERM and then deletes whatever
+# multi-gigabyte scratch it had built, which is the one thing that must not be
+# cut short -- the host has filled its disk before. Docker's own default stop
+# timeout is 10 s and systemd's is 90 s, so both are named here instead, the
+# outer one wide enough to let the inner one finish.
+#
+# Leading `-`: after a run that ended by itself there is no container left, and
+# `docker stop` on a name that is gone exits non-zero. Without it every clean
+# month would deactivate as a failure.
+TimeoutStopSec=6min
+ExecStop=-/usr/bin/env docker stop --time 300 %N
+
 # $VAR rather than ${VAR} on purpose. systemd substitutes ${VAR} inside a word
 # but leaves a bare $VAR that is not a word of its own, so these reach bash
 # intact and bash expands them -- which is what keeps a path containing a space
-# one argument. WorkingDirectory= cannot be used instead: it takes no variables.
+# one argument.
 #
-# CHARTS_REPO is checked here because it is the one path the pipeline cannot
-# check for itself. An unset variable expands to an empty argument rather than
-# being dropped, and `cd ""` succeeds on every bash before 5.3 -- so an earlier
-# form of this line ran from the home directory and reported nothing. `run`
-# cd's to its own directory, so an absolute path to it needs no cd at all.
-ExecStart=/usr/bin/env bash -c '[ -n "$CHARTS_REPO" ] || { echo "CHARTS_REPO is empty: check the environment file" >&2; exit 78; }; exec "$CHARTS_REPO/run" pipeline --archive "$CHARTS_ARCHIVE" --work "$CHARTS_WORK" --dest "$CHARTS_DEST"'
+# Two checks, and only two, because everything else already fails loudly in the
+# first second: docker refuses an empty image name, and the pipeline refuses an
+# empty --archive, --work or --dest by name. Neither can catch these.
+#
+# CHARTS_IMAGE empty would make docker read the first pipeline flag as the image
+# and complain about a reference format, naming nothing an operator set.
+#
+# The sibling check is the expensive one. Work and dest go in through one mount
+# so that publishing can rename between them; if dest lives somewhere else the
+# container simply would not have it, and the pipeline would report a directory
+# missing that plainly exists on the host.
+#
+# --user: the container writes as whoever owns this unit, which is the same
+# ownership the pipeline produced when it ran on the host directly. Files land
+# readable by the web server, and the archive stays writable by the pipeline.
+#
+# --pull=never: the image is built here and exists nowhere else. The default
+# policy fetches an image it cannot find locally, and this name carries no
+# registry, so a missing image would send an unattended 01:00 run to Docker Hub
+# for whatever answers to it -- and run that, as this user, with the archive and
+# the served directory mounted. Absent means stop, not substitute.
+ExecStart=/usr/bin/env bash -c '[ -n "$CHARTS_IMAGE" ] || { echo "CHARTS_IMAGE is empty: check the environment file" >&2; exit 78; }; spool=$(dirname "$CHARTS_WORK"); [ "$spool" = "$(dirname "$CHARTS_DEST")" ] || { echo "CHARTS_WORK and CHARTS_DEST must sit side by side: publishing renames between them, and a rename cannot cross a mount point" >&2; exit 78; }; exec docker run --rm --pull=never --name %N --user %U:%G --stop-timeout 300 --volume "$CHARTS_ARCHIVE":"$CHARTS_ARCHIVE" --volume "$spool":"$spool" "$CHARTS_IMAGE" --archive "$CHARTS_ARCHIVE" --work "$CHARTS_WORK" --dest "$CHARTS_DEST"'
 
 SyslogIdentifier=fi-nautical-charts

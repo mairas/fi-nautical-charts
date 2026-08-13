@@ -706,22 +706,72 @@ than trusted to a `finally` a `kill -9` never reaches.
 
 Each layer reports how long it took, whether or not it rebuilt anything — the
 sweep runs either way and is the long step, so a quiet month spends nearly all
-its hours in layers that produced nothing else to log. The run ends with the
-peak resident size any one step reached, which stands in for `/usr/bin/time`;
-the build host does not have it, memory is a binding constraint there, and a
-regression that only shows under a full archive is not something to go looking
-for twice.
+its hours in layers that produced nothing else to log. The run ends with a peak
+memory figure, which stands in for `/usr/bin/time` where that is not installed.
+Memory is the binding constraint on a small machine, and a regression that only
+shows under a full archive is not something to go looking for twice.
+
+The figure says what it covers, because there are two of them and they are not
+comparable. Under a cgroup — which is to say in the container — it is the whole
+subtree's high-water mark: every worker resident at once, which is the number
+that decides whether the host runs out. Without one it is the largest single
+process, and `strip-nodata` and `downscale` both fan out across a pool.
+
+## Running it in a container
+
+The scheduled run happens inside an image built on the host that runs it.
+Nothing is pushed to a registry and nothing is pulled from one:
+
+```bash
+./run image
+```
+
+The build resolves the five lockfiles into a single environment and bakes it in,
+so the 01:00 run reaches no package index at all. That is what `uv run --locked`
+gives on the command line, moved to build time and frozen into an artifact —
+there is nothing left for a scheduled run to resolve. uv is not in the image:
+its cache cannot be made read-only, so keeping it would mean a writable
+directory tied to whichever uid the run happened to use.
+
+The image will not build unless it can run the job. It reaches for `nice` and
+`ionice`, imports every module the run touches through the interpreter it baked,
+and requires the commit it is being built from — so a file left out, a broken
+environment, or an image that could not say what made it stops the build on the
+host that built it rather than the month on the host that runs it.
+
+**The work and published directories must sit side by side inside one bind
+mount.** Publishing renames from the first into the second, and `rename(2)`
+refuses to cross a mount point even when both sides are the same filesystem: two
+`--volume` flags fail with `EXDEV` at the last step of a ten-hour run. The unit
+mounts the parent the two share, and the pipeline tries the rename for real
+before it starts — a layout that cannot publish fails in the first second
+instead of the tenth hour.
+
+The archive is a separate mount, because nothing is ever renamed across it.
+
+The container runs as whoever owns the unit, so published files land with the
+same ownership they had when the pipeline ran on the host directly: readable by
+the web server, and the archive still writable by the next run.
+
+Which commit an image holds:
+
+```bash
+docker image inspect fi-nautical-charts \
+  --format '{{index .Config.Labels "org.opencontainers.image.revision"}}'
+```
+
+The same string is the `pipeline` field of the published `charts.json`, so a
+served chart set names the code that produced it.
 
 ## Scheduling it with systemd
 
-`systemd/` holds a user timer and service. They are user units because `uv`
-installs user-scoped and the archives live in the user's home: nothing here
-needs root. Every path is host-specific and stays out of the repository, in an
-environment file the unit reads.
+`systemd/` holds a user timer and service. They are user units because nothing
+here needs root. Every path is host-specific and stays out of the repository, in
+an environment file the unit reads.
 
 ```bash
 cp systemd/fi-nautical-charts.env.example ~/.config/fi-nautical-charts.env
-$EDITOR ~/.config/fi-nautical-charts.env        # the four directories
+$EDITOR ~/.config/fi-nautical-charts.env        # the image, and three directories
 
 systemctl --user link "$PWD/systemd/fi-nautical-charts.service"
 systemctl --user link "$PWD/systemd/fi-nautical-charts.timer"
@@ -729,10 +779,13 @@ systemctl --user enable --now fi-nautical-charts.timer
 loginctl enable-linger "$USER"
 ```
 
-`link` rather than `cp`: the clone stays the running copy, so a fix committed
-here reaches the host with a `git pull` and a `daemon-reload` instead of
+`link` rather than `cp`, so the units stay the ones in this clone instead of
 diverging from a copy nobody remembers making. The clone has to stay where it
 is — moving it breaks the symlinks.
+
+A change to a unit reaches the host with a `git pull` and a `daemon-reload`. A
+change to the pipeline does not: the code runs from the image, so it takes a
+`./run image` as well.
 
 **`enable-linger` is not optional.** Without it a user manager exists only while
 the user has a session, so the timer stops firing at logout and starts again at
@@ -755,17 +808,29 @@ middle of the afternoon. `status` cannot answer that: `RandomizedDelaySec` also
 applies to a catch-up, so the service reads inactive for up to an hour while a
 run is already pending.
 
-The service runs the pipeline exactly as the command above does, so anything
-you can pass by hand you can add to `ExecStart`, and a manual `systemctl --user
-start fi-nautical-charts.service` is a real run under the same limits as the
-scheduled one. A second run is refused with exit 2 rather than starting: the
-lock covers the archive and the work directory for the whole ten hours.
+The service runs the pipeline with the same arguments the command above takes,
+so anything you can pass by hand you can add to `ExecStart` after the image
+name, and a manual `systemctl --user start fi-nautical-charts.service` is a real
+run under the same limits as the scheduled one. A second run is refused with
+exit 2 rather than starting: the lock covers the archive and the work directory
+for the whole ten hours.
 
-Every step runs `uv run --locked`, so a scheduled run resolves nothing. The
-inline dependency blocks carry no version bounds, and an unattended 01:00 job
-that writes to the served directory should not be taking whatever pillow or
-numpy released last week. `./run relock` is how a dependency moves, and it
-moves as a commit someone read.
+`Nice=` and `IOSchedulingClass=` in the unit reach the docker client and stop
+there — the container runs in a sibling cgroup under the daemon, not as a child
+of the unit. What keeps this job a guest on a shared host is the `nice` and
+`ionice -c 3` wrapped around every step *inside* the container, which take
+effect there unprivileged. Removing that wrapping on the grounds that the unit
+already covers it would leave nothing covering it.
+
+Stopping the unit stops the container by name and gives it five minutes, because
+what the pipeline does on the way down is delete however much multi-gigabyte
+scratch it had built. Docker's own default is ten seconds.
+
+The inline dependency blocks carry no version bounds, and an unattended 01:00
+job that writes to the served directory should not be taking whatever pillow or
+numpy released last week — so a scheduled run resolves nothing, having been
+handed an environment the build already fixed. `./run relock` is how a
+dependency moves, and it moves as a commit someone read.
 
 Nothing here notifies anyone. A run that fails a step exits non-zero, names the
 layer and leaves the published set untouched — but it does not reach a phone,
