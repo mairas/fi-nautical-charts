@@ -1060,20 +1060,65 @@ def test_the_timer_names_a_service_file_that_exists():
     assert (pipeline.REPO / "systemd" / unit).exists()
 
 
-def test_the_service_runs_a_command_the_run_script_defines():
-    exec_line = next(l for l in unit_text("fi-nautical-charts.service").splitlines()
-                     if l.startswith("ExecStart="))
-    target = re.search(r'/run"?\s+([a-z][\w-]*)', exec_line).group(1)
-    assert re.search(rf'^function {target} ',
-                     (pipeline.REPO / "run").read_text(), re.M)
+def exec_start() -> str:
+    return next(l for l in unit_text("fi-nautical-charts.service").splitlines()
+                if l.startswith("ExecStart="))
+
+
+def pipeline_arguments() -> str:
+    """What the unit passes to the pipeline, which is everything after the image
+    name. Before it are docker's own flags, which answer to docker.
+
+    The last occurrence, not the first: the variable is also read by the guard
+    that refuses an empty one, well before it names the image."""
+    return exec_start().split('"$CHARTS_IMAGE"')[-1]
+
+
+def test_the_service_runs_the_image_the_env_file_names():
+    """The image is built here and pulled from nowhere, so the name in the
+    example file and the tag the build writes are one string kept in two
+    places."""
+    tag = re.search(r'--tag (\S+)', (pipeline.REPO / "run").read_text()).group(1)
+    assert re.search(rf'^CHARTS_IMAGE={tag}$',
+                     unit_text("fi-nautical-charts.env.example"), re.M)
 
 
 def test_the_service_passes_only_flags_the_pipeline_accepts():
-    exec_line = next(l for l in unit_text("fi-nautical-charts.service").splitlines()
-                     if l.startswith("ExecStart="))
     source = (pipeline.REPO / "pipeline.py").read_text()
-    for flag in re.findall(r'--[a-z-]+', exec_line):
+    for flag in re.findall(r'--[a-z-]+', pipeline_arguments()):
         assert f'"{flag}"' in source, f"{flag} is not an argument pipeline.py adds"
+
+
+def test_work_and_dest_reach_the_container_through_one_mount():
+    """Two volumes fail `os.replace` with EXDEV even when both sides are the
+    same host filesystem, because a rename tests mount-point identity. Publishing
+    is a rename, so a second volume here would fail at hour ten, on the step that
+    has already cost the most. The unit mounts the parent the two share."""
+    mounted = re.findall(r'--volume "([^ ]+)"', exec_start())
+    assert not any("CHARTS_WORK" in m or "CHARTS_DEST" in m for m in mounted), (
+        "work or dest is mounted in its own right; publishing cannot rename "
+        "across two mounts")
+    assert '--work "$CHARTS_WORK"' in pipeline_arguments()
+    assert '--dest "$CHARTS_DEST"' in pipeline_arguments()
+
+
+def test_the_service_uses_only_the_three_specifiers_it_means_to():
+    """A `%` in an Exec line is systemd's, not the shell's. An unknown one fails
+    the unit at load, which is loud; a known one substitutes silently, which is
+    not. A `printf "%s\\n"` written into this line came back as `/bin/bash\\n`,
+    because %s is the user's shell."""
+    assert set(re.findall(r'%(.)', exec_start())) == {"N", "U", "G"}
+
+
+def test_the_container_is_stoppable_by_the_name_it_runs_under():
+    """--sig-proxy carries one signal and never escalates, so a client that dies
+    first leaves the container running with the scratch it had built. Stopping it
+    by name goes through the daemon instead, and only works if the two names
+    agree."""
+    started = re.search(r'--name (\S+)', exec_start()).group(1)
+    stopped = re.search(r'^ExecStop=.*docker stop\b.*?(\S+)$',
+                        unit_text("fi-nautical-charts.service"), re.M).group(1)
+    assert started == stopped
 
 
 # --- the image has to carry what the run reaches -------------------------------
