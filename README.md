@@ -710,7 +710,7 @@ the build host does not have it, memory is a binding constraint there, and a
 regression that only shows under a full archive is not something to go looking
 for twice.
 
-## Running it monthly
+## Scheduling it with systemd
 
 `systemd/` holds a user timer and service. They are user units because `uv`
 installs user-scoped and the archives live in the user's home: nothing here
@@ -731,21 +731,23 @@ loginctl enable-linger "$USER"
 **`enable-linger` is not optional.** Without it a user manager exists only while
 the user has a session, so the timer stops firing at logout and starts again at
 the next login — the whole job quietly not running, which is the one failure
-this schedule cannot show you. It is also the reason the pipeline is registered
-as a target of the monitoring stack rather than trusted to report for itself.
+this schedule cannot show you. It is also why watching for that belongs outside
+the pipeline: a job that has stopped running cannot report that it has.
 
 Check what you got:
 
 ```bash
-systemctl --user list-timers fi-nautical-charts.timer    # next elapse
-systemctl --user status fi-nautical-charts.service       # did enabling start one?
+systemctl --user list-timers fi-nautical-charts.timer    # next elapse, and LEFT
 journalctl --user -u fi-nautical-charts.service -f       # follow a live run
 ```
 
-The status check is worth doing straight after enabling. `Persistent=true` makes
-a timer catch up on a run it missed while the host was off, and whether that
-counts a never-yet-run timer as missed depends on the systemd version — so
-confirm you have not just started a ten-hour job in the middle of the afternoon.
+Read `list-timers` straight after enabling, not the service's status.
+`Persistent=true` makes a timer catch up on a run it missed while the host was
+off, and whether that counts a never-yet-run timer as missed depends on the
+systemd version — so confirm you have not just scheduled a ten-hour job into the
+middle of the afternoon. `status` cannot answer that: `RandomizedDelaySec` also
+applies to a catch-up, so the service reads inactive for up to an hour while a
+run is already pending.
 
 The service runs the pipeline exactly as the command above does, so anything
 you can pass by hand you can add to `ExecStart`, and a manual `systemctl --user
