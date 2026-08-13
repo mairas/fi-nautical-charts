@@ -11,6 +11,7 @@ The steps themselves -- refresh, strip, downscale, publish -- have their own
 tests. Here they are subprocesses and stay that way.
 """
 
+import errno
 import re
 import sqlite3
 import sys
@@ -657,6 +658,88 @@ def test_a_second_run_reports_the_refusal_rather_than_a_traceback(cli, work, cap
     assert "refusing to run concurrently" in capsys.readouterr().err
 
 
+# --- publishing has to be able to rename, not copy -----------------------------
+
+def test_a_layout_that_can_rename_is_accepted(work, dest):
+    assert pipeline.can_rename(work, dest) is None
+
+
+def test_the_probe_leaves_nothing_behind_in_either_directory(work, dest):
+    before = sorted(p.name for p in dest.iterdir())
+    pipeline.can_rename(work, dest)
+    assert sorted(p.name for p in dest.iterdir()) == before
+    assert list(work.iterdir()) == []
+
+
+def test_a_layout_that_cannot_rename_is_named_not_discovered_at_hour_ten(
+        work, dest, monkeypatch):
+    """Two bind mounts of one host filesystem report the same st_dev and still
+    fail with EXDEV, because rename(2) tests mount-point identity. Only trying
+    it finds that out."""
+    def cross_device(src, dst):
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(pipeline.os, "replace", cross_device)
+    complaint = pipeline.can_rename(work, dest)
+    assert str(work) in complaint and str(dest) in complaint
+
+
+def test_the_probe_cleans_up_after_a_failed_rename(work, dest, monkeypatch):
+    monkeypatch.setattr(pipeline.os, "replace",
+                        lambda s, d: (_ for _ in ()).throw(OSError(errno.EXDEV, "no")))
+    pipeline.can_rename(work, dest)
+    assert list(work.iterdir()) == []
+
+
+def test_a_destination_that_cannot_be_written_says_so(work, dest, monkeypatch):
+    """Denied by a mocked errno rather than by mode bits: root ignores mode bits,
+    so a container running the suite as root would not exercise this at all."""
+    monkeypatch.setattr(pipeline.os, "replace",
+                        lambda s, d: (_ for _ in ()).throw(
+                            PermissionError(errno.EACCES, "Permission denied")))
+    complaint = pipeline.can_rename(work, dest)
+    assert complaint and str(dest) in complaint
+
+
+def test_the_probe_does_not_destroy_a_file_that_is_already_there(work, dest):
+    """os.replace overwrites whatever it lands on and the cleanup then removes
+    it, so a fixed probe name would delete a served chart that happened to
+    share it."""
+    for d in (work, dest):
+        (d / ".rename-probe").write_text("someone else's file")
+    assert pipeline.can_rename(work, dest) is None
+    assert (work / ".rename-probe").read_text() == "someone else's file"
+    assert (dest / ".rename-probe").read_text() == "someone else's file"
+
+
+def test_two_probes_at_once_do_not_collide(work, dest):
+    """can_rename runs before the lock is taken, so two runs can probe together."""
+    names = set()
+    real = pipeline.tempfile.mkstemp
+
+    def remember(**kwargs):
+        fd, path = real(**kwargs)
+        names.add(Path(path).name)
+        return fd, path
+
+    pipeline.tempfile.mkstemp = remember
+    try:
+        for _ in range(5):
+            assert pipeline.can_rename(work, dest) is None
+    finally:
+        pipeline.tempfile.mkstemp = real
+    assert len(names) == 5
+
+
+def test_a_run_is_refused_before_any_step_when_the_layout_cannot_rename(
+        cli, monkeypatch):
+    monkeypatch.setattr(pipeline, "run_step",
+                        lambda *a: pytest.fail("a step ran despite a bad layout"))
+    monkeypatch.setattr(pipeline, "can_rename",
+                        lambda w, d: "work and dest cannot rename between them")
+    assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 2
+
+
 def test_a_missing_directory_is_named(tmp_path):
     import argparse
     (tmp_path / "a").mkdir()
@@ -856,11 +939,48 @@ def test_a_failed_layer_is_still_timed(cli, monkeypatch, capsys):
     assert "took 0 min" in capsys.readouterr().out.split("=== Yleiskartat")[1]
 
 
-def test_the_run_reports_the_peak_memory_of_its_steps(cli, monkeypatch, capsys):
-    monkeypatch.setattr(pipeline, "peak_process_memory", lambda: 412 * 1024 * 1024)
+def test_a_cgroup_reports_the_whole_subtree_and_says_so(tmp_path, monkeypatch):
+    """ru_maxrss is the largest single process. Both heavy steps fan out across
+    a worker pool, so the number that matters is the parent plus its workers
+    resident together, which only the cgroup counter sees."""
+    peak = tmp_path / "memory.peak"
+    peak.write_text("224395264\n")
+    monkeypatch.setattr(pipeline, "CGROUP_PEAK", peak)
+    assert pipeline.peak_memory() == (224395264, "subtree")
+
+
+def test_without_a_cgroup_the_process_figure_is_used_and_labelled(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "CGROUP_PEAK", tmp_path / "absent")
+    assert pipeline.peak_memory()[1] == "one process"
+
+
+@pytest.mark.parametrize("content", ["", "   ", "not a number", "1_0", "-5", "12.5"])
+def test_an_unreadable_cgroup_value_falls_back_rather_than_failing_the_run(
+        tmp_path, monkeypatch, content):
+    """This runs in the last line of a ten-hour job. It must not be what fails
+    it."""
+    peak = tmp_path / "memory.peak"
+    peak.write_text(content)
+    monkeypatch.setattr(pipeline, "CGROUP_PEAK", peak)
+    assert pipeline.peak_memory()[1] == "one process"
+
+
+def test_a_cgroup_that_cannot_be_read_falls_back(monkeypatch):
+    """Denied by a raised error rather than by mode bits, which root ignores."""
+    class Denied:
+        def read_text(self):
+            raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(pipeline, "CGROUP_PEAK", Denied())
+    assert pipeline.peak_memory()[1] == "one process"
+
+
+def test_the_run_says_which_measurement_it_reported(cli, monkeypatch, capsys):
+    monkeypatch.setattr(pipeline, "peak_memory", lambda: (412 * 1024 * 1024, "subtree"))
     monkeypatch.setattr(pipeline, "run_step", lambda *a: None)
     assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 0
-    assert "412 MiB" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "412 MiB" in out and "subtree" in out
 
 
 def test_peak_memory_measures_the_steps_and_not_the_pipeline_itself(monkeypatch):
@@ -888,6 +1008,31 @@ def test_peak_memory_reads_the_units_of_the_host_it_runs_on(monkeypatch):
     assert pipeline.peak_process_memory() == 4096 * 1024
     monkeypatch.setattr(pipeline.sys, "platform", "darwin")
     assert pipeline.peak_process_memory() == 4096
+
+
+# --- how a step gets invoked ---------------------------------------------------
+
+def test_a_step_runs_under_uv_against_the_lockfile_by_default(monkeypatch):
+    monkeypatch.delenv(pipeline.INTERPRETER, raising=False)
+    assert pipeline.uv("downscale.py", "--jobs", "1") == [
+        "uv", "run", "--locked", str(pipeline.REPO / "downscale.py"), "--jobs", "1"]
+
+
+def test_a_named_interpreter_replaces_uv_entirely(monkeypatch):
+    """The image resolves its dependencies once, at build time. Re-resolving at
+    01:00 is the thing --locked exists to prevent, and an interpreter that was
+    given its environment at build time has nothing left to resolve."""
+    monkeypatch.setenv(pipeline.INTERPRETER, "/usr/local/bin/python3")
+    assert pipeline.uv("downscale.py", "--jobs", "1") == [
+        "/usr/local/bin/python3", str(pipeline.REPO / "downscale.py"), "--jobs", "1"]
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_interpreter_reads_as_unset_not_as_an_empty_argument(monkeypatch, blank):
+    """Same shape as the blank --dest that published into the clone: an unset
+    variable arrives as an empty string, and honouring it would exec ''."""
+    monkeypatch.setenv(pipeline.INTERPRETER, blank)
+    assert pipeline.uv("downscale.py")[0] == "uv"
 
 
 # --- the timer has to invoke a command this repo actually has ------------------

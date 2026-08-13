@@ -33,6 +33,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,6 +92,14 @@ WHITE_LEVEL = WHITE - 1
 NICE = 19           # every step yields the CPU; the neighbours are production
 IONICE_IDLE = "3"   # ionice class: disk only when nobody else wants it
 LOCK = ".pipeline.lock"
+
+# Names the interpreter each step runs under. Unset outside a container, where
+# uv owns the environment; set by the image, which baked one at build time.
+INTERPRETER = "CHARTS_PYTHON"
+
+# The cgroup's own memory high-water mark, present under cgroup v2 from kernel
+# 5.19. Absent outside a cgroup, and absent on older kernels.
+CGROUP_PEAK = Path("/sys/fs/cgroup/memory.peak")
 
 # strip and downscale hold a full copy each, and publish stages a third beside
 # the destination. Two archive-sets of headroom is the rough peak.
@@ -233,17 +242,40 @@ def duration(seconds: float) -> str:
 def peak_process_memory() -> int:
     """The largest resident size any one finished process reached, in bytes.
 
-    Stands in for `/usr/bin/time`, which the build host does not have. Memory is
-    a binding constraint on that host and `strip-nodata` has had to be bounded
-    once already, so a regression should show up in the monthly log rather than
-    need a ten-hour rerun to find.
-
     One process, not one step, and the distinction matters: strip and downscale
     both fan out across a worker pool, so a step's real footprint is its parent
-    plus however many workers are resident at once. This number never sums them.
+    plus however many workers are resident at once. This never sums them, which
+    is why `peak_memory` prefers the cgroup counter where there is one.
     """
     peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     return peak if sys.platform == "darwin" else peak * 1024   # KiB elsewhere
+
+
+def peak_memory() -> tuple[int, str]:
+    """How much memory the run needed, in bytes, and what that figure covers.
+
+    Stands in for `/usr/bin/time`, which the build host does not have. Memory is
+    a binding constraint there and `strip-nodata` has had to be bounded once
+    already, so a regression should show up in the monthly log rather than need
+    a ten-hour rerun to find.
+
+    Under a cgroup this is the whole subtree's high-water mark, which is the
+    figure that decides whether the host runs out: every worker resident at
+    once, not the largest one. Without a cgroup there is only the per-process
+    number. They are not comparable, so the log says which it got rather than
+    leaving a reader of two months' logs to guess.
+
+    Never writes to the file: a write resets the counter for that descriptor.
+    """
+    try:
+        raw = CGROUP_PEAK.read_text().strip()
+    except OSError:
+        return peak_process_memory(), "one process"
+    # int() accepts digit separators, so "1_0" would read as 10 rather than as
+    # the nonsense it is. Nothing but a plain count belongs in this file.
+    if not raw.isdigit():
+        return peak_process_memory(), "one process"
+    return int(raw), "subtree"
 
 
 def run_step(cmd: list[str], what: str) -> None:
@@ -255,11 +287,22 @@ def run_step(cmd: list[str], what: str) -> None:
 
 
 def uv(script: str, *args: str) -> list[str]:
-    # --locked: refuse to resolve. The inline dependency blocks carry no version
-    # bounds, so without a lockfile an unattended 01:00 run would silently take
-    # whatever pillow, numpy or scipy released since anyone last looked, and
-    # write the result into the served directory. A dependency change should be
-    # a commit someone read.
+    """How a step is invoked.
+
+    --locked: refuse to resolve. The inline dependency blocks carry no version
+    bounds, so without a lockfile an unattended 01:00 run would silently take
+    whatever pillow, numpy or scipy released since anyone last looked, and write
+    the result into the served directory. A dependency change should be a commit
+    someone read.
+
+    An image resolves once, at build time, and bakes the result. Naming its
+    interpreter here keeps that guarantee while dropping the machinery that
+    enforces it per-run: there is nothing left to resolve, and uv's cache cannot
+    be made read-only, so keeping uv in the container would mean a writable
+    cache tied to whichever uid the run happens to use.
+    """
+    if interpreter := os.environ.get(INTERPRETER, "").strip():
+        return [interpreter, str(REPO / script), *args]
     return ["uv", "run", "--locked", str(REPO / script), *args]
 
 
@@ -520,6 +563,39 @@ def directory(value: str) -> Path:
     return Path(value)
 
 
+def can_rename(work: Path, dest: Path) -> str | None:
+    """Try the move publishing depends on. Returns a complaint or None.
+
+    `publish` stages beside the destination and renames into place, because an
+    upload once truncated three of five files and went unnoticed for six days.
+    That only works when the two directories are on one mount.
+
+    Tried rather than deduced. Comparing `st_dev` looks like the same check and
+    is not: two bind mounts of one filesystem report the same device and still
+    fail, because `rename(2)` refuses to cross a mount point even within a
+    filesystem. Trying it also catches the case no comparison can -- both paths
+    landing somewhere that is not the mount anyone meant, where the rename
+    succeeds and the charts are never written to the storage that serves them.
+    """
+    # A fixed name would be a file this deletes: os.replace overwrites whatever
+    # it lands on, and the cleanup below then removes it. The destination is the
+    # served directory, and this runs before the lock, so a second run is not
+    # excluded either. mkstemp picks a name nothing else holds.
+    fd, made = tempfile.mkstemp(dir=work, prefix=".rename-probe-")
+    os.close(fd)
+    probe = Path(made)
+    landed = dest / probe.name
+    try:
+        os.replace(probe, landed)
+    except OSError as exc:
+        return (f"cannot rename from {work} into {dest} ({exc.strerror}); publishing "
+                f"renames rather than copies, so both must be on one mount")
+    finally:
+        probe.unlink(missing_ok=True)
+        landed.unlink(missing_ok=True)
+    return None
+
+
 def resolve_dirs(args: argparse.Namespace) -> str | None:
     """Absolute, distinct, and all three present. Returns a complaint or None.
 
@@ -564,6 +640,12 @@ def main() -> int:
     args = p.parse_args()
 
     if complaint := resolve_dirs(args):
+        print(complaint, file=sys.stderr)
+        return 2
+
+    # Before the ten hours, not after them: a layout that cannot rename fails in
+    # publish, having already refreshed and rebuilt everything.
+    if not args.dry_run and (complaint := can_rename(args.work, args.dest)):
         print(complaint, file=sys.stderr)
         return 2
 
@@ -687,7 +769,8 @@ def run(layers: list[Layer], found: dict[str, Path],
 
     print(f"\nrun finished in {duration(time.monotonic() - started)}: "
           f"{len(ready)} processed, {len(failures)} failed")
-    print(f"peak memory in any one process: {peak_process_memory() / 2**20:.0f} MiB")
+    used, scope = peak_memory()
+    print(f"peak memory ({scope}): {used / 2**20:.0f} MiB")
     for name, why in failures:
         print(f"  {name}: {why}", file=sys.stderr)
     return 1 if failures else 0

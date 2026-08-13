@@ -65,6 +65,10 @@ SQLITE_MAGIC = b"SQLite format 3\x00"
 
 REPO = Path(__file__).resolve().parent
 
+# What the manifest records as the code that built a chart. Unset in a checkout,
+# where git answers it; set by an image, which has no working tree to ask.
+VERSION = "CHARTS_VERSION"
+
 
 class Unpublishable(RuntimeError):
     """The set was not published, and nothing in the destination was touched."""
@@ -192,6 +196,18 @@ def processing(meta: dict) -> str:
 
 
 def pipeline_version() -> str:
+    """Which code produced these charts.
+
+    Filenames carry the source edition, not the processing version -- the
+    fill-strip and off-EEZ work changed the bytes without changing any name --
+    so this field is the only record of it.
+
+    An image is not a working tree: `git describe` there answers "unknown",
+    which is non-empty and therefore passed the check that used to guard this.
+    A build that knows its own commit says so instead.
+    """
+    if version := os.environ.get(VERSION, "").strip():
+        return version
     try:
         rev = subprocess.run(["git", "-C", REPO, "describe", "--always", "--dirty"],
                              capture_output=True, text=True, check=True, timeout=10)
