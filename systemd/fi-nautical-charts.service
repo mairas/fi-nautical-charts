@@ -1,0 +1,47 @@
+[Unit]
+Description=Refresh, reprocess and publish the Traficom raster chart sets
+Documentation=https://github.com/mairas/fi-nautical-charts
+
+[Service]
+Type=oneshot
+
+# Where the three directories and the clone are is the host's business, not the
+# repository's. See "Running it monthly" in the README for the file's shape.
+EnvironmentFile=%h/.config/fi-nautical-charts.env
+
+# Python block-buffers stdout when it is not a tty, so without this a detached
+# run writes nothing to the journal until it exits. For a ten-hour unattended
+# job that removes the only way to tell "slow" from "wedged" while it still
+# matters. It also keeps stdout and stderr in the order they were written, so a
+# layer's failure lands next to the step that caused it.
+Environment=PYTHONUNBUFFERED=1
+
+# uv installs user-scoped, and a systemd unit gets none of the login shell's
+# PATH. Spelled out rather than inherited so the unit does not depend on what a
+# profile happens to export.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# The pipeline wraps each step in nice and ionice itself; these cover the parent
+# and anything that escapes the wrapper. The neighbours on this host are
+# production and this job is a guest.
+Nice=19
+IOSchedulingClass=idle
+
+# A full conditional sweep is nine to ten hours and the processing adds to it.
+# Finite rather than infinity: a wedged run should be killed long before the
+# next month's would start, and a run this long has no other upper bound.
+TimeoutStartSec=24h
+
+# $VAR rather than ${VAR} on purpose. systemd substitutes ${VAR} inside a word
+# but leaves a bare $VAR that is not a word of its own, so these reach bash
+# intact and bash expands them -- which is what keeps a path containing a space
+# one argument. WorkingDirectory= cannot be used instead: it takes no variables.
+#
+# CHARTS_REPO is checked here because it is the one path the pipeline cannot
+# check for itself. An unset variable expands to an empty argument rather than
+# being dropped, and `cd ""` succeeds on every bash before 5.3 -- so an earlier
+# form of this line ran from the home directory and reported nothing. `run`
+# cd's to its own directory, so an absolute path to it needs no cd at all.
+ExecStart=/usr/bin/env bash -c '[ -n "$CHARTS_REPO" ] || { echo "CHARTS_REPO is empty: check the environment file" >&2; exit 78; }; exec "$CHARTS_REPO/run" pipeline --archive "$CHARTS_ARCHIVE" --work "$CHARTS_WORK" --dest "$CHARTS_DEST"'
+
+SyslogIdentifier=fi-nautical-charts

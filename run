@@ -94,7 +94,17 @@ function publish {
 function pipeline {
   #@ Refresh every layer, reprocess what moved, and publish it
   #@ Category: Publish
-  uv run pipeline.py "$@"
+  uv run --locked pipeline.py "$@"
+}
+
+function relock {
+  #@ Re-resolve the pinned dependencies of every script the pipeline runs
+  #@ Category: Publish
+  local s
+  for s in pipeline.py traficom_dl.py strip_nodata.py downscale.py publish.py; do
+    echo "locking $s"
+    uv lock --script "$s"
+  done
 }
 
 ################################################################################

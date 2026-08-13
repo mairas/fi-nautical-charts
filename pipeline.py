@@ -27,7 +27,9 @@ import argparse
 import fcntl
 import json
 import os
+import resource
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -99,17 +101,31 @@ class Failed(Exception):
     """A step failed. The layer stops; the run continues with the next one."""
 
 
-class exclusive:
-    """Hold the work directory for the length of a run.
+class Terminated(BaseException):
+    """The run was asked to stop.
 
-    publish takes its own lock, but only for the minutes it is renaming files.
-    The ten hours before that refresh the archive in place and build scratch at
-    paths derived from the layer alone, so two runs would delete each other's
-    partials and race the same SQLite archive.
+    Not an Exception on purpose: the per-layer handler catches Exception and
+    moves to the next layer, which is right for a step that failed and wrong
+    for a signal. This unwinds past it, running the sweeps in the `finally`
+    blocks on the way out.
     """
 
-    def __init__(self, work: Path):
-        self.path = work / LOCK
+
+class exclusive:
+    """Hold a directory for the length of a run.
+
+    Taken on both the archive and the work directory, because they are separate
+    resources and a run mutates both: refresh rewrites the archive in place and
+    currency renames it, while scratch is built at paths derived from the layer
+    alone. Locking only the work directory left two runs pointed at one archive
+    and different scratch free to race the same SQLite file.
+
+    publish takes its own lock on the destination, but only for the minutes it
+    is renaming files.
+    """
+
+    def __init__(self, where: Path):
+        self.path = where / LOCK
 
     def __enter__(self):
         self.fd = os.open(self.path, os.O_WRONLY | os.O_CREAT, 0o644)
@@ -203,6 +219,33 @@ def nicely(cmd: list[str]) -> list[str]:
     return out + cmd
 
 
+def terminate(signum, frame) -> None:
+    raise Terminated(f"stopped by signal {signum}; scratch swept, nothing published")
+
+
+def duration(seconds: float) -> str:
+    minutes = round(seconds / 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    return f"{minutes // 60} h {minutes % 60} min"
+
+
+def peak_process_memory() -> int:
+    """The largest resident size any one finished process reached, in bytes.
+
+    Stands in for `/usr/bin/time`, which the build host does not have. Memory is
+    a binding constraint on that host and `strip-nodata` has had to be bounded
+    once already, so a regression should show up in the monthly log rather than
+    need a ten-hour rerun to find.
+
+    One process, not one step, and the distinction matters: strip and downscale
+    both fan out across a worker pool, so a step's real footprint is its parent
+    plus however many workers are resident at once. This number never sums them.
+    """
+    peak = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+    return peak if sys.platform == "darwin" else peak * 1024   # KiB elsewhere
+
+
 def run_step(cmd: list[str], what: str) -> None:
     full = nicely(cmd)
     print(f"  $ {' '.join(full)}", flush=True)
@@ -212,7 +255,12 @@ def run_step(cmd: list[str], what: str) -> None:
 
 
 def uv(script: str, *args: str) -> list[str]:
-    return ["uv", "run", str(REPO / script), *args]
+    # --locked: refuse to resolve. The inline dependency blocks carry no version
+    # bounds, so without a lockfile an unattended 01:00 run would silently take
+    # whatever pillow, numpy or scipy released since anyone last looked, and
+    # write the result into the served directory. A dependency change should be
+    # a commit someone read.
+    return ["uv", "run", "--locked", str(REPO / script), *args]
 
 
 def revision(m: dict[str, str]) -> int:
@@ -457,6 +505,21 @@ def check_space(work: Path, archives: list[Path]) -> None:
                      f"partway through a build")
 
 
+def directory(value: str) -> Path:
+    """Refuse an empty path before it silently becomes the current directory.
+
+    A variable the unit's environment file does not set expands to an empty
+    argument rather than being dropped, and `Path("")` resolves to the cwd --
+    a real directory, distinct from the other two, so every check in
+    `resolve_dirs` passes. A blank `--dest` publishes ten hours of work into
+    the clone and a blank `--work` sweeps it.
+    """
+    if not value.strip():
+        raise argparse.ArgumentTypeError(
+            "empty path: check that the environment file sets every directory")
+    return Path(value)
+
+
 def resolve_dirs(args: argparse.Namespace) -> str | None:
     """Absolute, distinct, and all three present. Returns a complaint or None.
 
@@ -480,11 +543,12 @@ def resolve_dirs(args: argparse.Namespace) -> str | None:
 def main() -> int:
     p = argparse.ArgumentParser(
         description="Refresh, reprocess and publish the Traficom raster sets")
-    p.add_argument("--archive", required=True, type=Path,
+    p.add_argument("--archive", required=True, type=directory,
                    help="the raw archives; refreshed in place, never published")
-    p.add_argument("--work", required=True, type=Path,
+    p.add_argument("--work", required=True, type=directory,
                    help="scratch for processed copies; same filesystem as --dest")
-    p.add_argument("--dest", required=True, type=Path, help="the served chart directory")
+    p.add_argument("--dest", required=True, type=directory,
+                   help="the served chart directory")
     p.add_argument("--layer", action="append", dest="only",
                    help="restrict the run to this WMTS layer (repeatable)")
     p.add_argument("--jobs", type=int, default=1,
@@ -524,8 +588,25 @@ def main() -> int:
     if args.dry_run:
         return dry_run(layers, found, args)
 
-    with exclusive(args.work):
-        return run(layers, found, args)
+    # The 24h TimeoutStartSec makes a SIGTERM mid-run a scheduled possibility
+    # rather than an accident, and Python's default handling exits without
+    # running a `finally` -- which is where every sweep of the multi-gigabyte
+    # scratch lives. The host has run out of disk before.
+    signal.signal(signal.SIGTERM, terminate)
+
+    try:
+        with exclusive(args.archive), exclusive(args.work):
+            return run(layers, found, args)
+    except Failed as exc:
+        # 2 is "did not run", which every other refusal in main() already
+        # returns. Letting this escape gave a traceback and exit 1 -- the code
+        # run() returns when a layer failed, so a refused month and a broken
+        # one were the same signal to whatever reads the exit status.
+        print(exc, file=sys.stderr)
+        return 2
+    except Terminated as exc:
+        print(exc, file=sys.stderr)
+        return 128 + signal.SIGTERM
 
 
 def dry_run(layers: list[Layer], found: dict[str, Path],
@@ -561,22 +642,35 @@ def run(layers: list[Layer], found: dict[str, Path],
         print(exc, file=sys.stderr)
         return 2
 
-    for layer in layers:
-        archive = found.get(layer.wmts)
-        print(f"\n=== {layer.wmts} ===", flush=True)
-        if archive is None:
-            failures.append((layer.wmts, "no archive file for this layer"))
-            print("  no archive file for this layer", file=sys.stderr)
-            continue
-        try:
-            out = build_layer(layer, archive, args.work, args.dest,
-                              max(1, args.jobs), args.force, args.skip_refresh)
-        except Exception as exc:
-            failures.append((layer.wmts, str(exc)))
-            print(f"  FAILED: {exc}", file=sys.stderr)
-            continue
-        if out is not None:
-            ready.append(out)
+    try:
+        for layer in layers:
+            archive = found.get(layer.wmts)
+            print(f"\n=== {layer.wmts} ===", flush=True)
+            if archive is None:
+                failures.append((layer.wmts, "no archive file for this layer"))
+                print("  no archive file for this layer", file=sys.stderr)
+                continue
+            began = time.monotonic()
+            try:
+                out = build_layer(layer, archive, args.work, args.dest,
+                                  max(1, args.jobs), args.force, args.skip_refresh)
+            except Exception as exc:
+                failures.append((layer.wmts, str(exc)))
+                print(f"  FAILED: {exc}", file=sys.stderr)
+                continue
+            finally:
+                # The sweep runs whether or not anything is rebuilt and is the
+                # long step, so a quiet month spends nearly all its hours in
+                # layers this line is the only account of.
+                print(f"  took {duration(time.monotonic() - began)}", flush=True)
+            if out is not None:
+                ready.append(out)
+    except Terminated:
+        # build_layer's own finally has swept the layer it was on; these are the
+        # finished sets waiting for publish, which nothing else will collect.
+        for f in ready:
+            f.unlink(missing_ok=True)
+        raise
 
     if ready:
         print(f"\n=== publishing {len(ready)} set(s) ===", flush=True)
@@ -591,9 +685,9 @@ def run(layers: list[Layer], found: dict[str, Path],
     else:
         print("\nnothing to publish")
 
-    mins = (time.monotonic() - started) / 60
-    print(f"\nrun finished in {mins:.0f} min: {len(ready)} processed, "
-          f"{len(failures)} failed")
+    print(f"\nrun finished in {duration(time.monotonic() - started)}: "
+          f"{len(ready)} processed, {len(failures)} failed")
+    print(f"peak memory in any one process: {peak_process_memory() / 2**20:.0f} MiB")
     for name, why in failures:
         print(f"  {name}: {why}", file=sys.stderr)
     return 1 if failures else 0

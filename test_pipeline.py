@@ -11,6 +11,7 @@ The steps themselves -- refresh, strip, downscale, publish -- have their own
 tests. Here they are subprocesses and stay that way.
 """
 
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -339,6 +340,16 @@ def only(steps, what):
     return next(cmd for w, cmd in steps if w == what)
 
 
+def step_input(cmd):
+    """The file a step reads: the first argument after the script it runs.
+
+    Found by shape rather than by index -- the uv invocation carries flags of
+    its own, and a test that counts positions breaks when one is added.
+    """
+    script = next(i for i, a in enumerate(cmd) if a.endswith(".py"))
+    return cmd[script + 1]
+
+
 def test_downscale_is_always_told_which_level_to_start_from(archive, work, steps):
     """Derived from recipe, not spelled out: the zoom process passes and the zoom
     why_run compares against have to be one number."""
@@ -592,6 +603,60 @@ def test_pointing_two_of_the_directories_at_one_place_is_refused(tmp_path, alias
     assert "same directory" in pipeline.resolve_dirs(args)
 
 
+@pytest.mark.parametrize("which", ["--archive", "--work", "--dest"])
+def test_an_empty_directory_argument_is_refused(cli, which):
+    """A variable the unit's environment file does not set arrives as an empty
+    argument, and Path("") is the cwd -- a real directory that passes every
+    check in resolve_dirs. Blank --dest publishes into the clone; blank --work
+    sweeps it."""
+    with pytest.raises(SystemExit) as exit:
+        cli(which, "")
+    assert exit.value.code == 2
+
+
+def test_a_terminated_run_sweeps_its_scratch_and_publishes_nothing(
+        cli, archive, work, dest, monkeypatch, capsys):
+    """TimeoutStartSec makes SIGTERM a scheduled possibility. Python's default
+    handling skips every `finally`, which is where the sweeps live, so the
+    multi-gigabyte scratch would sit until the next month's run."""
+    make_mbtiles(archive / "fi-satamakartat-2026-06-29.mbtiles",
+                 ARCHIVE_META | {"wmts_layer": "Satamakartat",
+                                 "source_updated": "2026-06-29"})
+
+    def fake(cmd, what):
+        if what == "publish":
+            pytest.fail("a terminated run must not publish")
+        if what == "downscale" and "satamakartat" in step_input(cmd):
+            raise pipeline.Terminated("stopped by signal 15")
+        if what in ("strip-nodata", "downscale"):
+            make_mbtiles(Path(cmd[cmd.index("--out") + 1]), PUBLISHED_META)
+
+    monkeypatch.setattr(pipeline, "run_step", fake)
+    before = sorted(p.name for p in dest.iterdir())
+    assert cli("--force", "--skip-refresh", "--layer", "Yleiskartat 250k public",
+               "--layer", "Satamakartat") == 143
+    # Yleiskartat finished and was waiting to publish; Satamakartat was mid-step
+    assert [p.name for p in work.iterdir()] == [pipeline.LOCK]
+    assert sorted(p.name for p in dest.iterdir()) == before
+    assert "stopped by signal 15" in capsys.readouterr().err
+
+
+def test_the_lock_covers_the_archive_as_well_as_the_work_directory(cli, archive):
+    """Refresh rewrites the archive in place and currency renames it. Two runs
+    with different --work would both acquire and race the same SQLite file."""
+    with pipeline.exclusive(archive):
+        assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 2
+
+
+def test_a_second_run_reports_the_refusal_rather_than_a_traceback(cli, work, capsys):
+    """Exit 2 is "did not run" everywhere else in main(). Letting Failed escape
+    gave exit 1 -- what run() returns when a layer broke -- so a refused month
+    and a broken one were one signal."""
+    with pipeline.exclusive(work):
+        assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 2
+    assert "refusing to run concurrently" in capsys.readouterr().err
+
+
 def test_a_missing_directory_is_named(tmp_path):
     import argparse
     (tmp_path / "a").mkdir()
@@ -637,16 +702,16 @@ def test_one_failing_layer_does_not_stop_the_others(cli, monkeypatch, archive, d
 
     def fake(cmd, what):
         if what == "strip-nodata":
-            attempted.append(cmd[3])
-            if "yleiskartat" in cmd[3]:
+            attempted.append(step_input(cmd))
+            if "yleiskartat" in step_input(cmd):
                 raise Failed("strip-nodata exited 1")
             make_mbtiles(Path(cmd[cmd.index("--out") + 1]), PUBLISHED_META)
         if what == "downscale":
             # Satamakartat is not stripped, so downscale reads the archive and
             # the result carries no strip stamp
-            stripped = ".stripped." in cmd[3]
+            stripped = ".stripped." in step_input(cmd)
             if not stripped:
-                attempted.append(cmd[3])
+                attempted.append(step_input(cmd))
             zoom = cmd[cmd.index("--source-zoom") + 1]
             m = PUBLISHED_META | {"wmts_layer": "Satamakartat",
                                   "source_updated": "2026-06-29",
@@ -731,3 +796,134 @@ def test_the_missing_tool_warning_is_not_repeated_every_step(monkeypatch, capsys
     capsys.readouterr()
     pipeline.nicely(["x"])
     assert capsys.readouterr().err == ""
+
+
+# --- a run log someone can read a month later ---------------------------------
+
+def test_a_long_run_reads_in_hours_rather_than_hundreds_of_minutes():
+    assert pipeline.duration(10.5 * 3600) == "10 h 30 min"
+
+
+def test_a_run_under_an_hour_stays_in_minutes():
+    assert pipeline.duration(5 * 60) == "5 min"
+
+
+def test_the_hour_boundary_does_not_read_as_zero_minutes():
+    assert pipeline.duration(3600) == "1 h 0 min"
+
+
+def test_a_run_that_rounds_up_to_the_hour_never_reads_as_sixty_minutes():
+    """Branching on the seconds rather than on the rounded minutes puts the
+    boundary in the wrong place, and 3599 s prints as `60 min`."""
+    assert pipeline.duration(3599) == "1 h 0 min"
+
+
+def test_each_layer_is_timed_from_its_own_start_not_the_run_s(
+        cli, archive, dest, monkeypatch, capsys):
+    """Timing every layer from the whole run's start would read as plausible
+    increasing numbers -- 9 h, 9 h 30, 9 h 45 -- and hide which layer is slow,
+    which is the only question a ten-hour log gets asked."""
+    satama = ARCHIVE_META | {"wmts_layer": "Satamakartat",
+                             "source_updated": "2026-06-29"}
+    make_mbtiles(archive / "fi-satamakartat-2026-06-29.mbtiles", satama)
+    # published too, so both layers skip and the run's exit code stays readable
+    published = PUBLISHED_META | satama
+    published.pop("nodata_stripped")
+    make_mbtiles(dest / "fi-satamakartat-2026-06-29.mbtiles", published)
+    ticks = iter([0,                                  # run start
+                  100, 100 + 9 * 3600,                # Yleiskartat start, end
+                  100 + 9 * 3600, 100 + 12 * 3600,    # Satamakartat start, end
+                  100 + 12 * 3600])                   # run end
+    monkeypatch.setattr(pipeline.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(pipeline, "run_step", lambda *a: None)
+    assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public",
+               "--layer", "Satamakartat") == 0
+    logged = {}
+    for chunk in capsys.readouterr().out.split("\n=== ")[1:]:
+        name, _, body = chunk.partition(" ===\n")
+        logged[name] = body
+    assert "took 9 h 0 min" in logged["Yleiskartat 250k public"]
+    assert "took 3 h 0 min" in logged["Satamakartat"]
+
+
+def test_a_failed_layer_is_still_timed(cli, monkeypatch, capsys):
+    def fake(cmd, what):
+        if what == "strip-nodata":
+            raise Failed("strip-nodata exited 1")
+
+    monkeypatch.setattr(pipeline, "run_step", fake)
+    assert cli("--force", "--skip-refresh", "--layer", "Yleiskartat 250k public") == 1
+    assert "took 0 min" in capsys.readouterr().out.split("=== Yleiskartat")[1]
+
+
+def test_the_run_reports_the_peak_memory_of_its_steps(cli, monkeypatch, capsys):
+    monkeypatch.setattr(pipeline, "peak_process_memory", lambda: 412 * 1024 * 1024)
+    monkeypatch.setattr(pipeline, "run_step", lambda *a: None)
+    assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 0
+    assert "412 MiB" in capsys.readouterr().out
+
+
+def test_peak_memory_measures_the_steps_and_not_the_pipeline_itself(monkeypatch):
+    """RUSAGE_SELF would report this process -- tens of MiB, never the multi-GB
+    peak of a strip -- and the whole point is to catch a step's regression."""
+    seen = []
+
+    class Usage:
+        ru_maxrss = 4096
+
+    monkeypatch.setattr(pipeline.resource, "getrusage",
+                        lambda who: (seen.append(who), Usage())[1])
+    pipeline.peak_process_memory()
+    assert seen == [pipeline.resource.RUSAGE_CHILDREN]
+
+
+def test_peak_memory_reads_the_units_of_the_host_it_runs_on(monkeypatch):
+    """ru_maxrss is KiB on Linux and bytes on macOS. Production is Linux and the
+    tests run on both, so the wrong assumption is off by 1024 where nobody looks."""
+    class Usage:
+        ru_maxrss = 4096
+
+    monkeypatch.setattr(pipeline.resource, "getrusage", lambda who: Usage())
+    monkeypatch.setattr(pipeline.sys, "platform", "linux")
+    assert pipeline.peak_process_memory() == 4096 * 1024
+    monkeypatch.setattr(pipeline.sys, "platform", "darwin")
+    assert pipeline.peak_process_memory() == 4096
+
+
+# --- the timer has to invoke a command this repo actually has ------------------
+
+def unit_text(name: str) -> str:
+    return (pipeline.REPO / "systemd" / name).read_text()
+
+
+def test_the_service_passes_only_variables_the_example_env_file_sets():
+    """The two files are coupled by hand across a directory boundary. Rename one
+    and the timer's next fire passes an empty path, a month later."""
+    exec_line = next(l for l in unit_text("fi-nautical-charts.service").splitlines()
+                     if l.startswith("ExecStart="))
+    used = set(re.findall(r'\$([A-Z_]+)', exec_line))
+    defined = set(re.findall(r'^([A-Z_]+)=',
+                             unit_text("fi-nautical-charts.env.example"), re.M))
+    assert used == defined
+
+
+def test_the_timer_names_a_service_file_that_exists():
+    unit = re.search(r'^Unit=(\S+)$', unit_text("fi-nautical-charts.timer"),
+                     re.M).group(1)
+    assert (pipeline.REPO / "systemd" / unit).exists()
+
+
+def test_the_service_runs_a_command_the_run_script_defines():
+    exec_line = next(l for l in unit_text("fi-nautical-charts.service").splitlines()
+                     if l.startswith("ExecStart="))
+    target = re.search(r'/run"?\s+([a-z][\w-]*)', exec_line).group(1)
+    assert re.search(rf'^function {target} ',
+                     (pipeline.REPO / "run").read_text(), re.M)
+
+
+def test_the_service_passes_only_flags_the_pipeline_accepts():
+    exec_line = next(l for l in unit_text("fi-nautical-charts.service").splitlines()
+                     if l.startswith("ExecStart="))
+    source = (pipeline.REPO / "pipeline.py").read_text()
+    for flag in re.findall(r'--[a-z-]+', exec_line):
+        assert f'"{flag}"' in source, f"{flag} is not an argument pipeline.py adds"

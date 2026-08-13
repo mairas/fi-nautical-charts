@@ -702,5 +702,75 @@ scratch at paths derived from the layer alone, so a second run would delete the
 first one's partials. Scratch from an earlier run is swept at startup rather
 than trusted to a `finally` a `kill -9` never reaches.
 
+Each layer reports how long it took, whether or not it rebuilt anything — the
+sweep runs either way and is the long step, so a quiet month spends nearly all
+its hours in layers that produced nothing else to log. The run ends with the
+peak resident size any one step reached, which stands in for `/usr/bin/time`;
+the build host does not have it, memory is a binding constraint there, and a
+regression that only shows under a full archive is not something to go looking
+for twice.
+
+## Scheduling it with systemd
+
+`systemd/` holds a user timer and service. They are user units because `uv`
+installs user-scoped and the archives live in the user's home: nothing here
+needs root. Every path is host-specific and stays out of the repository, in an
+environment file the unit reads.
+
+```bash
+cp systemd/fi-nautical-charts.env.example ~/.config/fi-nautical-charts.env
+$EDITOR ~/.config/fi-nautical-charts.env        # the four directories
+
+systemctl --user link "$PWD/systemd/fi-nautical-charts.service"
+systemctl --user link "$PWD/systemd/fi-nautical-charts.timer"
+systemctl --user enable --now fi-nautical-charts.timer
+loginctl enable-linger "$USER"
+```
+
+`link` rather than `cp`: the clone stays the running copy, so a fix committed
+here reaches the host with a `git pull` and a `daemon-reload` instead of
+diverging from a copy nobody remembers making. The clone has to stay where it
+is — moving it breaks the symlinks.
+
+**`enable-linger` is not optional.** Without it a user manager exists only while
+the user has a session, so the timer stops firing at logout and starts again at
+the next login — the whole job quietly not running, which is the one failure
+this schedule cannot show you. It is also why watching for that belongs outside
+the pipeline: a job that has stopped running cannot report that it has.
+
+Check what you got:
+
+```bash
+systemctl --user list-timers fi-nautical-charts.timer    # next elapse, and LEFT
+journalctl --user -u fi-nautical-charts.service -f       # follow a live run
+```
+
+Read `list-timers` straight after enabling, not the service's status.
+`Persistent=true` makes a timer catch up on a run it missed while the host was
+off, and whether that counts a never-yet-run timer as missed depends on the
+systemd version — so confirm you have not just scheduled a ten-hour job into the
+middle of the afternoon. `status` cannot answer that: `RandomizedDelaySec` also
+applies to a catch-up, so the service reads inactive for up to an hour while a
+run is already pending.
+
+The service runs the pipeline exactly as the command above does, so anything
+you can pass by hand you can add to `ExecStart`, and a manual `systemctl --user
+start fi-nautical-charts.service` is a real run under the same limits as the
+scheduled one. A second run is refused with exit 2 rather than starting: the
+lock covers the archive and the work directory for the whole ten hours.
+
+Every step runs `uv run --locked`, so a scheduled run resolves nothing. The
+inline dependency blocks carry no version bounds, and an unattended 01:00 job
+that writes to the served directory should not be taking whatever pillow or
+numpy released last week. `./run relock` is how a dependency moves, and it
+moves as a commit someone read.
+
+Nothing here notifies anyone. A run that fails a step exits non-zero, names the
+layer and leaves the published set untouched — but it does not reach a phone,
+and it is not the only way a month can go wrong: a refresh in which every
+request failed still exits 0 and reads as a quiet month
+([#36](https://github.com/mairas/fi-nautical-charts/issues/36)). Alerting is
+handled by the monitoring stack, outside this repository.
+
 Python tools run via [uv](https://docs.astral.sh/uv/) with PEP 723 inline
 dependencies — no manual environment setup. `./run test` runs the suite.
