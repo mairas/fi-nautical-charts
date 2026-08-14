@@ -136,8 +136,9 @@ function test {
   # Named explicitly: a bare pytest collects the whole tree, including scratch
   # files and _local/, so a stray test elsewhere would fail the suite.
   uv run --with 'pytest>=8,<9' --with pillow --with numpy --with scipy \
+    --with requests \
     pytest test_publish.py test_index_page.py test_strip_nodata.py \
-    test_downscale.py test_pipeline.py "$@"
+    test_downscale.py test_pipeline.py test_traficom_dl.py "$@"
 }
 
 function deps {

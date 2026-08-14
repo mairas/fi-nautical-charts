@@ -690,6 +690,14 @@ def refresh(con, args, src, limits, bbox, zooms):
                 cur = con.execute("DELETE FROM tiles WHERE zoom_level=? AND "
                                   "tile_column=? AND tile_row=?", (z, x, row))
                 removed += cur.rowcount
+            elif status == "notmodified":
+                # The answer this pass asks for. `fetch` narrows blank and
+                # outside to "empty" and passes this one through untouched, so
+                # without a branch of its own it falls to the failure case
+                # below -- and in a month where nothing was reseded, that is
+                # every tile: a sweep that worked perfectly reports total
+                # failure, and the watermark it should have advanced stays put.
+                pass
             else:
                 # a tile whose new edition failed to transfer: recorded so
                 # --repair can replay it, and counted so the watermark below
