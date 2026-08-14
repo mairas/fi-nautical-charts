@@ -751,6 +751,15 @@ instead of the tenth hour.
 
 The archive is a separate mount, because nothing is ever renamed across it.
 
+**The container gets the whole of that parent, so give the two a parent of their
+own.** The mount is the directory they share, whatever else is in it: work and
+published dropped straight into an existing data directory hand the container
+read-write access to everything else in there. That is the layout an existing
+host falls into, since the served directory is usually already somewhere, and
+nothing in the unit can tell the difference. A directory holding only the
+archive, the work directory and the published one keeps the grant the size of
+the job.
+
 The container runs as whoever owns the unit, so published files land with the
 same ownership they had when the pipeline ran on the host directly: readable by
 the web server, and the archive still writable by the next run.
