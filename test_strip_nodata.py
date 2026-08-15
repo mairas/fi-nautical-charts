@@ -715,15 +715,18 @@ def test_a_stroke_abutting_the_fill_keeps_its_far_end(tmp_path):
 
 
 def test_a_strip_that_empties_the_deepest_level_refuses(tmp_path):
-    """What happens to Yleiskartat. Its archive grew a z14 of 9,972 blank tiles,
-    the blank pass dropped every one, and the levels below were then deleted for
-    a downscale that had nothing left to rebuild them from. The file that
-    reached downscale held no tiles at all, and the message three steps later
-    was `no tiles`.
+    """A deepest level of blank tiles is dropped whole, and the levels below it
+    are deleted for a downscale that rebuilds them from there -- from nothing.
+    What reaches downscale then holds no tiles at all, and the only complaint
+    comes from downscale, three steps past the level that caused it.
 
-    Refusing here keeps the pyramid and names the level that emptied. It is not
-    the coverage floor in `pipeline`, which cannot see this: that is checked
-    after downscale, and downscale is what fails first.
+    So the refusal happens here, before anything is deleted, and it names the
+    level. `pipeline`'s coverage floor cannot stand in for it: that is measured
+    after downscale.
+
+    Three things have to hold, and the staged file is the one a regression drops
+    silently -- it is multi-gigabyte on a real archive, and the run that would
+    have deleted it is the run that just failed.
     """
     src = tmp_path / "src.mbtiles"
     build(src, {(0, 0): "content", (1, 0): "content"}, z=Z - 1)
@@ -735,6 +738,7 @@ def test_a_strip_that_empties_the_deepest_level_refuses(tmp_path):
 
     assert f"z{Z}" in str(exit.value)
     assert not out.exists()
+    assert not out.with_suffix(out.suffix + ".partial").exists()
     con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
     assert con.execute("SELECT count(*) FROM tiles WHERE zoom_level=?",
                        (Z - 1,)).fetchone()[0] == 2

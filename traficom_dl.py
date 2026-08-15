@@ -675,12 +675,10 @@ def refresh(con, args, src, limits, bbox, zooms):
     for z in zooms:
         # The tiles the archive already holds, not the download's descent. The
         # descent asks for the children of everything stored, which is one level
-        # deeper than the archive has -- and Traficom answers past a layer's real
+        # deeper than the archive has, and Traficom answers past a layer's real
         # detail with near-blank tiles rather than 404. Those pass the blank test
-        # here and fail the strip's, so the archive grows a level that looks like
-        # a chart until something processes it and drops all of it. Yleiskartat
-        # gained 9,972 such tiles at a z14 it does not have, and could not be
-        # built again afterwards.
+        # here and fail the strip's, so a refresh built on the descent deepens
+        # the archive by a level that empties the set when it is processed.
         cands = sorted(data_tiles_at(con, z))
         if bbox:
             cmin, cmax, rmin, rmax = clamped_bounds(limits[z], bbox, z)

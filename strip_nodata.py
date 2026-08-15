@@ -772,12 +772,12 @@ def run(src: Path, out: Path, jobs: int, stages=DEFAULT_STAGES,
     # `pyramid_pending` carries the floor downscale is to rebuild to, and
     # downscale clears it. Publish refuses anything still carrying it.
     # Checked before the levels below are deleted, because deleting them is what
-    # makes this unrecoverable. An emptied deepest level means its tiles were not
-    # chart at all -- Yleiskartat's archive grew a z14 of blank tiles the layer
-    # does not have -- and dropping the pyramid so downscale can rebuild it from
-    # nothing produces a file with no tiles, which is what the next step reports,
-    # three steps away from the cause. `pipeline`'s coverage floor cannot catch
-    # it either: that is measured after downscale, and downscale fails first.
+    # makes an empty deepest level unrecoverable: downscale rebuilds them from
+    # here, and here has nothing. An archive that reaches this holds a deepest
+    # level that is not chart at all, which is a fault in the archive rather than
+    # anything the strip can repair. `pipeline`'s coverage floor cannot stand in
+    # for this -- it is measured after downscale, and downscale fails first, on a
+    # file with no tiles and three steps from the cause.
     if not con.execute("SELECT count(*) FROM tiles WHERE zoom_level=?",
                        (deep,)).fetchone()[0]:
         con.close()
