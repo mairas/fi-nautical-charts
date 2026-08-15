@@ -712,3 +712,33 @@ def test_a_stroke_abutting_the_fill_keeps_its_far_end(tmp_path):
 
 
 
+
+
+def test_a_strip_that_empties_the_deepest_level_refuses(tmp_path):
+    """A deepest level of blank tiles is dropped whole, and the levels below it
+    are deleted for a downscale that rebuilds them from there -- from nothing.
+    What reaches downscale then holds no tiles at all, and the only complaint
+    comes from downscale, three steps past the level that caused it.
+
+    So the refusal happens here, before anything is deleted, and it names the
+    level. `pipeline`'s coverage floor cannot stand in for it: that is measured
+    after downscale.
+
+    Three things have to hold, and the staged file is the one a regression drops
+    silently -- it is multi-gigabyte on a real archive, and the run that would
+    have deleted it is the run that just failed.
+    """
+    src = tmp_path / "src.mbtiles"
+    build(src, {(0, 0): "content", (1, 0): "content"}, z=Z - 1)
+    build(src, {(0, 0): "blank", (1, 0): "blank"}, z=Z)
+    out = tmp_path / "out.mbtiles"
+
+    with pytest.raises(SystemExit) as exit:
+        sn.run(src, out, jobs=1, stages=("white-tiles",))
+
+    assert f"z{Z}" in str(exit.value)
+    assert not out.exists()
+    assert not out.with_suffix(out.suffix + ".partial").exists()
+    con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    assert con.execute("SELECT count(*) FROM tiles WHERE zoom_level=?",
+                       (Z - 1,)).fetchone()[0] == 2

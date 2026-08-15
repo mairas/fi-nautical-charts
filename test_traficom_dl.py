@@ -45,18 +45,44 @@ def archive(tmp_path):
 def run_refresh(monkeypatch, con, answers, z=8):
     """Drive one zoom of refresh with the server's answers decided by the test.
 
-    Both seams are the module's own: `gen_candidates` decides which tiles get
-    asked about and `fetch` is the one call site that asks. Nothing reaches the
-    network, and the loop under test is the real one.
+    `fetch` is the module's one call site for asking the server anything, and it
+    is the only seam stubbed here: which tiles get asked about is what refresh
+    decides, so a test that supplied the candidates too could not see it decide
+    wrongly. Nothing reaches the network, and the loop under test is the real
+    one.
     """
-    tiles = sorted(answers)
-    monkeypatch.setattr(traficom_dl, "gen_candidates",
-                        lambda *a, **k: (tiles, None))
     monkeypatch.setattr(traficom_dl, "fetch",
                         lambda src, z, x, y, ims=None: (x, y, answers[(x, y)], b"new"))
     args = argparse.Namespace(mode="full", full_until=None, concurrency=1)
     src = traficom_dl.parse_source("wmts", "Yleiskartat 250k public")
+    # No limits: a refresh reads them only to clamp a --bbox, and asking for the
+    # real ones fetches GetCapabilities over the network from every test.
     return traficom_dl.refresh(con, args, src, limits=None, bbox=None, zooms=[z])
+
+
+def test_a_refresh_asks_only_about_tiles_the_archive_holds(monkeypatch, archive):
+    """Refresh re-checks coverage. New chart areas, and new zoom levels, are a
+    fresh download's business.
+
+    The download's descent asks for the children of every stored tile, which is
+    one level past whatever the archive has. Traficom answers past a layer's
+    real detail with near-blank tiles rather than 404, and those pass this
+    module's blank test while failing the strip's -- so a refresh built on the
+    descent grows a level that empties the whole set when it is processed.
+    """
+    con = make_archive(archive, [(8, 147, 73), (8, 148, 73)])
+    asked = []
+
+    def fetch(src, z, x, y, ims=None):
+        asked.append((z, x, y))
+        return (x, y, "notmodified", b"")
+
+    monkeypatch.setattr(traficom_dl, "fetch", fetch)
+    src = traficom_dl.parse_source("wmts", "Yleiskartat 250k public")
+    args = argparse.Namespace(mode="full", full_until=None, concurrency=1)
+    traficom_dl.refresh(con, args, src, limits=None, bbox=None, zooms=[8, 9])
+
+    assert sorted(asked) == [(8, 147, 73), (8, 148, 73)]
 
 
 def test_an_unchanged_tile_is_not_a_failure(monkeypatch, archive):
@@ -136,3 +162,27 @@ def test_a_withdrawn_tile_is_removed(monkeypatch, archive):
     assert counts["removed"] == 1 and counts["errors"] == 0
     con = sqlite3.connect(archive)
     assert con.execute("SELECT count(*) FROM tiles").fetchone()[0] == 0
+
+
+def test_a_bbox_still_narrows_a_refresh(monkeypatch, archive):
+    """`--bbox` selects an area to re-check. The candidates come from the
+    archive now rather than from a generated rectangle, and the clamp has to
+    survive that move: a flag that selects nothing and says nothing is worse
+    than one that is refused."""
+    con = make_archive(archive, [(8, 147, 73), (8, 200, 73)])
+    asked = []
+
+    def fetch(src, z, x, y, ims=None):
+        asked.append((x, y))
+        return (x, y, "notmodified", b"")
+
+    monkeypatch.setattr(traficom_dl, "fetch", fetch)
+    src = traficom_dl.parse_source("wmts", "Yleiskartat 250k public")
+    args = argparse.Namespace(mode="full", full_until=None, concurrency=1)
+    # exactly the ground under tile (147, 73)
+    bbox = (traficom_dl.x2lon(147, 8), traficom_dl.y2lat(74, 8),
+            traficom_dl.x2lon(148, 8), traficom_dl.y2lat(73, 8))
+    traficom_dl.refresh(con, args, src, limits={8: (0, 255, 0, 255)},
+                        bbox=bbox, zooms=[8])
+
+    assert asked == [(147, 73)]
