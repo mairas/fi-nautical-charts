@@ -23,10 +23,13 @@ Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Nice=19
 IOSchedulingClass=idle
 
-# A full conditional sweep is nine to ten hours and the processing adds to it.
+# The first full run measured 24h and had one of four layers still to go, so
+# the whole month is roughly a day and a half of refresh plus reprocessing.
 # Finite rather than infinity: a wedged run should be killed long before the
-# next month's would start, and a run this long has no other upper bound.
-TimeoutStartSec=24h
+# next month's would start, and a run this long has no other upper bound. What
+# a short timeout costs is no longer the whole month -- each layer publishes as
+# it finishes -- but the layers at the end of the list, every month.
+TimeoutStartSec=72h
 
 # On the way down the container gets SIGTERM and then deletes whatever
 # multi-gigabyte scratch it had built, which is the one thing that must not be
