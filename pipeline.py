@@ -717,14 +717,19 @@ def run(layers: list[Layer], found: dict[str, Path],
     failures: list[tuple[str, str]] = []
     started = time.monotonic()
 
-    sweep_stale(args.work)
     try:
-        check_space(args.work, [found[l.wmts] for l in layers if l.wmts in found])
-    except Failed as exc:
-        print(exc, file=sys.stderr)
-        return 2
+        # Inside the reporting `finally` below, not before it: the sweep deletes
+        # a killed run's scratch and has taken minutes at 14 GB, so a signal
+        # arrives during it often enough that the run which did least would
+        # otherwise be the one run that says nothing about itself.
+        sweep_stale(args.work)
+        try:
+            check_space(args.work,
+                        [found[l.wmts] for l in layers if l.wmts in found])
+        except Failed as exc:
+            print(exc, file=sys.stderr)
+            return 2
 
-    try:
         for layer in layers:
             archive = found.get(layer.wmts)
             print(f"\n=== {layer.wmts} ===", flush=True)

@@ -695,10 +695,11 @@ all.
 
 A layer that fails stops there and the rest carry on; the exit status is
 non-zero. Each layer is published as soon as it is built, rather than all of
-them together at the end. A full month is a day and a half of work and
-`TimeoutStartSec` will end some of them, so a run holding its finished sets back
-would publish nothing at all whenever it was killed — and the layer at the end
-of the list would be the one that never landed, the same one every month. Within
+them together at the end. A full month is a day and a half of work — long enough
+that a reboot, a wedged step, or `TimeoutStartSec` at 72h can cut a run short,
+and a run holding its finished sets back until the end then publishes nothing at
+all. The layer last in the list would be the one that never landed, the same one
+every month. Within
 a layer the guarantee is unchanged: nothing is renamed in the destination until
 that set has been staged and verified, so a refusal leaves the published set
 exactly as it was, while a failure *during* the renames reports
@@ -750,10 +751,10 @@ host that built it rather than the month on the host that runs it.
 **The work and published directories must sit side by side inside one bind
 mount.** Publishing renames from the first into the second, and `rename(2)`
 refuses to cross a mount point even when both sides are the same filesystem: two
-`--volume` flags fail with `EXDEV` at the last step of a ten-hour run. The unit
-mounts the parent the two share, and the pipeline tries the rename for real
-before it starts — a layout that cannot publish fails in the first second
-instead of the tenth hour.
+`--volume` flags fail with `EXDEV` the first time a layer is published, hours
+in. The unit mounts the parent the two share, and the pipeline tries the rename
+for real before it starts — a layout that cannot publish fails in the first
+second instead of after the first layer.
 
 The archive is a separate mount, because nothing is ever renamed across it.
 
@@ -820,8 +821,8 @@ journalctl --user -u fi-nautical-charts.service -f       # follow a live run
 Read `list-timers` straight after enabling, not the service's status.
 `Persistent=true` makes a timer catch up on a run it missed while the host was
 off, and whether that counts a never-yet-run timer as missed depends on the
-systemd version — so confirm you have not just scheduled a ten-hour job into the
-middle of the afternoon. `status` cannot answer that: `RandomizedDelaySec` also
+systemd version — so confirm you have not just scheduled a day-and-a-half job
+into the middle of the afternoon. `status` cannot answer that: `RandomizedDelaySec` also
 applies to a catch-up, so the service reads inactive for up to an hour while a
 run is already pending.
 

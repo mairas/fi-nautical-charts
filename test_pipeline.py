@@ -652,6 +652,20 @@ def test_a_terminated_run_keeps_the_layers_it_already_published(
     assert "1 published" in out.out
 
 
+def test_a_signal_during_the_startup_sweep_is_still_accounted_for(
+        cli, monkeypatch, capsys):
+    """The sweep deletes a killed run's scratch and has taken minutes at 14 GB,
+    so a signal lands in it often enough to matter. It runs before the layer
+    loop, so a summary printed only around that loop leaves the run that did
+    least the one run that says nothing about itself."""
+    def swept(_):
+        raise pipeline.Terminated("stopped by signal 15")
+
+    monkeypatch.setattr(pipeline, "sweep_stale", swept)
+    assert cli("--skip-refresh", "--layer", "Yleiskartat 250k public") == 143
+    assert "0 published" in capsys.readouterr().out
+
+
 def test_the_lock_covers_the_archive_as_well_as_the_work_directory(cli, archive):
     """Refresh rewrites the archive in place and currency renames it. Two runs
     with different --work would both acquire and race the same SQLite file."""
@@ -792,9 +806,12 @@ def test_each_layer_publishes_as_it_finishes(cli, monkeypatch, archive):
     make_mbtiles(archive / "fi-satamakartat-2026-06-29.mbtiles",
                  ARCHIVE_META | {"wmts_layer": "Satamakartat",
                                  "source_updated": "2026-06-29"})
-    published = []
+    published, trace = [], []
 
     def fake(cmd, what):
+        src = step_input(cmd)
+        trace.append((what, "satamakartat" if "satamakartat" in src
+                      else "yleiskartat250k"))
         if what == "publish":
             published.append([a for a in cmd if a.endswith(".mbtiles")])
             return
@@ -817,8 +834,12 @@ def test_each_layer_publishes_as_it_finishes(cli, monkeypatch, archive):
                "--layer", "Satamakartat") == 0
     assert len(published) == 2, "the sets were held back for one publish at the end"
     assert all(len(call) == 1 for call in published), published
-    assert "yleiskartat250k" in published[0][0]
-    assert "satamakartat" in published[1][0]
+    # Interleaving, not just one call per set: a loop over the finished files
+    # placed after the layer loop also publishes each of them separately, in
+    # this order, and still loses every one of them to a signal.
+    began_second = next(i for i, (_, layer) in enumerate(trace)
+                        if layer == "satamakartat")
+    assert ("publish", "yleiskartat250k") in trace[:began_second], trace
 
 
 def test_one_failing_layer_does_not_stop_the_others(cli, monkeypatch, archive, dest):
