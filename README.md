@@ -694,14 +694,20 @@ measured against the archive it just gutted the loss would read as no loss at
 all.
 
 A layer that fails stops there and the rest carry on; the exit status is
-non-zero. Nothing is renamed in the destination until every processed set has
-been staged and verified, so a refusal leaves the published set exactly as it
-was — but a failure *during* the renames reports `DESTINATION CHANGED` and wants
-a look, as the publishing section above describes.
+non-zero. Each layer is published as soon as it is built, rather than all of
+them together at the end. A full month is a day and a half of work and
+`TimeoutStartSec` will end some of them, so a run holding its finished sets back
+would publish nothing at all whenever it was killed — and the layer at the end
+of the list would be the one that never landed, the same one every month. Within
+a layer the guarantee is unchanged: nothing is renamed in the destination until
+that set has been staged and verified, so a refusal leaves the published set
+exactly as it was, while a failure *during* the renames reports
+`DESTINATION CHANGED` and wants a look, as the publishing section above
+describes.
 
 One run at a time: the whole run holds an exclusive lock on the work directory.
 `publish` takes its own lock on the destination, but only for the minutes it is
-renaming; the ten hours before that refresh the archive in place and build
+renaming; the hours around each of those refresh the archive in place and build
 scratch at paths derived from the layer alone, so a second run would delete the
 first one's partials. Scratch from an earlier run is swept at startup rather
 than trusted to a `finally` a `kill -9` never reaches.
@@ -824,7 +830,7 @@ so anything you can pass by hand you can add to `ExecStart` after the image
 name, and a manual `systemctl --user start fi-nautical-charts.service` is a real
 run under the same limits as the scheduled one. A second run is refused with
 exit 2 rather than starting: the lock covers the archive and the work directory
-for the whole ten hours.
+for the whole run, which the first full month measured at over a day.
 
 `Nice=` and `IOSchedulingClass=` in the unit reach the docker client and stop
 there — the container runs in a sibling cgroup under the daemon, not as a child

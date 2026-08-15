@@ -620,31 +620,36 @@ def test_an_empty_directory_argument_is_refused(cli, which):
     assert exit.value.code == 2
 
 
-def test_a_terminated_run_sweeps_its_scratch_and_publishes_nothing(
-        cli, archive, work, dest, monkeypatch, capsys):
-    """TimeoutStartSec makes SIGTERM a scheduled possibility. Python's default
-    handling skips every `finally`, which is where the sweeps live, so the
-    multi-gigabyte scratch would sit until the next month's run."""
+def test_a_terminated_run_keeps_the_layers_it_already_published(
+        cli, archive, work, monkeypatch, capsys):
+    """TimeoutStartSec makes SIGTERM a scheduled event rather than an accident,
+    and Python's default handling skips every `finally` -- which is where the
+    sweeps live. The layer the signal lands on leaves no scratch and publishes
+    nothing; the layers behind it keep what they already put in place."""
     make_mbtiles(archive / "fi-satamakartat-2026-06-29.mbtiles",
                  ARCHIVE_META | {"wmts_layer": "Satamakartat",
                                  "source_updated": "2026-06-29"})
+    published = []
 
     def fake(cmd, what):
         if what == "publish":
-            pytest.fail("a terminated run must not publish")
+            published.append(step_input(cmd))
+            return
         if what == "downscale" and "satamakartat" in step_input(cmd):
             raise pipeline.Terminated("stopped by signal 15")
         if what in ("strip-nodata", "downscale"):
             make_mbtiles(Path(cmd[cmd.index("--out") + 1]), PUBLISHED_META)
 
     monkeypatch.setattr(pipeline, "run_step", fake)
-    before = sorted(p.name for p in dest.iterdir())
     assert cli("--force", "--skip-refresh", "--layer", "Yleiskartat 250k public",
                "--layer", "Satamakartat") == 143
-    # Yleiskartat finished and was waiting to publish; Satamakartat was mid-step
+    assert [Path(p).name.split("-")[1] for p in published] == ["yleiskartat250k"]
     assert [p.name for p in work.iterdir()] == [pipeline.LOCK]
-    assert sorted(p.name for p in dest.iterdir()) == before
-    assert "stopped by signal 15" in capsys.readouterr().err
+    out = capsys.readouterr()
+    assert "stopped by signal 15" in out.err
+    # The summary is the only account of what a killed run did land, and a
+    # killed run is now the ordinary way a long month ends.
+    assert "1 published" in out.out
 
 
 def test_the_lock_covers_the_archive_as_well_as_the_work_directory(cli, archive):
@@ -777,6 +782,43 @@ def test_dry_run_touches_nothing_and_runs_no_steps(cli, monkeypatch, work, archi
 def test_dry_run_reports_a_missing_archive_in_its_exit_status(cli, monkeypatch):
     monkeypatch.setattr(pipeline, "run_step", lambda *a: None)
     assert cli("--dry-run", "--layer", "Satamakartat") == 1
+
+
+def test_each_layer_publishes_as_it_finishes(cli, monkeypatch, archive):
+    """One publish after the loop means a run that does not reach the end
+    publishes nothing, however many layers it finished. The run is long enough
+    that systemd killing it is a scheduled event, and the layer that is last is
+    then the one that never lands -- the same one, every month."""
+    make_mbtiles(archive / "fi-satamakartat-2026-06-29.mbtiles",
+                 ARCHIVE_META | {"wmts_layer": "Satamakartat",
+                                 "source_updated": "2026-06-29"})
+    published = []
+
+    def fake(cmd, what):
+        if what == "publish":
+            published.append([a for a in cmd if a.endswith(".mbtiles")])
+            return
+        if what == "strip-nodata":
+            make_mbtiles(Path(cmd[cmd.index("--out") + 1]), PUBLISHED_META)
+        if what == "downscale":
+            # Satamakartat is not stripped, so downscale reads the archive and
+            # the result carries no strip stamp
+            stripped = ".stripped." in step_input(cmd)
+            m = PUBLISHED_META | {
+                "downscale_source_zoom": cmd[cmd.index("--source-zoom") + 1]}
+            if not stripped:
+                m = m | {"wmts_layer": "Satamakartat",
+                         "source_updated": "2026-06-29"}
+                m.pop("nodata_stripped", None)
+            make_mbtiles(Path(cmd[cmd.index("--out") + 1]), m)
+
+    monkeypatch.setattr(pipeline, "run_step", fake)
+    assert cli("--force", "--skip-refresh", "--layer", "Yleiskartat 250k public",
+               "--layer", "Satamakartat") == 0
+    assert len(published) == 2, "the sets were held back for one publish at the end"
+    assert all(len(call) == 1 for call in published), published
+    assert "yleiskartat250k" in published[0][0]
+    assert "satamakartat" in published[1][0]
 
 
 def test_one_failing_layer_does_not_stop_the_others(cli, monkeypatch, archive, dest):
