@@ -155,19 +155,24 @@ def test_labelling_twice_changes_nothing(tmp_path):
     nothing, so this has to be a function of the recorded facts rather than of
     how many times it has been applied.
 
-    The first snapshot is checked for having grown before the two are compared:
-    a labelling step that wrote nothing at all would leave both reads showing
-    the fixture, and two equal nothings satisfy an equality test.
+    Both runs are checked for having succeeded, and the first snapshot for
+    having grown, before the two are compared. Otherwise a run that wrote
+    nothing -- because it did nothing, or because it died on the way -- leaves
+    both reads showing the same thing, and two equal nothings satisfy an
+    equality test. A second run that refuses an already-labelled set is the
+    failure this test exists to catch, and it looks exactly like success.
     """
     src = make_archive(tmp_path / "x.mbtiles", ARCHIVE_META)
     first = run_currency(src)
+    assert first.returncode == 0, first.stderr
     con = sqlite3.connect(src)
     once = dict(con.execute("SELECT name, value FROM metadata"))
     con.close()
     assert set(once) > set(ARCHIVE_META), (
         f"labelling added nothing to the metadata: {first.stderr}")
 
-    run_currency(src)
+    second = run_currency(src)
+    assert second.returncode == 0, second.stderr
     con = sqlite3.connect(src)
     assert dict(con.execute("SELECT name, value FROM metadata")) == once
 
