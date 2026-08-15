@@ -712,3 +712,29 @@ def test_a_stroke_abutting_the_fill_keeps_its_far_end(tmp_path):
 
 
 
+
+
+def test_a_strip_that_empties_the_deepest_level_refuses(tmp_path):
+    """What happens to Yleiskartat. Its archive grew a z14 of 9,972 blank tiles,
+    the blank pass dropped every one, and the levels below were then deleted for
+    a downscale that had nothing left to rebuild them from. The file that
+    reached downscale held no tiles at all, and the message three steps later
+    was `no tiles`.
+
+    Refusing here keeps the pyramid and names the level that emptied. It is not
+    the coverage floor in `pipeline`, which cannot see this: that is checked
+    after downscale, and downscale is what fails first.
+    """
+    src = tmp_path / "src.mbtiles"
+    build(src, {(0, 0): "content", (1, 0): "content"}, z=Z - 1)
+    build(src, {(0, 0): "blank", (1, 0): "blank"}, z=Z)
+    out = tmp_path / "out.mbtiles"
+
+    with pytest.raises(SystemExit) as exit:
+        sn.run(src, out, jobs=1, stages=("white-tiles",))
+
+    assert f"z{Z}" in str(exit.value)
+    assert not out.exists()
+    con = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
+    assert con.execute("SELECT count(*) FROM tiles WHERE zoom_level=?",
+                       (Z - 1,)).fetchone()[0] == 2
