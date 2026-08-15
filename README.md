@@ -695,11 +695,12 @@ all.
 
 A layer that fails stops there and the rest carry on; the exit status is
 non-zero. Each layer is published as soon as it is built, rather than all of
-them together at the end. A full month is a day and a half of work — long enough
-that a reboot, a wedged step, or `TimeoutStartSec` at 72h can cut a run short,
-and a run holding its finished sets back until the end then publishes nothing at
-all. The layer last in the list would be the one that never landed, the same one
-every month. Within
+them together at the end. A full month is a day and a half of work, so a run can
+end before it finishes. A reboot or a crash stops it at whatever point it had
+reached; `TimeoutStartSec` is the backstop for a run that wedges, and at 72h an
+ordinary month does not come near it. A run holding its finished sets back until
+the end publishes nothing at all when any of that happens, and the layer last in
+the list is the one that never lands, the same one every month. Within
 a layer the guarantee is unchanged: nothing is renamed in the destination until
 that set has been staged and verified, so a refusal leaves the published set
 exactly as it was, while a failure *during* the renames reports
