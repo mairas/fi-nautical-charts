@@ -229,7 +229,7 @@ def nicely(cmd: list[str]) -> list[str]:
 
 
 def terminate(signum, frame) -> None:
-    raise Terminated(f"stopped by signal {signum}; scratch swept, nothing published")
+    raise Terminated(f"stopped by signal {signum}; scratch swept")
 
 
 def duration(seconds: float) -> str:
@@ -670,10 +670,10 @@ def main() -> int:
     if args.dry_run:
         return dry_run(layers, found, args)
 
-    # The 24h TimeoutStartSec makes a SIGTERM mid-run a scheduled possibility
-    # rather than an accident, and Python's default handling exits without
-    # running a `finally` -- which is where every sweep of the multi-gigabyte
-    # scratch lives. The host has run out of disk before.
+    # TimeoutStartSec makes a SIGTERM mid-run a scheduled possibility rather
+    # than an accident, and Python's default handling exits without running a
+    # `finally` -- which is where every sweep of the multi-gigabyte scratch
+    # lives. The host has run out of disk before.
     signal.signal(signal.SIGTERM, terminate)
 
     try:
@@ -713,18 +713,23 @@ def dry_run(layers: list[Layer], found: dict[str, Path],
 
 def run(layers: list[Layer], found: dict[str, Path],
         args: argparse.Namespace) -> int:
-    ready: list[Path] = []
+    published: list[str] = []
     failures: list[tuple[str, str]] = []
     started = time.monotonic()
 
-    sweep_stale(args.work)
     try:
-        check_space(args.work, [found[l.wmts] for l in layers if l.wmts in found])
-    except Failed as exc:
-        print(exc, file=sys.stderr)
-        return 2
+        # Inside the reporting `finally` below, not before it: the sweep deletes
+        # a killed run's scratch and has taken minutes at 14 GB, so a signal
+        # arrives during it often enough that the run which did least would
+        # otherwise be the one run that says nothing about itself.
+        sweep_stale(args.work)
+        try:
+            check_space(args.work,
+                        [found[l.wmts] for l in layers if l.wmts in found])
+        except Failed as exc:
+            print(exc, file=sys.stderr)
+            return 2
 
-    try:
         for layer in layers:
             archive = found.get(layer.wmts)
             print(f"\n=== {layer.wmts} ===", flush=True)
@@ -736,43 +741,37 @@ def run(layers: list[Layer], found: dict[str, Path],
             try:
                 out = build_layer(layer, archive, args.work, args.dest,
                                   max(1, args.jobs), args.force, args.skip_refresh)
+                if out is not None:
+                    # Each layer is published as it finishes rather than all of
+                    # them after the loop. A run outliving TimeoutStartSec is a
+                    # scheduled event at these durations, and holding the
+                    # finished sets back means such a run publishes nothing at
+                    # all -- with the last layer in the list the one that never
+                    # lands, the same one every month.
+                    try:
+                        run_step(uv("publish.py", str(out),
+                                    "--dest", str(args.dest)), "publish")
+                        published.append(layer.wmts)
+                    finally:
+                        out.unlink(missing_ok=True)
             except Exception as exc:
                 failures.append((layer.wmts, str(exc)))
                 print(f"  FAILED: {exc}", file=sys.stderr)
-                continue
             finally:
                 # The sweep runs whether or not anything is rebuilt and is the
                 # long step, so a quiet month spends nearly all its hours in
                 # layers this line is the only account of.
                 print(f"  took {duration(time.monotonic() - began)}", flush=True)
-            if out is not None:
-                ready.append(out)
-    except Terminated:
-        # build_layer's own finally has swept the layer it was on; these are the
-        # finished sets waiting for publish, which nothing else will collect.
-        for f in ready:
-            f.unlink(missing_ok=True)
-        raise
-
-    if ready:
-        print(f"\n=== publishing {len(ready)} set(s) ===", flush=True)
-        try:
-            run_step(uv("publish.py", *[str(f) for f in ready],
-                        "--dest", str(args.dest)), "publish")
-        except Failed as exc:
-            failures.append(("publish", str(exc)))
-            print(f"  FAILED: {exc}", file=sys.stderr)
-        for f in ready:
-            f.unlink(missing_ok=True)
-    else:
-        print("\nnothing to publish")
-
-    print(f"\nrun finished in {duration(time.monotonic() - started)}: "
-          f"{len(ready)} processed, {len(failures)} failed")
-    used, scope = peak_memory()
-    print(f"peak memory ({scope}): {used / 2**20:.0f} MiB")
-    for name, why in failures:
-        print(f"  {name}: {why}", file=sys.stderr)
+    finally:
+        # Printed on the way out of a terminated run too. What landed before the
+        # signal is what tells next month's operator whether anything is owed,
+        # and a run that is killed is now the ordinary way a long month ends.
+        print(f"\nrun finished in {duration(time.monotonic() - started)}: "
+              f"{len(published)} published, {len(failures)} failed")
+        used, scope = peak_memory()
+        print(f"peak memory ({scope}): {used / 2**20:.0f} MiB")
+        for name, why in failures:
+            print(f"  {name}: {why}", file=sys.stderr)
     return 1 if failures else 0
 
 

@@ -694,14 +694,22 @@ measured against the archive it just gutted the loss would read as no loss at
 all.
 
 A layer that fails stops there and the rest carry on; the exit status is
-non-zero. Nothing is renamed in the destination until every processed set has
-been staged and verified, so a refusal leaves the published set exactly as it
-was — but a failure *during* the renames reports `DESTINATION CHANGED` and wants
-a look, as the publishing section above describes.
+non-zero. Each layer is published as soon as it is built, rather than all of
+them together at the end. A full month is a day and a half of work, so a run can
+end before it finishes. A reboot or a crash stops it at whatever point it had
+reached; `TimeoutStartSec` is the backstop for a run that wedges, and at 72h an
+ordinary month does not come near it. A run holding its finished sets back until
+the end publishes nothing at all when any of that happens, and the layer last in
+the list is the one that never lands, the same one every month. Within
+a layer the guarantee is unchanged: nothing is renamed in the destination until
+that set has been staged and verified, so a refusal leaves the published set
+exactly as it was, while a failure *during* the renames reports
+`DESTINATION CHANGED` and wants a look, as the publishing section above
+describes.
 
 One run at a time: the whole run holds an exclusive lock on the work directory.
 `publish` takes its own lock on the destination, but only for the minutes it is
-renaming; the ten hours before that refresh the archive in place and build
+renaming; the hours around each of those refresh the archive in place and build
 scratch at paths derived from the layer alone, so a second run would delete the
 first one's partials. Scratch from an earlier run is swept at startup rather
 than trusted to a `finally` a `kill -9` never reaches.
@@ -744,10 +752,10 @@ host that built it rather than the month on the host that runs it.
 **The work and published directories must sit side by side inside one bind
 mount.** Publishing renames from the first into the second, and `rename(2)`
 refuses to cross a mount point even when both sides are the same filesystem: two
-`--volume` flags fail with `EXDEV` at the last step of a ten-hour run. The unit
-mounts the parent the two share, and the pipeline tries the rename for real
-before it starts — a layout that cannot publish fails in the first second
-instead of the tenth hour.
+`--volume` flags fail with `EXDEV` the first time a layer is published, hours
+in. The unit mounts the parent the two share, and the pipeline tries the rename
+for real before it starts — a layout that cannot publish fails in the first
+second instead of after the first layer.
 
 The archive is a separate mount, because nothing is ever renamed across it.
 
@@ -814,8 +822,8 @@ journalctl --user -u fi-nautical-charts.service -f       # follow a live run
 Read `list-timers` straight after enabling, not the service's status.
 `Persistent=true` makes a timer catch up on a run it missed while the host was
 off, and whether that counts a never-yet-run timer as missed depends on the
-systemd version — so confirm you have not just scheduled a ten-hour job into the
-middle of the afternoon. `status` cannot answer that: `RandomizedDelaySec` also
+systemd version — so confirm you have not just scheduled a day-and-a-half job
+into the middle of the afternoon. `status` cannot answer that: `RandomizedDelaySec` also
 applies to a catch-up, so the service reads inactive for up to an hour while a
 run is already pending.
 
@@ -824,7 +832,7 @@ so anything you can pass by hand you can add to `ExecStart` after the image
 name, and a manual `systemctl --user start fi-nautical-charts.service` is a real
 run under the same limits as the scheduled one. A second run is refused with
 exit 2 rather than starting: the lock covers the archive and the work directory
-for the whole ten hours.
+for the whole run, which the first full month measured at over a day.
 
 `Nice=` and `IOSchedulingClass=` in the unit reach the docker client and stop
 there — the container runs in a sibling cgroup under the daemon, not as a child
