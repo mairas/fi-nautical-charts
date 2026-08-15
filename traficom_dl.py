@@ -671,10 +671,21 @@ def refresh(con, args, src, limits, bbox, zooms):
     ims = email.utils.format_datetime(
         datetime.datetime(base.year, base.month, base.day, tzinfo=datetime.timezone.utc))
     print(f"refresh: checking for editions newer than {since} ...")
-    frontier = None
     updated = removed = checked = errors = 0
     for z in zooms:
-        cands, _ = gen_candidates(z, limits, bbox, frontier, args.mode, args.full_until)
+        # The tiles the archive already holds, not the download's descent. The
+        # descent asks for the children of everything stored, which is one level
+        # deeper than the archive has -- and Traficom answers past a layer's real
+        # detail with near-blank tiles rather than 404. Those pass the blank test
+        # here and fail the strip's, so the archive grows a level that looks like
+        # a chart until something processes it and drops all of it. Yleiskartat
+        # gained 9,972 such tiles at a z14 it does not have, and could not be
+        # built again afterwards.
+        cands = sorted(data_tiles_at(con, z))
+        if bbox:
+            cmin, cmax, rmin, rmax = clamped_bounds(limits[z], bbox, z)
+            cands = [c for c in cands
+                     if cmin <= c[0] <= cmax and rmin <= c[1] <= rmax]
         with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
             results = list(pool.map(
                 lambda c: fetch(src, z, c[0], c[1], ims), cands))
@@ -707,7 +718,6 @@ def refresh(con, args, src, limits, bbox, zooms):
                 errors += 1
         flush_editions(con)
         con.commit()
-        frontier = data_tiles_at(con, z)
         progress = (f"  z{z:<2} checked {checked:,}  updated {updated:,}  "
                     f"removed {removed:,}  errors {errors:,}")
         # A terminal redraws one line; journald frames entries on newlines, so
